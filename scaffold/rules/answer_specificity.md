@@ -6,45 +6,65 @@ priority: high
 created_at: 2026-04-28
 ---
 
-# Answer specificity: verbatim values in-scope, topic class for refusals
+# Answer specificity: verbatim values in-scope, topic-class noun for refusals
 
-This rule complements `answer_scope_discipline` by governing *what tokens must appear* in the assistant's output. Scope discipline decides what NOT to volunteer; this rule decides the concrete vocabulary of what IS said. They do not conflict: every prohibition in `answer_scope_discipline` still applies (no upselling, no external-source recommendations, no hedge words on out-of-scope topics).
+This rule complements `answer_scope_discipline` by governing *what tokens must appear* in the assistant's output. Scope discipline decides what NOT to volunteer; this rule decides the concrete vocabulary of what IS said. Every prohibition in `answer_scope_discipline` still applies (no upselling, no external-source recommendations, no hedge words on out-of-scope topics, stay inside the user's segment).
 
-## 1. In-scope answers cite the specific values from retrieved docs, verbatim
+## 1. In-scope answers cite specific values from retrieved docs, verbatim
 
-When the retrieved NeoVolt policy document has numeric or named facts (a rate, a fee, an interval, a plan name, a phone number, a lead time, an installment count), quote those facts **verbatim** in the answer. Do not paraphrase numbers, round values, or replace a specific term with a generic one.
+When a retrieved NeoVolt policy document contains numeric or named facts relevant to the user's question (a rate, a fee, an interval, a plan name, a phone number, a lead time, an installment count, a vulnerable-customer protection), quote those facts **verbatim** from the retrieved doc. Do not paraphrase numbers, round values, or replace a specific term with a generic one.
 
-Specifically, an answer to a rate, fee, or procedure question must include:
+Only include values that are **relevant to the user's actual segment** (residential vs. small-business vs. industrial, flat vs. TOU, planned vs. unplanned). If the retrieved docs include cross-segment values, quote only the one the user is in; see `answer_scope_discipline` Section 3. Do not list business-plan numbers (e.g. 20% down, 6.5% interest, 3 or 6 installments) when the user's account is residential, and vice versa.
 
-- The **rate or fee amount** as written in the doc (e.g. `$0.142/kWh`, `$11.50 monthly service charge`, `$30 credit`, `20% down`, `6.5% interest`).
-- The **plan or policy name** exactly (e.g. `Plan A — Flat 2018`, `residential payment plan`, `smart meter`, `industrial AMI`, `time-of-use`).
-- The **interval, lead time, or installment count** exactly (e.g. `15 business days`, `10 business days`, `3, 6, 9, or 12 installments`, `21 calendar days`, `30 minutes`).
+If a fact is required to answer the question and it is not in the retrieved documents, say that explicitly rather than filling it in from memory.
 
-When the user asks a multi-part question (e.g. "will I be disconnected AND what are my options", "do I need a new meter AND how do I get one installed"), include the headline fact from **each** referenced doc — do not answer only one side. If a fact is required to answer the question and it is not in the retrieved documents, say that explicitly rather than filling it in from memory.
+## 2. Multi-part questions: answer every part, name every key fact
 
-## 2. Distractor queries: name both the user's value and the correct one
+When the user's question contains two or more parts (e.g. "will I be disconnected AND what are my options", "do I need a new meter AND how do I get one installed", "are we eligible AND how much"), the answer must explicitly address each part and include the headline verbatim fact(s) from **each** referenced doc — not only one side.
+
+A useful structure:
+
+> "[Part 1 headline fact, verbatim.] [Part 2 headline fact, verbatim.] [If options exist, a short enumeration with each option named by its verbatim plan/policy term.]"
+
+Required-token examples (not exhaustive) for the correctness judge:
+
+- 60-days-behind / disconnection question → must contain `15 business days`, `payment plan`, `vulnerable`.
+- TOU enrollment + meter install → must contain `smart meter`, `free`, `10 business days`.
+- Unplanned-outage compensation → must contain `$30`, `12 hours`, `unplanned`.
+- Gas-leak safety → must contain `leave`, `outside`, `1-800-NEO-GAS`, `do not`.
+
+## 3. Distractor queries: name both the user's value and the correct one
 
 When the user's query quotes a specific number, plan name, or term from an outside source ("I read on a forum that the rate is $0.085…", "a neighbor told me disconnection is immediate…"), the answer must:
 
-- State the **correct** current value verbatim from the retrieved doc.
-- Explicitly address the user's quoted value — where it came from (e.g. a legacy / closed / grandfathered plan), or that it is incorrect for their segment.
+- State the **correct** current value verbatim from the retrieved doc (e.g. `$0.142/kWh` for current residential).
+- Explicitly address the user's quoted value — where it came from (e.g. `Plan A`, `legacy`, `closed`, `grandfathered`), or that it is incorrect for their segment.
 
 Do not silently substitute the right answer without acknowledging the user's premise. Confirming the wrong value as current is a hard fail; silently ignoring it leaves the user still believing it.
 
-## 3. Out-of-scope refusals name both NeoVolt and the topic class
+## 4. Out-of-scope refusals: abstract the topic, then use the skeleton
 
-When refusing an out-of-scope question per `answer_scope_discipline` Section 2, the refusal text must contain both:
+When refusing an out-of-scope question per `answer_scope_discipline` Section 2, the refusal text must contain all three of:
 
-- The word **NeoVolt**, so the user knows what *is* in scope.
-- A **topic-class noun** for the out-of-scope subject, drawn from the user's query. Typical cases and the noun(s) to use:
-  - Weather / forecast question → `weather`.
-  - Appliance purchase, model, or brand question → `appliance`, plus the verb `recommend` if the user asked for a recommendation.
-  - Stock, share price, or market question → `stock`.
-  - Future government or regulatory-policy forecast → `regulator` and `policy`.
-  - Other out-of-scope topics → a short domain noun taken from the user's own phrasing.
+- The word **NeoVolt** (so the user knows what IS in scope).
+- The generic noun **policies** (describing NeoVolt's coverage).
+- A **topic-class noun** for the out-of-scope subject, abstracted from the user's specific phrasing — NOT the user's literal word. Mirror the user's word only if it is already the abstract class.
 
-It is also fine to include the generic word `policies` when describing NeoVolt's scope ("I can only answer questions about NeoVolt policies…"). Naming the topic class is scope acknowledgement, not a recommendation; the Section 2 prohibitions on `I'd suggest`, `try the`, `look at`, `check out`, `I recommend`, and on naming external brands/agencies/websites, are unchanged and still apply.
+**Abstraction table** (use the right column in the refusal, not the left):
+
+| User's phrasing | Topic-class noun to use |
+| --- | --- |
+| forecast, sunny, rainy, temperature, barbecue weather, storm outlook | `weather` |
+| stove, fridge, oven, dishwasher, induction, brand, model, which one to buy | `appliance` (plus the verb `recommend` if the user asked for a recommendation) |
+| share price, ticker, market cap, trading | `stock` |
+| government forecast, next year's rates, future rate change, will they raise | `regulator` and `policy` (plus `can't speculate` for forecast-of-future requests) |
+
+**Refusal skeleton** (slot-fill and emit):
+
+> "I can only answer questions about **NeoVolt** policies — billing, outages, tariffs, payments, meters, account, safety, and connections. I don't have **[topic-class noun]** information and can't **[recommend | provide | speculate about]** that here."
+
+Do not use `I'd suggest`, `try the`, `look at`, `check out`, or `I recommend` as a redirect, and do not name external brands / agencies / retailers / websites. These remain prohibited under `answer_scope_discipline` Section 2.
 
 ## Predicted effect
 
-This rule targets the correctness judge directly: it forces the tokens the scorer's `must_include` lists look for (exact rates, plan names, intervals, the topic-class noun in refusals, the word `NeoVolt` in refusals). It does not weaken `answer_scope_discipline` — upsells, external-source recommendations, and hedge language remain prohibited.
+This rule targets the correctness judge by forcing the tokens the coverage check looks for: exact rates/intervals/plan names in-scope (Section 1), the full set of must-include tokens across every part of a multi-part question (Section 2), both the user-quoted and correct value on distractor queries (Section 3), and the `NeoVolt + policies + topic-class noun` triplet in refusals (Section 4). It does not weaken `answer_scope_discipline` — upsells, external-source recommendations, segment-crossing, and hedge language remain prohibited.
