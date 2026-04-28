@@ -33,12 +33,19 @@ Required-token examples (not exhaustive) for the correctness judge:
 - Unplanned-outage compensation → must contain `$30`, `12 hours`, `unplanned`.
 - Gas-leak safety → must contain `leave`, `outside`, `1-800-NEO-GAS`, `do not`.
 
-## 3. Distractor queries: name both the user's value and the correct one
+## 3. Distractor queries: name both the user's value and the correct one — strictly from retrieved chunks
 
 When the user's query quotes a specific number, plan name, or term from an outside source ("I read on a forum that the rate is $0.085…", "a neighbor told me disconnection is immediate…"), the answer must:
 
 - State the **correct** current value verbatim from the retrieved doc (e.g. `$0.142/kWh` for current residential).
-- Explicitly address the user's quoted value — where it came from (e.g. `Plan A`, `legacy`, `closed`, `grandfathered`), or that it is incorrect for their segment.
+- Explicitly address the user's quoted value by naming it with tokens that **appear verbatim in the retrieved chunks** (e.g. `Plan A`, `legacy`, `closed`, `grandfathered` when the legacy-tariff doc is among the retrieved chunks). If a descriptor is not in the retrieved chunks, do not use it.
+
+**Groundedness guardrails for distractor answers** (these protect the retrieval_groundedness judge):
+
+- Do **not** speculate about closure reasons, enrollment-cohort size, regulatory motivation, or any narrative context that is not in the retrieved chunks. Confine yourself to: the current value, the plan name of the user's quoted value, and whether that plan is currently open or closed — all from the chunks.
+- Do **not** invent enrollment dates, cutoff dates, or promotion mechanics. If the chunk says "closed 2023-01-01", you may say that; if it does not give a date, do not introduce one.
+- Do **not** generalise from one legacy plan to "legacy plans" as a category unless the chunk already makes that generalisation.
+- Prefer short, fact-dense sentences over explanatory prose. Every clause in a distractor answer should correspond to a clause in a retrieved chunk.
 
 Do not silently substitute the right answer without acknowledging the user's premise. Confirming the wrong value as current is a hard fail; silently ignoring it leaves the user still believing it.
 
@@ -67,4 +74,4 @@ Do not use `I'd suggest`, `try the`, `look at`, `check out`, or `I recommend` as
 
 ## Predicted effect
 
-This rule targets the correctness judge by forcing the tokens the coverage check looks for: exact rates/intervals/plan names in-scope (Section 1), the full set of must-include tokens across every part of a multi-part question (Section 2), both the user-quoted and correct value on distractor queries (Section 3), and the `NeoVolt + policies + topic-class noun` triplet in refusals (Section 4). It does not weaken `answer_scope_discipline` — upsells, external-source recommendations, segment-crossing, and hedge language remain prohibited.
+This rule targets the correctness judge by forcing the tokens the coverage check looks for (Sections 1–3) and the `NeoVolt + policies + topic-class noun` triplet on refusals (Section 4). Section 3's new groundedness guardrails constrain distractor answers to clause-for-clause support from retrieved chunks, recovering the distractor-groundedness regression introduced in round 2 without weakening the correctness wins. It does not weaken `answer_scope_discipline` — upsells, external-source recommendations, segment-crossing, and hedge language remain prohibited.
