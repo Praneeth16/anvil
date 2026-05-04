@@ -131,13 +131,28 @@ def show_baseline(repo_root: Path) -> dict | None:
 
 
 def show_eval_report(eval_path: Path, baseline: dict | None) -> None:
-    """Show one eval JSON: aggregate, per-judge, per-bucket, failures, vs baseline."""
+    """Show one eval JSON: aggregate, per-judge, per-bucket, failures, vs baseline.
+
+    Tolerant to two slightly different shapes:
+    * eval-only JSONs (from ``scripts/evaluate.py``) carry ``n_rows``.
+    * round JSONs (from ``loop.run_round``) carry ``n_examples`` instead.
+    """
     raw = json.loads(eval_path.read_text(encoding="utf-8"))
     label = raw.get("label") or eval_path.stem
     print(_h1(f"Eval report · {label}"))
 
+    if "aggregate" not in raw or raw.get("aggregate") is None:
+        print(f"  {YELLOW}no aggregate in JSON (likely a noop round){RESET}")
+        decision = raw.get("decision", "?")
+        action_kind = raw.get("action_kind", "?")
+        parse_status = raw.get("parse_status", "?")
+        print(f"  decision={decision} · action={action_kind} · parse_status={parse_status}")
+        return
+
     agg = float(raw["aggregate"])
-    line = f"  {BOLD}aggregate: {agg:.3f}{RESET}  (n={raw['n_rows']}, mode={raw['mode']})"
+    n = raw.get("n_examples", raw.get("n_rows", "?"))
+    mode = raw.get("mode", "?")
+    line = f"  {BOLD}aggregate: {agg:.3f}{RESET}  (n={n}, mode={mode})"
     if baseline:
         delta = agg - float(baseline["aggregate"])
         line += f"  vs baseline: {_color_delta(delta)}"
@@ -172,8 +187,14 @@ def show_eval_report(eval_path: Path, baseline: dict | None) -> None:
         print(f"               {DIM}trace_id: {f.get('trace_id')}{RESET}")
 
     print(_h2("mlflow"))
-    print(f"  run_id: {raw.get('run_id')}")
-    print(f"  experiment_id: {raw.get('experiment_id')}")
+    # Round JSONs nest mlflow under "mlflow"; eval-only JSONs put run_id flat.
+    mlflow_block = raw.get("mlflow") or {}
+    run_id = mlflow_block.get("run_id") if mlflow_block else raw.get("run_id")
+    experiment_id = (
+        mlflow_block.get("experiment_id") if mlflow_block else raw.get("experiment_id")
+    )
+    print(f"  run_id: {run_id}")
+    print(f"  experiment_id: {experiment_id}")
     print()
 
 
@@ -211,20 +232,40 @@ def show_round(round_id: int, repo_root: Path, baseline: dict | None) -> None:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         print(f"  {DIM}git not available{RESET}")
 
-    # 3. Critique md.
+    # 3. Critique md. If missing, fall back to the rationale stored in
+    # mutations.jsonl (the round.py bug that orphaned critique mds for
+    # keep-rounds is a known issue; data still survives in mutations).
     critique_path = repo_root / "scaffold" / "memory" / f"round_{round_id:03d}_critique.md"
+    print(_h2("critique"))
     if critique_path.is_file():
-        print(_h2("critique"))
         text = critique_path.read_text(encoding="utf-8")
-        # Show frontmatter + first ~25 body lines.
         lines = text.splitlines()
         for line in lines[:35]:
             print(f"  {line}")
         if len(lines) > 35:
             print(f"  {DIM}... ({len(lines) - 35} more lines){RESET}")
     else:
-        print(_h2("critique"))
-        print(f"  {DIM}no critique md at {critique_path}{RESET}")
+        print(f"  {YELLOW}critique md missing on disk — falling back to mutations log{RESET}")
+        mutations_path = repo_root / "eval" / "mutations.jsonl"
+        rationale = None
+        if mutations_path.is_file():
+            for line in mutations_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("round_id") == round_id:
+                    rationale = record.get("diff_summary", "")
+                    break
+        if rationale:
+            print(f"  decision: {raw.get('decision', '?')}")
+            print(f"  action:   {raw.get('action_kind', '?')}")
+            print(f"  parse:    {raw.get('parse_status', '?')}")
+            print(f"  summary:  {rationale}")
+        else:
+            print(f"  {DIM}also no row in mutations.jsonl{RESET}")
 
     # 4. Eval body.
     print()

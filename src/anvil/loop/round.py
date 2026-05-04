@@ -229,6 +229,19 @@ def run_round(
     )
     append_mutation(repo_root, record)
 
+    # 10b. Commit the round artifacts (critique md, transcript md,
+    # round JSON) onto the round branch BEFORE we ff-merge or delete
+    # it. Without this step the critique md was orphaned: the only
+    # commit_all (step 4) ran before the critique was written, so the
+    # file lived as untracked in the working tree and got clobbered
+    # by the next round's git checkout. Fixed in this commit; the
+    # legacy artifacts for R4/R6/R8 were reconstructed via
+    # ``scripts/reconstruct_critiques.py``.
+    try:
+        commit_all(repo_root, message=f"round {round_id:03d}: critique + eval artifacts")
+    except Exception as exc:  # noqa: BLE001 — defensive, don't break the round
+        print(f"[round {round_id}] warning: artifacts commit failed: {exc}")
+
     # 11. Apply git verdict.
     if decision == Decision.KEEP:
         ff_merge(repo_root, branch=branch, target=parent_branch)
