@@ -1,0 +1,139 @@
+"""Structured actions emitted by the optimizer.
+
+Replaces the legacy "free-reign Claude Code" pattern with a constrained
+action menu. The optimizer reasons freely during its session, but its
+final decision is a single JSON object matching one of the discriminated
+``OptimizerAction`` variants below. The :func:`anvil.optimizer.parser.parse_action`
+function validates this with ``Pydantic`` and falls back to ``NoopAction``
+on any malformed output.
+
+Why this shape (vs. arbitrary ``Edit`` / ``Write`` / ``Bash``):
+
+* **Reduces variance.** The legacy optimizer could touch any file with
+  any content; round 6's regression came from a skill that clashed with
+  an existing rule. With the menu, the loop's applier can lint and
+  validate before committing.
+* **Mockable.** Tests for the loop can inject a fake action without
+  spinning a real Claude session.
+* **Auditable.** ``rationale`` is mandatory on every variant; the
+  mutation Delta row carries it as ``diff_summary``.
+
+Six actions (today):
+
+* ``add_skill`` / ``edit_skill``      — add or edit a markdown skill
+* ``add_rule``  / ``edit_rule``       — add or edit a markdown rule
+* ``change_sampling``                  — tweak ``scaffold/harness.yaml > sampling.*``
+* ``noop``                             — the optimizer chose to do nothing
+
+Each non-``noop`` variant carries:
+
+* ``target_file``: relative path under ``scaffold/`` (without the
+  ``scaffold/`` prefix; e.g. ``"skills/identity.md"``).
+* ``content``: full file content for skills/rules; ``str | float | int``
+  for sampling.
+* ``rationale``: short string explaining the why. Goes into the
+  critique md and the mutations Delta row.
+"""
+
+from __future__ import annotations
+
+from typing import Annotated, Literal, Union
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class _ActionBase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    rationale: str = Field(min_length=1, max_length=2000)
+
+
+class AddSkillAction(_ActionBase):
+    action: Literal["add_skill"] = "add_skill"
+    target_file: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+
+    @field_validator("target_file")
+    @classmethod
+    def _validate_path(cls, v: str) -> str:
+        return _check_relative_path(v, expected_dir="skills")
+
+
+class EditSkillAction(_ActionBase):
+    action: Literal["edit_skill"] = "edit_skill"
+    target_file: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+
+    @field_validator("target_file")
+    @classmethod
+    def _validate_path(cls, v: str) -> str:
+        return _check_relative_path(v, expected_dir="skills")
+
+
+class AddRuleAction(_ActionBase):
+    action: Literal["add_rule"] = "add_rule"
+    target_file: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+
+    @field_validator("target_file")
+    @classmethod
+    def _validate_path(cls, v: str) -> str:
+        return _check_relative_path(v, expected_dir="rules")
+
+
+class EditRuleAction(_ActionBase):
+    action: Literal["edit_rule"] = "edit_rule"
+    target_file: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+
+    @field_validator("target_file")
+    @classmethod
+    def _validate_path(cls, v: str) -> str:
+        return _check_relative_path(v, expected_dir="rules")
+
+
+class ChangeSamplingAction(_ActionBase):
+    """Edit a single field under ``scaffold/harness.yaml > sampling.*``."""
+
+    action: Literal["change_sampling"] = "change_sampling"
+    field: Literal["temperature", "top_p", "max_tokens", "tool_choice", "max_tool_calls"]
+    value: float | int | str | None
+
+
+class NoopAction(_ActionBase):
+    """The optimizer chose to make no change. Always valid; never a parse failure."""
+
+    action: Literal["noop"] = "noop"
+
+
+# Discriminated union over the literal ``action`` field.
+OptimizerAction = Annotated[
+    Union[
+        AddSkillAction,
+        EditSkillAction,
+        AddRuleAction,
+        EditRuleAction,
+        ChangeSamplingAction,
+        NoopAction,
+    ],
+    Field(discriminator="action"),
+]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _check_relative_path(path: str, *, expected_dir: str) -> str:
+    """Reject path traversal and require the right scaffold sub-directory."""
+    if path.startswith("/") or ".." in path.split("/"):
+        raise ValueError(f"target_file must be relative under scaffold/: got {path!r}")
+    parts = path.split("/")
+    if parts[0] != expected_dir:
+        raise ValueError(
+            f"target_file must live under scaffold/{expected_dir}/, "
+            f"got first segment {parts[0]!r}"
+        )
+    if not path.endswith(".md"):
+        raise ValueError(f"target_file must be a .md file, got {path!r}")
+    return path

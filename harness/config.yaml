@@ -1,0 +1,79 @@
+# ANVIL runtime config — IMMUTABLE.
+#
+# This file is OUTSIDE the optimizer's writable scope. It holds the
+# runtime model identities, the optimizer loop's meta-configuration,
+# and the MLflow experiment paths.
+#
+# The optimizer must NOT rewrite this file — changing endpoints
+# mid-loop invalidates the comparative metric, and letting the
+# optimizer rewrite its own lookback window is a recursion the loop's
+# gate is not designed to catch.
+#
+# Anything mutation-worthy (sampling, skills, rules, tools) lives in
+# `scaffold/harness.yaml`.
+
+# Endpoint the runtime agent calls. Provider-agnostic — any
+# OpenAI-compatible Databricks serving endpoint works.
+runtime_endpoint: databricks-claude-sonnet-4-6
+
+# Endpoint the ANVIL optimizer loop calls for trace analysis +
+# mutation planning. Not read by the runtime agent.
+optimizer_endpoint: databricks-claude-opus-4-7
+
+# Endpoint the MLflow LLM judges call. Same as runtime by default;
+# kept separate so a future round can pin a different judge model.
+judge_endpoint: databricks-claude-sonnet-4-6
+
+# MLflow experiment paths. Stable, declared here, NOT driven by
+# environment variables (which lint/format passes have historically
+# clobbered). The CLI may override per-run via --experiment-suffix
+# but the suffix is appended in-process, never via env-var.
+#
+# Defaults to ``/Shared`` so the harness boots in any workspace.
+# Per-user paths (``/Users/<email>/anvil-runtime``) work too — edit
+# below to taste.
+experiments:
+  runtime:   "/Shared/anvil-runtime"
+  eval:      "/Shared/anvil-eval"
+  optimizer: "/Shared/anvil-optimizer"
+
+# Loop configuration — how the ANVIL optimizer schedules itself.
+loop:
+  target_rounds: 50
+  stretch_rounds: 100
+  cost_budget_usd_per_round: 5.0
+  # Early-stop if N consecutive rounds produce no positive
+  # score_delta.
+  early_stop_after_stalled_rounds: 10
+  # How many past critiques to include in the next round's context.
+  critique_lookback: 3
+  # How many past reverted mutations to surface to the planner so it
+  # avoids re-proposing what was already tried.
+  revert_lookback: 20
+  # Hard cap on optimizer turns per round. Round aborts as `noop` if
+  # exceeded.
+  max_optimizer_turns: 30
+
+# Eval configuration.
+eval:
+  # Default mode for `evaluate_branch`. One of: quick, standard, full.
+  default_mode: quick
+  # Row count per mode (deterministic sub-set of the golden set).
+  modes:
+    quick:    {rows: 8,  buckets: {direct: 2, multi_hop: 2, distractor: 2, out_of_scope: 2}}
+    standard: {rows: 12, buckets: {direct: 4, multi_hop: 4, distractor: 2, out_of_scope: 2}}
+    full:     {rows: 20, buckets: {direct: 6, multi_hop: 6, distractor: 4, out_of_scope: 4}}
+  # Parallelism for predict_fn rows. Tune down if TPM saturates.
+  n_workers: 4
+  # Cooldown seconds between row tasks inside the thread pool when
+  # the endpoint is approaching its quota.
+  inter_row_cooldown_s: 0.0
+  # Scorers active by default. Safety is excluded from the aggregate
+  # by design — it has been a flat 1.000 in every measured round and
+  # provides no gradient. It can be re-added as a guard-only check
+  # via --include-safety.
+  scorers:
+    - correctness
+    - retrieval_groundedness
+    - refusal_appropriateness
+  safety_guard_threshold: 0.95

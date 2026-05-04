@@ -1,0 +1,355 @@
+"""End-to-end evaluation runner — driver of ``mlflow.genai.evaluate``.
+
+Wraps :func:`mlflow.genai.evaluate` with the active scorers (3 by
+default; Safety opt-in), the golden set sub-set per mode
+(``quick``/``standard``/``full``), and an :class:`AnvilAgent`
+constructed with ``source=SOURCE_EVAL``.
+
+Sequential by design today: ``mlflow.genai.evaluate`` in 3.10.x does
+not accept ``n_workers``. Parallelism with a thread pool is the
+documented Phase-2c follow-up; for now, sequential keeps the rate-
+limit footprint predictable.
+
+Public surface:
+
+* :func:`evaluate_branch` — driver function callable from
+  ``scripts/evaluate.py`` or another module.
+* :class:`EvalReport` — aggregate / per-judge / per-bucket / failures.
+"""
+
+from __future__ import annotations
+
+import os
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import mlflow
+from mlflow.types.responses import ResponsesAgentRequest
+from openai import OpenAI
+
+from anvil.data import load_golden_set, select_subset
+from anvil.eval.scorers import DEFAULT_JUDGE_MODEL, build_scorers
+from anvil.observability import SOURCE_EVAL, enable_runtime_tracing
+from anvil.runtime.agent import AnvilAgent
+from anvil.runtime.client import build_databricks_client
+from anvil.runtime.loader import default_runtime_config_path, load_harness
+from anvil.runtime.models import EvalConfig
+from anvil.tools.search_knowledge_base import make_kb_executor
+
+
+@dataclass
+class EvalReport:
+    """Summary of one ``mlflow.genai.evaluate`` run."""
+
+    aggregate: float
+    per_judge: dict[str, float]
+    per_bucket: dict[str, dict[str, float]]
+    failures: list[dict[str, Any]]
+    run_id: str
+    experiment_id: str
+    n_rows: int
+    mode: str
+    scorers: list[str]
+    evaluated_at: str
+    trace_ids: list[str] = field(default_factory=list)
+
+
+def _extract_final_text(response: Any) -> str:
+    """Walk ``response.output`` for the last ``message`` and concat its content."""
+    output = getattr(response, "output", None) or []
+    last_message: dict[str, Any] | None = None
+    for item in output:
+        data = item.model_dump() if hasattr(item, "model_dump") else item
+        if isinstance(data, dict) and data.get("type") == "message":
+            last_message = data
+    if last_message is None:
+        return ""
+    parts = last_message.get("content", [])
+    if isinstance(parts, str):
+        return parts
+    if not isinstance(parts, list):
+        return ""
+    chunks: list[str] = []
+    for part in parts:
+        if isinstance(part, dict):
+            text = part.get("text")
+            if isinstance(text, str):
+                chunks.append(text)
+        elif isinstance(part, str):
+            chunks.append(part)
+    return "".join(chunks)
+
+
+def _build_dataset(examples: list[dict]) -> list[dict]:
+    """Project golden-set rows into mlflow's inputs/expectations/tags shape."""
+    # Correctness rejects rows that pass BOTH expected_response and
+    # expected_facts. We use must_include as expected_facts; the
+    # reference_answer stays in the row for human debugging via
+    # mlflow.search_traces.
+    rows: list[dict] = []
+    for ex in examples:
+        rows.append(
+            {
+                "inputs": {
+                    "query": ex["query"],
+                    "category": ex["category"],
+                },
+                "expectations": {
+                    "expected_facts": ex["must_include"],
+                    "should_refuse": ex["should_refuse"],
+                    "expected_doc_ids": ex["expected_doc_ids"],
+                    "expected_citations": ex["expected_citations"],
+                    "must_not_include": ex["must_not_include"],
+                    "notes_for_judge": ex["notes_for_judge"],
+                    "reference_answer": ex["reference_answer"],
+                },
+                "tags": {"example_id": ex["example_id"]},
+            }
+        )
+    return rows
+
+
+def _coerce_score(raw: Any) -> float | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return 1.0 if raw else 0.0
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in ("yes", "pass", "true", "ok"):
+            return 1.0
+        if s in ("no", "fail", "false"):
+            return 0.0
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    return None
+
+
+def _row_score(row: Any, scorer_name: str) -> float | None:
+    if hasattr(row, "get"):
+        flat = row.get(f"{scorer_name}/value")
+        coerced = _coerce_score(flat)
+        if coerced is not None:
+            return coerced
+    assessments = row.get("assessments") if hasattr(row, "get") else None
+    if not isinstance(assessments, list):
+        return None
+    for a in assessments:
+        if not isinstance(a, dict):
+            continue
+        if a.get("assessment_name") != scorer_name:
+            continue
+        feedback = a.get("feedback")
+        if isinstance(feedback, dict):
+            coerced = _coerce_score(feedback.get("value"))
+            if coerced is not None:
+                return coerced
+    return None
+
+
+def _category_for_row(row: Any, examples: list[dict], idx: int) -> str:
+    if hasattr(row, "get"):
+        request = row.get("request")
+        if isinstance(request, dict):
+            cat = request.get("category")
+            if isinstance(cat, str):
+                return cat
+    if idx < len(examples):
+        cat = examples[idx].get("category")
+        if isinstance(cat, str):
+            return cat
+    return ""
+
+
+def _aggregate_report(
+    *,
+    result_df,
+    metrics: dict[str, float],
+    scorer_names: list[str],
+    aggregate_scorer_names: list[str],
+    examples: list[dict],
+    run_id: str,
+    experiment_id: str,
+    mode: str,
+) -> EvalReport:
+    n_rows = len(result_df)
+
+    per_judge_rows: dict[str, list[float | None]] = {
+        name: [_row_score(result_df.iloc[i], name) for i in range(n_rows)]
+        for name in scorer_names
+    }
+
+    def _mean(values: list[float | None]) -> float:
+        nums = [v for v in values if v is not None]
+        return sum(nums) / len(nums) if nums else 0.0
+
+    per_judge: dict[str, float] = {}
+    for name in scorer_names:
+        metric_key = f"{name}/mean"
+        if metric_key in metrics:
+            per_judge[name] = float(metrics[metric_key])
+        else:
+            per_judge[name] = _mean(per_judge_rows[name])
+
+    aggregate = (
+        sum(per_judge[name] for name in aggregate_scorer_names) / len(aggregate_scorer_names)
+        if aggregate_scorer_names
+        else 0.0
+    )
+
+    bucket_rows: dict[str, list[int]] = defaultdict(list)
+    for i in range(n_rows):
+        category = _category_for_row(result_df.iloc[i], examples, i)
+        if category:
+            bucket_rows[category].append(i)
+    per_bucket: dict[str, dict[str, float]] = {}
+    for bucket, idxs in bucket_rows.items():
+        per_bucket[bucket] = {
+            name: _mean([per_judge_rows[name][i] for i in idxs]) for name in scorer_names
+        }
+
+    failures: list[dict[str, Any]] = []
+    trace_ids: list[str] = []
+    for i in range(n_rows):
+        row = result_df.iloc[i]
+        trace_id = row.get("trace_id") if hasattr(row, "get") else None
+        if trace_id:
+            trace_ids.append(str(trace_id))
+        judge_failures = [
+            name
+            for name in scorer_names
+            if (s := per_judge_rows[name][i]) is not None and s < 1.0
+        ]
+        if not judge_failures:
+            continue
+        category = _category_for_row(row, examples, i)
+        example_id = examples[i]["example_id"] if i < len(examples) else ""
+        query = examples[i]["query"] if i < len(examples) else ""
+        failures.append(
+            {
+                "example_id": example_id,
+                "query": query,
+                "category": category,
+                "judge_failures": judge_failures,
+                "trace_id": trace_id,
+            }
+        )
+
+    return EvalReport(
+        aggregate=aggregate,
+        per_judge=per_judge,
+        per_bucket=per_bucket,
+        failures=failures,
+        run_id=run_id,
+        experiment_id=experiment_id,
+        n_rows=n_rows,
+        mode=mode,
+        scorers=list(scorer_names),
+        evaluated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        trace_ids=trace_ids,
+    )
+
+
+def evaluate_branch(
+    *,
+    scaffold_root: Path | str,
+    runtime_config_path: Path | str | None = None,
+    kb_dir: Path | str = "data/kb",
+    golden_set_path: Path | str = "data/golden_set.jsonl",
+    profile: str | None = None,
+    mode: str | None = None,
+    include_safety: bool = False,
+    runtime_client: OpenAI | None = None,
+    judge_client: OpenAI | None = None,
+) -> EvalReport:
+    """Run the active scorers against a sub-set of the golden set."""
+    scaffold_path = Path(scaffold_root)
+    runtime_path = (
+        Path(runtime_config_path)
+        if runtime_config_path is not None
+        else default_runtime_config_path(scaffold_path)
+    )
+
+    snapshot = load_harness(scaffold_path, runtime_path)
+    cfg: EvalConfig = snapshot.config.eval
+    selected_mode = mode or cfg.default_mode
+    if selected_mode not in cfg.modes:
+        raise ValueError(
+            f"mode {selected_mode!r} not in harness/config.yaml > eval.modes "
+            f"({list(cfg.modes)})"
+        )
+    mode_config = cfg.modes[selected_mode]
+
+    if profile:
+        mlflow.set_tracking_uri(f"databricks://{profile}")
+        os.environ["DATABRICKS_CONFIG_PROFILE"] = profile
+    mlflow.set_experiment(snapshot.config.experiments.eval)
+
+    enable_runtime_tracing()
+
+    runtime_client = runtime_client or build_databricks_client(profile=profile)
+    judge_client = judge_client or build_databricks_client(profile=profile)
+
+    examples = load_golden_set(golden_set_path)
+    selected = select_subset(examples, buckets=mode_config.buckets)
+
+    tool_executor = make_kb_executor(kb_dir)
+    agent = AnvilAgent(
+        scaffold_root=scaffold_path,
+        runtime_config_path=runtime_path,
+        source=SOURCE_EVAL,
+        client=runtime_client,
+        tool_executor=tool_executor,
+    )
+
+    def predict_fn(query: str, **_kwargs: Any) -> str:
+        request = ResponsesAgentRequest(
+            input=[{"type": "message", "role": "user", "content": query}]
+        )
+        response = agent.predict(request)
+        # Drain async export queue so eval_item.trace is not None
+        # downstream. Documented in the legacy lessons (rounds 3-5).
+        mlflow.flush_trace_async_logging()
+        try:
+            mlflow.end_trace()
+        except (AttributeError, TypeError):
+            pass
+        return _extract_final_text(response)
+
+    aggregate_scorer_names = list(cfg.scorers)
+    active_scorer_names = list(aggregate_scorer_names)
+    if include_safety and "safety" not in active_scorer_names:
+        active_scorer_names.append("safety")
+
+    scorers = build_scorers(
+        judge_client=judge_client,
+        judge_model=snapshot.config.judge_endpoint,
+        active=active_scorer_names,
+        include_safety=False,  # already handled above
+    )
+    dataset = _build_dataset(selected)
+
+    result = mlflow.genai.evaluate(
+        data=dataset,
+        scorers=scorers,
+        predict_fn=predict_fn,
+    )
+
+    experiment = mlflow.get_experiment_by_name(snapshot.config.experiments.eval)
+    return _aggregate_report(
+        result_df=result.result_df,
+        metrics=result.metrics,
+        scorer_names=active_scorer_names,
+        aggregate_scorer_names=aggregate_scorer_names,
+        examples=selected,
+        run_id=result.run_id,
+        experiment_id=experiment.experiment_id if experiment else "",
+        mode=selected_mode,
+    )

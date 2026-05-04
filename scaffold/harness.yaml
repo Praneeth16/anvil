@@ -1,0 +1,66 @@
+# ANVIL scaffold harness — optimizer-mutable.
+#
+# This file is the single source of truth for sampling parameters,
+# the active-skills list (with identity skill first), the active-rules
+# list, and the tool registry. The optimizer may edit any field here
+# when proposing a mutation.
+#
+# Endpoints (`runtime_endpoint`, `optimizer_endpoint`,
+# `judge_endpoint`), MLflow experiment paths, and loop
+# meta-configuration live in the IMMUTABLE `harness/config.yaml`.
+# The optimizer must NOT rewrite that file.
+
+# Global sampling defaults. Per-skill overrides may live under
+# `skills[].sampling` if a skill needs them.
+#
+# NOTE: some Databricks serving endpoints (e.g. Claude Sonnet 4.6)
+# reject requests that set both `temperature` and `top_p` at once.
+# Default to `temperature` only; set `top_p: <value>` and
+# `temperature: null` to switch to nucleus sampling. The optimizer
+# may toggle.
+sampling:
+  temperature: 0.7
+  top_p: null
+  max_tokens: 2048
+  tool_choice: auto      # auto | required | none
+  # Hard cap per turn — guards against tool-call loops AND keeps the
+  # optimizer's input-token consumption bounded. Empirically lowered
+  # from 8 to 3 after rounds 7-9 saturated input-TPM on Sonnet 4.6.
+  max_tool_calls: 3
+
+# Active skills. Order is the precedence the runtime composer
+# respects when composing the system prompt. The skill marked
+# `kind: identity` in its frontmatter MUST come first; the composer
+# fails fast if no identity skill is registered.
+skills:
+  - file: identity.md          # required — establishes the agent's role
+  - file: greeting.md
+  - file: classification.md
+  - file: escalation.md
+  - file: refund.md
+
+# Workflow rules. The composer filters by frontmatter `applies_to`
+# (one of: runtime, optimizer, both). Runtime sees only rules with
+# `applies_to: runtime` or `applies_to: both` (or unset, default
+# runtime); the optimizer sees rules with `applies_to: optimizer` or
+# `applies_to: both`.
+rules:
+  - file: no_repeat_failed_mutations.md   # applies_to: optimizer
+  - file: answer_scope_discipline.md      # applies_to: runtime
+
+# Tools registered for the runtime agent. `name` is the model-facing
+# tool name; the actual dispatch lives in the ToolExecutor injected
+# at construction time. The optimizer may edit names, descriptions,
+# and the registered set, but should not invent tools that have no
+# executor backing them.
+tools:
+  - name: search_knowledge_base
+    description: |
+      Search the NeoVolt policy knowledge base by natural-language
+      query. Returns the top-k matching policy documents, each with
+      doc_id, title, and a snippet of the body. Use whenever the user
+      asks about NeoVolt policies — billing, outages, tariffs,
+      payments, meters, account, safety, connections, regulatory
+      rights, or emergency contacts. If the result is "No matching
+      policy documents." the question is out of scope for this
+      knowledge base and you should say so.

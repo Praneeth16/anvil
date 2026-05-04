@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+.eggs/
+*.egg-info/
+*.egg
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# uv
+.uv/
+
+# Local env
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+
+# ANVIL-specific
+# personal handoffs, decks, demo notes
+.private/
+# agent SDK working dirs (worktrees, etc.)
+.claude/
+# local diagnostic logs
+traces/
+# local MLflow store (when running detached)
+mlruns/
+
+# Eval artifacts: round_NNN.json + .md are checked in deliberately;
+# any *.tmp.json or scratch/ output stays out.
+eval/runs/*.tmp.json
+eval/scratch/

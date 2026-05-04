@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""CLI driver for ``anvil.loop.round.run_round``.
+
+Usage::
+
+    # Run one round (auto-detects round_id from existing branches)
+    uv run python scripts/run_round.py
+
+    # Run a specific round id
+    uv run python scripts/run_round.py --round-id 1
+
+    # Run N consecutive rounds
+    uv run python scripts/run_round.py --rounds 3
+
+    # Choose eval mode (default = harness/config.yaml > eval.default_mode)
+    uv run python scripts/run_round.py --eval-mode quick
+
+The runner expects:
+
+* The repo's parent branch (default ``anvil/exp``) to exist.
+* ``eval/runs/baseline.json`` to be cached (run
+  ``scripts/evaluate.py --mode full`` first if missing).
+* ``ANTHROPIC_AUTH_TOKEN`` either in env or as a Databricks secret
+  ``anvil/anthropic_auth_token`` on the configured profile.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from anvil.loop.round import run_round  # noqa: E402
+
+
+def _arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--round-id", type=int, default=None, help="explicit round id")
+    p.add_argument("--rounds", type=int, default=1, help="number of consecutive rounds")
+    p.add_argument(
+        "--profile", default="DEFAULT", help="Databricks CLI profile"
+    )
+    p.add_argument(
+        "--parent-branch", default="anvil/exp", help="branch to fork from + ff-merge to"
+    )
+    p.add_argument(
+        "--eval-mode",
+        choices=["quick", "standard", "full"],
+        default=None,
+        help="eval mode for the post-mutation eval",
+    )
+    p.add_argument(
+        "--max-turns",
+        type=int,
+        default=30,
+        help="hard cap on optimizer CLI turns per round",
+    )
+    return p
+
+
+def _next_round_id(repo_root: Path) -> int:
+    """Highest existing eval/runs/round_NNN.json + 1, or 1 if none."""
+    runs = (repo_root / "eval" / "runs").glob("round_*.json")
+    nums = []
+    for p in runs:
+        m = re.search(r"round_(\d+)\.json$", p.name)
+        if m:
+            nums.append(int(m.group(1)))
+    return (max(nums) + 1) if nums else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _arg_parser().parse_args(argv)
+
+    # Verify parent branch exists.
+    proc = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", "--verify", args.parent_branch],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        print(f"ERROR: parent branch {args.parent_branch!r} does not exist.")
+        print(
+            f"Create it first: git -C {REPO_ROOT} checkout -b {args.parent_branch} main"
+        )
+        return 2
+
+    next_id = args.round_id if args.round_id is not None else _next_round_id(REPO_ROOT)
+
+    for i in range(args.rounds):
+        rid = next_id + i
+        print(f"\n=== round {rid} ===")
+        report = run_round(
+            round_id=rid,
+            repo_root=REPO_ROOT,
+            profile=args.profile,
+            parent_branch=args.parent_branch,
+            eval_mode=args.eval_mode,
+            max_turns=args.max_turns,
+        )
+        print(
+            f"=== round {rid} done · {report.decision} · "
+            f"action={report.action_kind} · Δ={report.score_delta}\n"
+        )
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
