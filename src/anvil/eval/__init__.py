@@ -10,7 +10,13 @@ Cross-plane knowledge is forbidden: this plane does not know about
 the optimizer or git.
 """
 
-from anvil.eval.cache import CachedBaseline, is_compatible, load_baseline, save_baseline
+from anvil.eval.cache import (
+    CachedBaseline,
+    is_compatible,
+    load_baseline,
+    report_to_baseline,
+    save_baseline,
+)
 from anvil.eval.runner import EvalReport, evaluate_branch
 from anvil.eval.scorers import build_scorers
 
@@ -21,5 +27,6 @@ __all__ = [
     "evaluate_branch",
     "is_compatible",
     "load_baseline",
+    "report_to_baseline",
     "save_baseline",
 ]

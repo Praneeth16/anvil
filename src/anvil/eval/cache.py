@@ -35,7 +35,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    # EvalReport lives in the sibling runner module. Referenced under
+    # TYPE_CHECKING only so this module stays import-light (no mlflow /
+    # openai pulled in just for a type hint). ``report_to_baseline``
+    # reads attributes off the report, so it is duck-typed at runtime.
+    from anvil.eval.runner import EvalReport
 
 
 @dataclass(frozen=True)
@@ -117,4 +124,49 @@ def is_compatible(
         and list(cached.scorers) == list(scorers)
         and cached.runtime_endpoint == runtime_endpoint
         and cached.judge_endpoint == judge_endpoint
+    )
+
+
+def report_to_baseline(
+    report: EvalReport,
+    *,
+    scaffold_commit_sha: str,
+    runtime_endpoint: str,
+    judge_endpoint: str,
+) -> CachedBaseline:
+    """Convert an :class:`EvalReport` into a storable :class:`CachedBaseline`.
+
+    ``evaluate_branch`` returns an ``EvalReport`` — the eval runner's
+    own schema (``n_rows`` / ``run_id`` / ``failures`` / ``trace_ids``).
+    The loop's keep/revert gate, by contrast, reads a ``CachedBaseline``
+    (``n_examples`` / ``mlflow_run_id``) from
+    ``eval/runs/baseline.json``. This function bridges the two schemas
+    so a fresh scaffold can produce the baseline the gate needs without
+    re-running the eval every round.
+
+    The two schemas intentionally diverge on two field names:
+    ``EvalReport.n_rows`` → ``CachedBaseline.n_examples`` and
+    ``EvalReport.run_id`` → ``CachedBaseline.mlflow_run_id``. The
+    eval-only fields (``failures`` / ``experiment_id`` / ``trace_ids``)
+    are dropped — the cache header only carries what
+    :func:`is_compatible` and :func:`load_baseline` consume.
+
+    The three fields the eval does not know — ``scaffold_commit_sha``
+    (git), ``runtime_endpoint`` and ``judge_endpoint``
+    (``harness/config.yaml``) — are passed in by the caller, keeping
+    this plane git-agnostic and config-source-agnostic (see the module
+    docstring: cross-plane knowledge is forbidden here).
+    """
+    return CachedBaseline(
+        scaffold_commit_sha=scaffold_commit_sha,
+        evaluated_at=report.evaluated_at,
+        mode=report.mode,
+        scorers=list(report.scorers),
+        runtime_endpoint=runtime_endpoint,
+        judge_endpoint=judge_endpoint,
+        aggregate=report.aggregate,
+        per_judge=dict(report.per_judge),
+        per_bucket={k: dict(v) for k, v in report.per_bucket.items()},
+        n_examples=report.n_rows,
+        mlflow_run_id=report.run_id,
     )
