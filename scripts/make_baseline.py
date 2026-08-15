@@ -131,8 +131,14 @@ def build_baseline(
     )
     runtime_endpoint, judge_endpoint = _load_endpoints(runtime_path)
 
+    # Forward the resolved config path so the eval runs against the SAME
+    # harness/config.yaml the endpoints above were read from. Without this
+    # evaluate_branch() falls back to default_runtime_config_path() and the
+    # recorded endpoints can diverge from the config that produced the eval
+    # — a misleading baseline cache.
     report = evaluate_branch(
         scaffold_root=scaffold_path,
+        runtime_config_path=runtime_path,
         profile=profile,
         mode=mode,
         include_safety=include_safety,

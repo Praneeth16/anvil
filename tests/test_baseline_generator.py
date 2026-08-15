@@ -305,3 +305,62 @@ def test_make_baseline_help_lists_options(
     assert "--scaffold" in out
     assert "--profile" in out
     assert "--include-safety" in out
+
+
+# ---------------------------------------------------------------------------
+# 5. build_baseline() forwards an explicit runtime_config_path to
+#    evaluate_branch(). Without the forwarding the eval runs against the
+#    default config while the baseline records endpoints read from a
+#    different config — a misleading cache (cross-review of PR #1).
+# ---------------------------------------------------------------------------
+
+
+def test_build_baseline_forwards_explicit_runtime_config_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make_baseline = _import_make_baseline()
+
+    # A custom config at a NON-default location, with endpoints distinct
+    # from the default so a silent fall-back would be detectable.
+    custom_runtime = "databricks-claude-opus-4-7"
+    custom_judge = "databricks-claude-haiku-4-5"
+    custom_cfg = tmp_path / "custom" / "config.yaml"
+    custom_cfg.parent.mkdir(parents=True)
+    custom_cfg.write_text(
+        f"runtime_endpoint: {custom_runtime}\n"
+        f"optimizer_endpoint: {custom_runtime}\n"
+        f"judge_endpoint: {custom_judge}\n"
+        "experiments:\n"
+        '  runtime: "/Shared/anvil-runtime"\n'
+        '  eval: "/Shared/anvil-eval"\n'
+        '  optimizer: "/Shared/anvil-optimizer"\n',
+        encoding="utf-8",
+    )
+
+    # The default config (sibling of scaffold/) carries DIFFERENT endpoints.
+    (tmp_path / "harness").mkdir(parents=True)
+    (tmp_path / "harness" / "config.yaml").write_text(_MIN_CONFIG_YAML, encoding="utf-8")
+    (tmp_path / "scaffold").mkdir()
+
+    captured: dict[str, object] = {}
+
+    def _capture_evaluate(**kwargs: object) -> EvalReport:
+        captured.update(kwargs)
+        return _fake_report()
+
+    monkeypatch.setattr(make_baseline, "evaluate_branch", _capture_evaluate)
+    monkeypatch.setattr(make_baseline, "_git_head_sha", lambda _root: _SHA)
+
+    baseline = make_baseline.build_baseline(
+        scaffold_root=tmp_path / "scaffold",
+        runtime_config_path=custom_cfg,
+    )
+
+    # The eval must run against the SAME config the baseline read endpoints
+    # from — not the default sibling of scaffold/.
+    assert "runtime_config_path" in captured
+    assert Path(captured["runtime_config_path"]) == custom_cfg  # type: ignore[arg-type]
+    # And the recorded endpoints match the custom config end-to-end, proving
+    # the cache header and the forwarded eval config are consistent.
+    assert baseline.runtime_endpoint == custom_runtime
+    assert baseline.judge_endpoint == custom_judge
