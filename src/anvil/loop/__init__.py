@@ -9,24 +9,37 @@ keep/revert decisions. Drives one round end-to-end:
   4. Apply the returned ``OptimizerAction`` to scaffold/.
   5. Commit.
   6. Run eval on the mutated branch (skip on noop).
-  7. Compute score delta vs cached baseline.
+  7. Compute score delta vs cached baseline (reported) + decide keep |
+     revert | noop | infra_fail via the configured gate
+     (``harness/config.yaml > gate``; Pareto frontier by default).
   8. Write critique md + round JSON + mutations log row.
-  9. Decide keep | revert | noop | infra_fail.
- 10. ff-merge to ``anvil/exp`` (KEEP) or branch -D (everything else).
+  9. ff-merge to ``anvil/exp`` (KEEP) or branch -D (everything else).
 """
 
 from anvil.loop.builder import build_round_prompt
 from anvil.loop.decision import Decision, decide
+from anvil.loop.frontier import (
+    Frontier,
+    gate_decision,
+    load_frontier,
+    load_gate_config,
+    save_frontier,
+)
 from anvil.loop.mutations_log import MutationRecord, append_mutation, load_mutations
 from anvil.loop.round import RoundReport, run_round
 
 __all__ = [
     "Decision",
+    "Frontier",
     "MutationRecord",
     "RoundReport",
     "append_mutation",
     "build_round_prompt",
     "decide",
+    "gate_decision",
+    "load_frontier",
+    "load_gate_config",
     "load_mutations",
     "run_round",
+    "save_frontier",
 ]

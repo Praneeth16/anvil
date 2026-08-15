@@ -3,7 +3,8 @@
 The orchestrator. Reads cached baseline → spawns optimizer session →
 applies the action → runs eval on the mutated branch → computes
 score_delta → writes critique md + round JSON + mutations log row →
-applies the keep/revert decision.
+applies the keep/revert decision via the configured gate
+(``harness/config.yaml > gate``; see :mod:`anvil.loop.frontier`).
 
 Sync function. Internally calls ``asyncio.run`` to bridge to the
 async ``run_optimizer_session``. Everything else is plain Python.
@@ -13,12 +14,18 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from anvil.eval import evaluate_branch, load_baseline
 from anvil.loop.builder import build_round_prompt
-from anvil.loop.decision import Decision, decide
+from anvil.loop.decision import Decision
+from anvil.loop.frontier import (
+    gate_decision,
+    load_gate_config,
+    scores_from_baseline,
+    scores_from_eval,
+)
 from anvil.loop.git_ops import (
     commit_all,
     create_round_branch,
@@ -80,7 +87,7 @@ def run_round(
     repo_root = Path(repo_root).resolve()
     scaffold_root = Path(scaffold_root or (repo_root / "scaffold")).resolve()
 
-    starting_branch = current_branch(repo_root)
+    _starting_branch = current_branch(repo_root)
     parent_sha = current_sha(repo_root)
     baseline = load_baseline(repo_root)
 
@@ -116,15 +123,11 @@ def run_round(
     apply_result = apply_action(action, scaffold_root)
 
     # 4. Commit (no-op if nothing changed, e.g. noop action).
-    commit_message = (
-        f"round {round_id:03d}: {apply_result.action_summary or 'noop'}"
-    )
+    commit_message = f"round {round_id:03d}: {apply_result.action_summary or 'noop'}"
     commit_sha = commit_all(repo_root, message=commit_message)
 
     # 5. Persist transcript (debug aid; not the critique md yet).
-    transcript_path = (
-        repo_root / "scaffold" / "memory" / f"round_{round_id:03d}_transcript.md"
-    )
+    transcript_path = repo_root / "scaffold" / "memory" / f"round_{round_id:03d}_transcript.md"
     transcript_path.parent.mkdir(parents=True, exist_ok=True)
     transcript_path.write_text(transcript or "(empty)\n", encoding="utf-8")
 
@@ -153,23 +156,48 @@ def run_round(
             print(f"[round {round_id}] eval failure: {notes}")
 
     # 7. Compute score delta + decision.
+    #
+    # ``score_delta`` is reported vs the cached (frozen) baseline for the
+    # human-facing artifacts (round JSON, mutations log) — it shows how the
+    # mutation compares to the *original* baseline. The keep/revert DECISION
+    # is delegated to the configured gate (``harness/config.yaml > gate``):
+    #
+    # * ``gate.type: frontier`` (default) — Pareto frontier. The decision
+    #   compares the mutation against the best-so-far per objective
+    #   (per-judge scores + aggregate), persisted to
+    #   ``eval/runs/frontier.json``. A round that scores worse than a
+    #   previously KEPT round is REVERTED even if it still beats the frozen
+    #   baseline — the fix for the silent regression the frozen-baseline
+    #   delta gate allowed. On the first scored round the frontier is
+    #   initialized from the baseline.
+    # * ``gate.type: delta`` — legacy frozen-baseline behavior (kept for
+    #   backward compatibility); the decision reproduces the old
+    #   ``score_delta > 0`` check exactly and does not touch the frontier.
     baseline_aggregate = float(baseline.aggregate) if baseline else None
     score_delta = (
         (mutated_score - baseline_aggregate)
         if (mutated_score is not None and baseline_aggregate is not None)
         else None
     )
-    decision = decide(
-        score_delta=score_delta,
+    gate_cfg = load_gate_config(scaffold_root)
+    baseline_scores = scores_from_baseline(baseline) if baseline else None
+    mutated_scores = scores_from_eval(eval_report) if eval_report is not None else None
+    decision, frontier = gate_decision(
+        repo_root=repo_root,
+        gate_type=gate_cfg.type,
+        epsilon=gate_cfg.epsilon,
+        pareto=gate_cfg.pareto,
+        baseline_scores=baseline_scores,
+        baseline_aggregate=baseline_aggregate,
+        mutated_scores=mutated_scores,
+        mutated_aggregate=mutated_score,
         action_kind=action.action,
-        parse_status=parse_result.parse_status,
         eval_failed=eval_failed,
+        parse_status=parse_result.parse_status,
     )
 
     # 8. Write critique md.
-    critique_path = (
-        repo_root / "scaffold" / "memory" / f"round_{round_id:03d}_critique.md"
-    )
+    critique_path = repo_root / "scaffold" / "memory" / f"round_{round_id:03d}_critique.md"
     critique_path.write_text(
         _build_critique_md(
             round_id=round_id,
@@ -203,6 +231,7 @@ def run_round(
                 score_delta=score_delta,
                 parse_status=parse_result.parse_status,
                 notes="",
+                frontier_best=frontier.best if frontier else None,
             ),
             indent=2,
         )
@@ -251,7 +280,7 @@ def run_round(
         # NOOP: keep the (empty) branch around? Cheaper to delete.
         delete_branch(repo_root, branch=branch, target=parent_branch)
 
-    # We don't hard-restore starting_branch — caller's session is now on
+    # We don't hard-restore the starting branch — caller's session is now on
     # parent_branch, which is correct: that's where the kept mutation
     # lives. Worth printing for clarity.
     print(
@@ -317,7 +346,7 @@ score_delta: {sd}
 # Round {round_id} critique
 
 ## Action applied
-{apply_summary or '(no change)'}
+{apply_summary or "(no change)"}
 
 ## Rationale (from optimizer)
 {rationale}
@@ -341,6 +370,7 @@ def _build_round_json(
     score_delta: float | None,
     parse_status: str,
     notes: str,
+    frontier_best: dict[str, float] | None = None,
 ) -> dict:
     payload: dict = {
         "round_id": round_id,
@@ -353,6 +383,10 @@ def _build_round_json(
         "baseline_score": baseline_score,
         "score_delta_vs_parent": score_delta,
         "notes": notes,
+        # Best-so-far per objective after this round's decision (frontier
+        # gate only; None for the legacy delta gate / noop / infra-fail).
+        # The decision is driven by this, not by ``score_delta_vs_parent``.
+        "frontier_best": frontier_best,
     }
     if eval_report is not None:
         payload.update(
