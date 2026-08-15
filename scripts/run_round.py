@@ -35,6 +35,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from anvil.loop.git_ops import check_clean_worktree  # noqa: E402
 from anvil.loop.round import run_round  # noqa: E402
 
 
@@ -60,6 +61,11 @@ def _arg_parser() -> argparse.ArgumentParser:
         default=30,
         help="hard cap on optimizer CLI turns per round",
     )
+    p.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="skip the clean-worktree safety check",
+    )
     return p
 
 
@@ -76,6 +82,11 @@ def _next_round_id(repo_root: Path) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = _arg_parser().parse_args(argv)
+
+    if args.allow_dirty:
+        print("WARNING: --allow-dirty specified; skipping clean-worktree safety check.")
+    else:
+        check_clean_worktree()
 
     # Verify parent branch exists.
     proc = subprocess.run(
