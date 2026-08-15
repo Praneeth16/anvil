@@ -33,6 +33,7 @@ Public surface:
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,11 @@ def _shared_objectives(a: dict[str, float], b: dict[str, float]) -> list[str]:
     out = [k for k in b if k in a]
     out.extend(k for k in a if k not in b)
     return out
+
+
+def _all_finite(scores: dict[str, float]) -> bool:
+    """True if every value in ``scores`` is a finite number."""
+    return all(math.isfinite(v) for v in scores.values())
 
 
 class Frontier:
@@ -129,15 +135,28 @@ class Frontier:
         semantics where a zero gradient is not an improvement.
 
         An objective that the frontier has no best-so-far for counts as
-        an extension (improves); an objective the mutation does not
-        report is skipped (no information — can be neither an improvement
-        nor a regression).
+        an extension (improves). An objective among the frontier's
+        tracked objectives that the mutation does not report fails
+        closed (revert): a mutation that drops a previously-tracked
+        objective must not be KEPT while hiding the regression.
+
+        Non-finite score values (NaN, +inf, -inf) cause the gate to fail
+        closed (revert): NaN comparisons are always False in Python, so a
+        NaN delta would never trip the regression or improvement checks
+        and the mutation could be silently KEPT.
         """
         if objectives is not None:
             objs = list(objectives)
         else:
             objs = _shared_objectives(mutated_scores, current_frontier)
         if not objs:
+            return False
+
+        # Reject non-finite scores (NaN/inf) — fail closed (revert). NaN
+        # comparisons are always False in Python, so a NaN delta never
+        # trips the regression or improvement checks and the mutation
+        # could be silently KEPT.
+        if not _all_finite(mutated_scores):
             return False
 
         if not pareto:
@@ -157,7 +176,7 @@ class Frontier:
         for obj in objs:
             new = mutated_scores.get(obj)
             if new is None:
-                continue  # mutation did not report this objective
+                return False  # mutation dropped a tracked objective → fail closed
             cur = current_frontier.get(obj)
             if cur is None:
                 improves_any = True  # frontier has no best yet → extends
@@ -179,7 +198,15 @@ class Frontier:
         On the first call against an empty frontier, the incoming scores
         seed both the objectives and the best-so-far (the first point
         always extends an empty frontier).
+
+        Non-finite score values (NaN, +inf, -inf) cause an immediate
+        revert — they never enter the best-so-far.
         """
+        # Reject non-finite scores before tracking objectives or
+        # comparing — a NaN/inf must never enter the best-so-far.
+        if not _all_finite(scores):
+            return False
+
         # Track any newly-seen objectives so the gate compares over the
         # full set the loop has ever reported.
         if not self._objectives:
@@ -333,9 +360,13 @@ def gate_decision(
     Ordering mirrors :func:`anvil.loop.decision.decide`:
 
     1. An explicit ``noop`` from the optimizer wins over everything.
-    2. An eval-side infrastructure failure (or a missing mutated score)
-       beats any score consideration → ``INFRA_FAIL``.
-    3. Otherwise the gate decides KEEP vs REVERT.
+    2. An eval-side infrastructure failure (or a missing mutated
+       *aggregate*) beats any score consideration → ``INFRA_FAIL``.
+    3. ``gate_type="delta"`` → legacy :func:`decide` (needs only the
+       aggregate; checked before per-objective scores).
+    4. ``gate_type="frontier"`` → per-objective scores required; a
+       missing ``mutated_scores`` → ``INFRA_FAIL``, otherwise the
+       frontier gate decides KEEP vs REVERT.
 
     For ``gate_type="delta"`` the legacy frozen-baseline behavior is
     reproduced exactly via :func:`decide`; the frontier is not used.
@@ -350,11 +381,16 @@ def gate_decision(
     if action_kind == "noop":
         return Decision.NOOP, None
 
-    # 2. eval failure / missing score → infra fail (no gate, no frontier I/O).
-    if eval_failed or mutated_scores is None or mutated_aggregate is None:
+    # 2. eval failure / missing aggregate → infra fail (no gate, no frontier
+    #    I/O). Only mutated_aggregate is checked here: the delta gate needs
+    #    only the aggregate, so per-objective scores are validated later for
+    #    the frontier gate specifically.
+    if eval_failed or mutated_aggregate is None:
         return Decision.INFRA_FAIL, None
 
     # 3a. Legacy frozen-baseline gate — preserved verbatim for backward compat.
+    #     Placed before the mutated_scores check: the delta gate needs only
+    #     mutated_aggregate, not per-objective scores.
     if gate_type == "delta":
         score_delta = (
             mutated_aggregate - baseline_aggregate if baseline_aggregate is not None else None
@@ -368,6 +404,10 @@ def gate_decision(
         return decision, None
 
     # 3b. Pareto frontier gate (default).
+    #     Per-objective scores are required for the frontier gate.
+    if mutated_scores is None:
+        return Decision.INFRA_FAIL, None
+
     frontier = load_frontier(repo_root)
     if frontier is None:
         # First scored round: initialize the frontier from the baseline.

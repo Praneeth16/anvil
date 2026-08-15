@@ -194,6 +194,32 @@ def test_should_keep_pareto_false_falls_back_to_first_objective() -> None:
     assert Frontier.should_keep({"correctness": 0.4}, frontier, pareto=False) is False
 
 
+def test_should_keep_reverts_when_tracked_objective_missing() -> None:
+    """A mutation that drops a tracked objective (e.g. safety) fails
+    closed — the gate returns False (revert), not silently skipping it."""
+    frontier = {"correctness": 0.5, "safety": 0.9}
+    mutated = {"correctness": 0.6}  # safety absent from the mutation
+    assert (
+        Frontier.should_keep(
+            mutated, frontier, objectives=["correctness", "safety"]
+        )
+        is False
+    )
+
+
+def test_should_keep_reverts_on_nan_score() -> None:
+    """NaN for one objective → fail closed (NaN comparisons are always
+    False, so the delta never trips regression or improvement checks)."""
+    mutated = {**BASELINE, "correctness": float("nan")}
+    assert Frontier.should_keep(mutated, BASELINE) is False
+
+
+def test_should_keep_reverts_on_infinite_score() -> None:
+    """An infinite score → fail closed."""
+    mutated = {**BASELINE, "correctness": float("inf")}
+    assert Frontier.should_keep(mutated, BASELINE) is False
+
+
 # ---------------------------------------------------------------------------
 # Frontier — serialization
 # ---------------------------------------------------------------------------
@@ -467,6 +493,22 @@ def test_gate_delta_noop_and_infra_fail_match_legacy(tmp_path: Path) -> None:
     assert _gate(tmp_path, gate_type="delta", eval_failed=True)[0] == Decision.INFRA_FAIL
 
 
+def test_gate_decision_delta_works_with_aggregate_only(tmp_path: Path) -> None:
+    """The delta gate only needs mutated_aggregate, not per-objective scores.
+    A valid aggregate with absent per-objective scores must NOT become
+    INFRA_FAIL — it should use the legacy decide()."""
+    decision, frontier = _gate(
+        tmp_path,
+        gate_type="delta",
+        mutated_scores=None,
+        mutated_aggregate=0.8,
+    )
+    assert decision != Decision.INFRA_FAIL
+    assert frontier is None
+    # 0.8 > baseline 0.744 → KEEP under the legacy gate.
+    assert decision == Decision.KEEP
+
+
 # ---------------------------------------------------------------------------
 # load_gate_config
 # ---------------------------------------------------------------------------
@@ -516,6 +558,22 @@ def test_load_gate_config_rejects_unknown_field(tmp_path: Path) -> None:
 
     with pytest.raises(ValidationError):
         load_gate_config(tmp_path / "scaffold")
+
+
+def test_gate_config_rejects_negative_epsilon() -> None:
+    """A negative epsilon makes ties count as improvements → rejected."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        GateConfig(epsilon=-0.1)
+
+
+def test_gate_config_rejects_nan_epsilon() -> None:
+    """A NaN epsilon breaks every comparison in the gate → rejected."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        GateConfig(epsilon=float("nan"))
 
 
 # ---------------------------------------------------------------------------

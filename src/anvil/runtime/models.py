@@ -15,10 +15,11 @@ with a domain-specific message.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class SamplingConfig(BaseModel):
@@ -106,6 +107,19 @@ class GateConfig(BaseModel):
     type: Literal["frontier", "delta"] = "frontier"
     epsilon: float = 0.0
     pareto: bool = True
+
+    @field_validator("epsilon")
+    @classmethod
+    def _epsilon_must_be_nonneg_finite(cls, v: float) -> float:
+        """Reject negative or non-finite epsilon.
+
+        A negative epsilon makes ties count as improvements (``delta >
+        epsilon`` is True when epsilon < 0 and delta == 0). NaN/inf
+        epsilon breaks every comparison in the gate.
+        """
+        if not math.isfinite(v) or v < 0:
+            raise ValueError("epsilon must be >= 0 and finite")
+        return v
 
 
 class ExperimentsConfig(BaseModel):
