@@ -54,6 +54,17 @@ def has_changes(repo_root: Path | str) -> bool:
     return bool(res.stdout)
 
 
+def check_clean_worktree() -> None:
+    """Raise if the Git working tree containing the current directory is dirty."""
+    status = _run(Path.cwd(), ["status", "--porcelain"])
+    if status.stdout:
+        raise RuntimeError(
+            "Working tree is dirty. Commit or stash your changes before running an "
+            "optimization round. Uncommitted files:\n"
+            f"{status.stdout}"
+        )
+
+
 def create_round_branch(
     repo_root: Path | str, round_id: int, *, parent_branch: str = "anvil/exp"
 ) -> str:
