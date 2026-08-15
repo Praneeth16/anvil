@@ -148,7 +148,12 @@ class Frontier:
         if objectives is not None:
             objs = list(objectives)
         else:
-            objs = _shared_objectives(mutated_scores, current_frontier)
+            # Union of frontier and mutation keys. Frontier keys first so
+            # tracked objectives are always checked (missing → fail closed).
+            objs = list(current_frontier.keys())
+            for k in mutated_scores:
+                if k not in current_frontier:
+                    objs.append(k)
         if not objs:
             return False
 

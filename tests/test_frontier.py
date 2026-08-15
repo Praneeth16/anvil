@@ -199,12 +199,23 @@ def test_should_keep_reverts_when_tracked_objective_missing() -> None:
     closed — the gate returns False (revert), not silently skipping it."""
     frontier = {"correctness": 0.5, "safety": 0.9}
     mutated = {"correctness": 0.6}  # safety absent from the mutation
+    # Without explicit objectives — the normal call path
+    assert Frontier.should_keep(mutated, frontier) is False
+    # With explicit objectives — also fails closed
     assert (
         Frontier.should_keep(
             mutated, frontier, objectives=["correctness", "safety"]
         )
         is False
     )
+
+
+def test_should_keep_new_objective_extends_frontier() -> None:
+    """A mutation reporting a new objective not in the frontier
+    counts as an improvement (extends the frontier)."""
+    frontier = {"correctness": 0.5}
+    mutated = {"correctness": 0.5, "safety": 0.9}  # safety is new
+    assert Frontier.should_keep(mutated, frontier) is True
 
 
 def test_should_keep_reverts_on_nan_score() -> None:
