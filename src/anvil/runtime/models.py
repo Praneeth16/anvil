@@ -67,6 +67,47 @@ class LoopConfig(BaseModel):
     max_optimizer_turns: int = 30
 
 
+class GateConfig(BaseModel):
+    """Configuration for the round keep/revert gate.
+
+    The gate decides whether a round's mutation is KEPT (fast-forward
+    merged into the parent branch) or REVERTED (branch deleted).
+
+    ``type`` selects the strategy:
+
+    * ``frontier`` (default) — Pareto frontier. A mutation is KEPT only
+      if it improves at least one tracked objective (per-judge scores +
+      the aggregate) without regressing any other by more than
+      ``epsilon``. The frontier — the best-so-far score per objective —
+      persists to ``eval/runs/frontier.json`` and is loaded at the start
+      of each round. On the first scored round (no frontier file) the
+      frontier is initialized from the cached baseline. This closes
+      the silent-regression hole in the legacy gate: a round that
+      scores worse than a previous KEPT round is REVERTED, even if it
+      still beats the original frozen baseline.
+    * ``delta`` — Legacy frozen-baseline behavior, preserved for
+      backward compatibility. A mutation is KEPT iff its aggregate beats
+      the cached baseline aggregate (``score_delta > 0``). The frontier
+      file is neither written nor read.
+
+    ``pareto`` (only consulted when ``type: frontier``): ``true`` for
+    multi-objective Pareto dominance across all tracked objectives;
+    ``false`` to fall back to single-objective "aggregate vs best-so-far
+    aggregate" — still measured against the frontier, never the frozen
+    baseline.
+
+    ``epsilon`` is the minimum improvement on an objective to count as
+    "better". With ``0.0`` a strict positive delta is required, so a tie
+    (no objective improves) does not extend the frontier and is reverted.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["frontier", "delta"] = "frontier"
+    epsilon: float = 0.0
+    pareto: bool = True
+
+
 class ExperimentsConfig(BaseModel):
     """MLflow experiment paths. Stable, declared in config.yaml."""
 
@@ -115,6 +156,7 @@ class RuntimeYAML(BaseModel):
     experiments: ExperimentsConfig
     loop: LoopConfig = Field(default_factory=LoopConfig)
     eval: EvalConfig = Field(default_factory=EvalConfig)
+    gate: GateConfig = Field(default_factory=GateConfig)
 
 
 class HarnessConfig(BaseModel):
@@ -130,6 +172,7 @@ class HarnessConfig(BaseModel):
     tools: list[ToolRef] = Field(default_factory=list)
     loop: LoopConfig = Field(default_factory=LoopConfig)
     eval: EvalConfig = Field(default_factory=EvalConfig)
+    gate: GateConfig = Field(default_factory=GateConfig)
 
     @classmethod
     def from_split(cls, scaffold: ScaffoldYAML, runtime: RuntimeYAML) -> HarnessConfig:
@@ -144,6 +187,7 @@ class HarnessConfig(BaseModel):
             tools=list(scaffold.tools),
             loop=runtime.loop,
             eval=runtime.eval,
+            gate=runtime.gate,
         )
 
 
@@ -151,6 +195,14 @@ class HarnessConfig(BaseModel):
 # generate domain-specific errors when an extra field happens to be
 # one of the canonical fields on the opposite side of the split.
 RUNTIME_FIELDS: frozenset[str] = frozenset(
-    {"runtime_endpoint", "optimizer_endpoint", "judge_endpoint", "experiments", "loop", "eval"}
+    {
+        "runtime_endpoint",
+        "optimizer_endpoint",
+        "judge_endpoint",
+        "experiments",
+        "loop",
+        "eval",
+        "gate",
+    }
 )
 SCAFFOLD_FIELDS: frozenset[str] = frozenset({"sampling", "skills", "rules", "tools"})

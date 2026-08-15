@@ -77,3 +77,37 @@ eval:
     - retrieval_groundedness
     - refusal_appropriateness
   safety_guard_threshold: 0.95
+
+# Gate configuration — how a round's mutation is accepted or rejected.
+#
+# The gate replaces the legacy frozen-baseline delta. The old gate kept
+# any mutation whose aggregate beat the cached baseline; that silently
+# allowed regressions (a round worse than a previous KEPT round but
+# still above the baseline was kept).
+gate:
+  # Gate strategy.
+  #   frontier — Pareto frontier (default). A mutation is KEPT only if it
+  #              improves at least one tracked objective (per-judge scores
+  #              + the aggregate) without regressing any other by more
+  #              than ``epsilon``. The frontier — best-so-far per
+  #              objective — persists to eval/runs/frontier.json and is
+  #              initialized from the baseline on the first scored round.
+  #              A round that scores worse than the best-so-far is REVERTED
+  #              even if it still beats the frozen baseline.
+  #   delta    — Legacy frozen-baseline behavior. A mutation is KEPT iff
+  #              its aggregate beats the cached baseline aggregate
+  #              (score_delta > 0). Backward compatible; the frontier file
+  #              is not used.
+  type: frontier
+  # Minimum improvement on an objective to count as "better". With 0.0 a
+  # strict positive delta is required — a tie (no objective improves)
+  # does not extend the frontier and is reverted.
+  epsilon: 0.0
+  # Multi-objective switch (only used when type: frontier).
+  #   true  — Pareto dominance across all tracked objectives (per-judge +
+  #           aggregate): keep iff >=1 objective improves by > epsilon
+  #           and no objective regresses by > epsilon.
+  #   false — Single-objective: keep iff the aggregate improves vs the
+  #           best-so-far aggregate by > epsilon. Still measured against
+  #           the frontier, NOT the frozen baseline.
+  pareto: true
