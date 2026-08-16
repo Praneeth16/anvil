@@ -35,6 +35,7 @@ import sys
 import warnings
 from collections import defaultdict
 from collections.abc import Callable
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -46,6 +47,14 @@ import mlflow
 from mlflow.entities import SpanType
 from mlflow.types.responses import ResponsesAgentRequest
 from openai import OpenAI
+
+try:
+    from mlflow.environment_variables import MLFLOW_ENABLE_ASYNC_TRACE_LOGGING
+
+    _MLFLOW_ASYNC_TRACE_LOGGING_ENV = MLFLOW_ENABLE_ASYNC_TRACE_LOGGING.name
+except ImportError:
+    # Compatibility with MLflow versions that predate the env-var constant.
+    _MLFLOW_ASYNC_TRACE_LOGGING_ENV = "MLFLOW_ENABLE_ASYNC_TRACE_LOGGING"
 
 from anvil.agents.memory_system import MemorySystem
 from anvil.data import load_golden_set, select_subset
@@ -485,6 +494,20 @@ _MLFLOW_MAX_WORKERS_ENV = "MLFLOW_GENAI_EVAL_MAX_WORKERS"
 _PREDICT_SPAN_NAME = "anvil.predict"
 
 
+@contextmanager
+def _synchronous_trace_logging():
+    """Temporarily force MLflow trace export to complete synchronously."""
+    previous = os.environ.get(_MLFLOW_ASYNC_TRACE_LOGGING_ENV)
+    os.environ[_MLFLOW_ASYNC_TRACE_LOGGING_ENV] = "false"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(_MLFLOW_ASYNC_TRACE_LOGGING_ENV, None)
+        else:
+            os.environ[_MLFLOW_ASYNC_TRACE_LOGGING_ENV] = previous
+
+
 def _run_predictions_parallel(
     predict_fn: Callable[[str], str],
     queries: list[str],
@@ -702,11 +725,16 @@ def evaluate_branch(
     _prev_workers = os.environ.get(_MLFLOW_MAX_WORKERS_ENV)
     os.environ[_MLFLOW_MAX_WORKERS_ENV] = str(n_workers)
     try:
-        result = mlflow.genai.evaluate(
-            data=dataset,
-            scorers=scorers,
-            predict_fn=predict_fn,
-        )
+        # On the Databricks Tracing Server, async export can race the eval
+        # harness's immediate per-row get_trace(request_id). A missing trace
+        # then reaches scoring as None and crashes _get_new_expectations.
+        # Keep export synchronous until evaluate has finished reading traces.
+        with _synchronous_trace_logging():
+            result = mlflow.genai.evaluate(
+                data=dataset,
+                scorers=scorers,
+                predict_fn=predict_fn,
+            )
     finally:
         if _prev_workers is None:
             os.environ.pop(_MLFLOW_MAX_WORKERS_ENV, None)
