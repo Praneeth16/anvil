@@ -71,14 +71,41 @@ eval:
   # Cooldown seconds between row tasks inside the thread pool when
   # the endpoint is approaching its quota.
   inter_row_cooldown_s: 0.0
-  # Scorers active by default. Safety is excluded from the aggregate
-  # by design — it has been a flat 1.000 in every measured round and
-  # provides no gradient. It can be re-added as a guard-only check
-  # via --include-safety.
+  # Scorers active by default. Each entry may be a bare name string
+  # (legacy form → type: llm, weight: 1.0) or a dict with ``name``,
+  # ``type`` (``llm`` or ``programmatic``), ``weight`` (default 1.0),
+  # and — for programmatic scorers — ``check_function`` (the name of a
+  # function in ``data/evaluator.py``). The aggregate is a weighted
+  # average across all configured scorers; uniform weights collapse to
+  # the legacy unweighted mean.
+  #
+  # Safety is excluded from the aggregate by design — it has been a
+  # flat 1.000 in every measured round and provides no gradient. It can
+  # be re-added as a guard-only check via --include-safety.
   scorers:
     - correctness
     - retrieval_groundedness
     - refusal_appropriateness
+    # Mixed llm + programmatic example (uncomment to enable). The
+    # programmatic scorers below are deterministic — no LLM call — and
+    # load their check functions from data/evaluator.py.
+    # - name: correctness
+    #   type: llm
+    #   weight: 0.4
+    # - name: retrieval_groundedness
+    #   type: llm
+    #   weight: 0.3
+    # - name: refusal_appropriateness
+    #   type: llm
+    #   weight: 0.3
+    # - name: exact_match
+    #   type: programmatic
+    #   check_function: exact_match
+    #   weight: 0.2
+    # - name: schema_validity
+    #   type: programmatic
+    #   check_function: json_schema_validity
+    #   weight: 0.2
   safety_guard_threshold: 0.95
 
 # Gate configuration — how a round's mutation is accepted or rejected.

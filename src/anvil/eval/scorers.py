@@ -26,18 +26,28 @@ the judge's own ``chat.completions.create`` does not spawn an orphan
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
+from types import ModuleType
 
 import mlflow
 from mlflow.entities import AssessmentSource, Feedback
 from mlflow.genai.scorers import Correctness, RetrievalGroundedness, Safety, scorer
 from openai import OpenAI
 
+from anvil.runtime.models import ScorerConfig
+
 DEFAULT_JUDGE_MODEL = "databricks-claude-sonnet-4-6"
 
 REFUSAL_SCORER_NAME = "refusal_appropriateness"
+
+# Default location of the programmatic check-function module, relative
+# to the harness working directory (matches the ``data/golden_set.jsonl``
+# convention). Overridable per-call via ``evaluator_path``.
+DEFAULT_EVALUATOR_PATH = Path("data/evaluator.py")
 
 # Maps the YAML scorer-name strings to the actual scorer factories.
 _BUILTIN_SCORERS = {
@@ -170,39 +180,132 @@ def _build_refusal_scorer(ctx: _JudgeContext):
     return refusal_appropriateness
 
 
+# ---------------------------------------------------------------------------
+# Programmatic scorers — deterministic check functions, no LLM call.
+# ---------------------------------------------------------------------------
+
+
+def load_evaluator_module(evaluator_path: str | Path | None = None) -> ModuleType:
+    """Dynamically import the programmatic check-function module.
+
+    Resolves ``evaluator_path`` (default :data:`DEFAULT_EVALUATOR_PATH`,
+    CWD-relative like ``data/golden_set.jsonl``) to an absolute path and
+    imports it via :mod:`importlib` under a stable module name. The
+    module is re-executed on every call — the eval runner builds scorers
+    once per ``evaluate_branch`` call, so there is no per-row cost, and
+    always-fresh execution avoids stale-cache bugs when the file is
+    edited between runs.
+    """
+    path = Path(evaluator_path) if evaluator_path is not None else DEFAULT_EVALUATOR_PATH
+    resolved = path.resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"evaluator module not found: {resolved}")
+    spec = importlib.util.spec_from_file_location("anvil_evaluator", resolved)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_check_function(
+    name: str | None,
+    evaluator_path: str | Path | None = None,
+):
+    """Look up ``name`` on the evaluator module and return the callable.
+
+    Raises ``ValueError`` if ``name`` is missing or not callable, so a
+    typo in ``check_function`` fails at scorer-build time (before any
+    row is scored) rather than mid-eval.
+    """
+    if not name:
+        raise ValueError("check_function name is required for a programmatic scorer")
+    module = load_evaluator_module(evaluator_path)
+    fn = getattr(module, name, None)
+    if not callable(fn):
+        raise ValueError(f"check function {name!r} not found in {module.__file__}")
+    return fn
+
+
+def _clamp_score(score: float) -> float:
+    if score < 0.0:
+        return 0.0
+    if score > 1.0:
+        return 1.0
+    return float(score)
+
+
+def _run_programmatic_check(check_fn, inputs, outputs, expectations) -> float:
+    """Invoke a check function with the ``(prediction, ground_truth)`` shape.
+
+    Pure and mlflow-free so it is unit-testable in isolation. ``outputs``
+    becomes the prediction string; ``expectations`` (the eval row's
+    golden-set projection) becomes the ``ground_truth`` dict. The score
+    is clamped to ``[0.0, 1.0]`` so a misbehaving custom check cannot
+    poison the aggregate.
+    """
+    prediction = "" if outputs is None else str(outputs)
+    ground_truth = dict(expectations) if isinstance(expectations, dict) else {}
+    return _clamp_score(float(check_fn(prediction, ground_truth)))
+
+
+def build_programmatic_scorer(*, name: str, check_fn):
+    """Return a ``@scorer`` that wraps a deterministic check function.
+
+    The returned scorer runs inside ``mlflow.genai.evaluate`` like the
+    LLM judges, but its body is pure Python — it calls ``check_fn`` with
+    the prediction and ground-truth dict and records the result as a
+    ``Feedback`` with a ``CODE`` assessment source. No LLM call is made.
+    """
+    source = AssessmentSource(source_type="CODE", source_id=f"programmatic:{name}")
+
+    @scorer(name=name)
+    def _programmatic(inputs: dict, outputs: str, expectations: dict) -> Feedback:
+        score = _run_programmatic_check(check_fn, inputs, outputs, expectations)
+        return Feedback(value=score, rationale=f"programmatic:{name}", source=source)
+
+    return _programmatic
+
+
 def build_scorers(
     *,
     judge_client: OpenAI,
     judge_model: str = DEFAULT_JUDGE_MODEL,
-    active: list[str] | None = None,
-    include_safety: bool = False,
+    scorer_configs: list[ScorerConfig] | None = None,
+    evaluator_path: str | Path | None = None,
 ) -> list:
     """Return the active scorers ready for ``mlflow.genai.evaluate``.
 
     Args:
         judge_client: OpenAI-compatible client for the custom
-            ``refusal_appropriateness`` judge.
+            ``refusal_appropriateness`` judge. Not invoked for
+            programmatic scorers.
         judge_model: Endpoint name for the custom judge.
-        active: List of scorer names to activate. Defaults to
-            ``["correctness", "retrieval_groundedness",
-            "refusal_appropriateness"]``.
-        include_safety: If True, append :class:`Safety` to the active
-            list. Useful for guard-mode runs that want a safety
-            assessment per row even though Safety is excluded from
-            the aggregate.
+        scorer_configs: The configured scorers (LLM + programmatic).
+            Defaults to the three built-in LLM judges. Each
+            ``type: llm`` scorer maps to its MLflow factory (or the
+            custom refusal judge); each ``type: programmatic`` scorer
+            loads its ``check_function`` from ``data/evaluator.py``.
+        evaluator_path: Override path to the programmatic check-function
+            module. Defaults to ``data/evaluator.py``.
     """
-    if active is None:
-        active = ["correctness", "retrieval_groundedness", "refusal_appropriateness"]
-    if include_safety and "safety" not in active:
-        active = [*active, "safety"]
+    if scorer_configs is None:
+        scorer_configs = [
+            ScorerConfig(name="correctness"),
+            ScorerConfig(name="retrieval_groundedness"),
+            ScorerConfig(name="refusal_appropriateness"),
+        ]
 
     ctx = _JudgeContext(client=judge_client, model=judge_model)
     out: list = []
-    for name in active:
-        if name == "refusal_appropriateness":
-            out.append(_build_refusal_scorer(ctx))
-        elif name in _BUILTIN_SCORERS:
-            out.append(_BUILTIN_SCORERS[name]())
-        else:
-            raise ValueError(f"unknown scorer name: {name!r}")
+    for cfg in scorer_configs:
+        if cfg.type == "programmatic":
+            check_fn = load_check_function(cfg.check_function, evaluator_path)
+            out.append(build_programmatic_scorer(name=cfg.name, check_fn=check_fn))
+        else:  # llm
+            if cfg.name == "refusal_appropriateness":
+                out.append(_build_refusal_scorer(ctx))
+            elif cfg.name in _BUILTIN_SCORERS:
+                out.append(_BUILTIN_SCORERS[cfg.name]())
+            else:
+                raise ValueError(f"unknown llm scorer name: {cfg.name!r}")
     return out
