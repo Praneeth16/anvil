@@ -161,6 +161,31 @@ class EvalModeConfig(BaseModel):
     buckets: dict[str, int] = Field(default_factory=dict)
 
 
+class SplitConfig(BaseModel):
+    """Data split configuration for anti-overfit enforcement.
+
+    The golden set is partitioned into train (reserved for optimizer-visible
+    use; currently excluded from scoring), dev (round-by-round eval), and test
+    (held-out finalization only).
+    Split is by hash of example_id — deterministic and stable across runs.
+    """
+
+    enabled: bool = False
+    train_ratio: float = 0.6
+    dev_ratio: float = 0.2
+    seed: int = 42
+
+    @model_validator(mode="after")
+    def _ratios_must_define_three_partitions(self) -> SplitConfig:
+        if not math.isfinite(self.train_ratio) or not 0 < self.train_ratio < 1:
+            raise ValueError("split train_ratio must be finite and between 0 and 1")
+        if not math.isfinite(self.dev_ratio) or not 0 < self.dev_ratio < 1:
+            raise ValueError("split dev_ratio must be finite and between 0 and 1")
+        if self.train_ratio + self.dev_ratio >= 1:
+            raise ValueError("split train_ratio + dev_ratio must be less than 1")
+        return self
+
+
 class ScorerConfig(BaseModel):
     """Configuration for one eval scorer — LLM judge or programmatic.
 
@@ -218,6 +243,7 @@ class EvalConfig(BaseModel):
 
     default_mode: Literal["quick", "standard", "full"] = "standard"
     held_out_test: bool = False
+    split: SplitConfig = Field(default_factory=SplitConfig)
     modes: dict[str, EvalModeConfig] = Field(default_factory=dict)
     n_workers: int = 4
     inter_row_cooldown_s: float = 0.0

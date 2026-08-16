@@ -20,11 +20,13 @@ Public surface:
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib
 import importlib.util
 import inspect
 import os
 import sys
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -44,7 +46,7 @@ from anvil.observability import SOURCE_EVAL, enable_runtime_tracing
 from anvil.runtime.agent import AnvilAgent
 from anvil.runtime.client import build_gateway_client
 from anvil.runtime.loader import default_runtime_config_path, load_harness
-from anvil.runtime.models import EvalConfig, ScorerConfig
+from anvil.runtime.models import EvalConfig, ScorerConfig, SplitConfig
 from anvil.tools.search_knowledge_base import make_kb_executor
 
 
@@ -74,6 +76,73 @@ class EvalReport:
     # comparison even when scorer names are unchanged. Empty when the
     # report is built by code that predates this field.
     scorer_fingerprint: str = ""
+
+
+def partition_dataset(
+    examples: list[dict],
+    split: SplitConfig,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Partition examples into (train, dev, test) by hash of example_id.
+
+    Uses a deterministic hash plus seed so membership is stable across runs
+    and independent of input ordering.
+    """
+    train: list[dict] = []
+    dev: list[dict] = []
+    test: list[dict] = []
+    train_cutoff = split.train_ratio
+    dev_cutoff = train_cutoff + split.dev_ratio
+
+    for example in examples:
+        digest = hashlib.md5(  # noqa: S324 - deterministic partitioning, not security
+            f"{split.seed}:{example['example_id']}".encode(), usedforsecurity=False
+        ).hexdigest()
+        fraction = int(digest, 16) / (2**128)
+        if fraction < train_cutoff:
+            train.append(example)
+        elif fraction < dev_cutoff:
+            dev.append(example)
+        else:
+            test.append(example)
+
+    return train, dev, test
+
+
+def _verify_no_overlap(train: list[dict], dev: list[dict], test: list[dict]) -> None:
+    """Assert no example_id appears in multiple partitions."""
+    train_ids = {example["example_id"] for example in train}
+    dev_ids = {example["example_id"] for example in dev}
+    test_ids = {example["example_id"] for example in test}
+    overlap = (train_ids & dev_ids) | (train_ids & test_ids) | (dev_ids & test_ids)
+    if overlap:
+        raise RuntimeError(f"partition overlap detected: {overlap}")
+
+
+def _select_mode_examples(
+    examples: list[dict], *, cfg: EvalConfig, selected_mode: str
+) -> list[dict]:
+    """Select a mode's rows while enforcing configured partition boundaries."""
+    mode_config = cfg.modes[selected_mode]
+    if not cfg.split.enabled:
+        return select_subset(examples, buckets=mode_config.buckets)
+
+    train, dev, test = partition_dataset(examples, cfg.split)
+    _verify_no_overlap(train, dev, test)
+    if selected_mode == "test":
+        return test[: mode_config.rows]
+
+    scaled_buckets = {
+        bucket: max(1, round(count * cfg.split.dev_ratio))
+        for bucket, count in mode_config.buckets.items()
+    }
+    if scaled_buckets != mode_config.buckets:
+        warnings.warn(
+            f"scaled {selected_mode!r} bucket counts for dev_ratio="
+            f"{cfg.split.dev_ratio}: {mode_config.buckets} -> {scaled_buckets}",
+            UserWarning,
+            stacklevel=2,
+        )
+    return select_subset(dev, buckets=scaled_buckets)
 
 
 def _extract_final_text(response: Any) -> str:
@@ -423,8 +492,6 @@ def evaluate_branch(
         raise ValueError(
             f"mode {selected_mode!r} not in harness/config.yaml > eval.modes ({list(cfg.modes)})"
         )
-    mode_config = cfg.modes[selected_mode]
-
     if profile:
         mlflow.set_tracking_uri(f"databricks://{profile}")
         os.environ["DATABRICKS_CONFIG_PROFILE"] = profile
@@ -441,7 +508,7 @@ def evaluate_branch(
     judge_client = judge_client or build_gateway_client()
 
     examples = load_golden_set(golden_set_path)
-    selected = select_subset(examples, buckets=mode_config.buckets)
+    selected = _select_mode_examples(examples, cfg=cfg, selected_mode=selected_mode)
 
     if snapshot.config.mode == "code":
         # Code mode: import the active MemorySystem subclass and call

@@ -78,6 +78,15 @@ eval:
   held_out_test: true
   # Default mode for `evaluate_branch`. One of: quick, standard, full.
   default_mode: quick
+  # Anti-overfit data split. When enabled, the golden set is partitioned
+  # into train (reserved for optimizer-visible use; currently not scored),
+  # dev (round-by-round eval), and test (held-out finalization only). Split is
+  # deterministic by hash of example_id, so membership remains stable.
+  # split:
+  #   enabled: false
+  #   train_ratio: 0.6
+  #   dev_ratio: 0.2
+  #   seed: 42
   # Row count per mode (deterministic sub-set of the golden set).
   modes:
     quick:    {rows: 8,  buckets: {direct: 2, multi_hop: 2, distractor: 2, out_of_scope: 2}}
