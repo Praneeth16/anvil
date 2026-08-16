@@ -5,10 +5,16 @@ default; Safety opt-in), the golden set sub-set per mode
 (``quick``/``standard``/``full``), and an :class:`AnvilAgent`
 constructed with ``source=SOURCE_EVAL``.
 
-Sequential by design today: ``mlflow.genai.evaluate`` in 3.10.x does
-not accept ``n_workers``. Parallelism with a thread pool is the
-documented Phase-2c follow-up; for now, sequential keeps the rate-
-limit footprint predictable.
+Parallel predict execution: ``mlflow.genai.evaluate`` already runs
+``predict_fn`` per row in a ``ThreadPoolExecutor`` sized by the
+``MLFLOW_GENAI_EVAL_MAX_WORKERS`` env var (default 10). The harness
+wires ``eval.n_workers`` from ``harness/config.yaml`` into that env
+var so the configured value actually controls concurrency — and keeps
+passing ``predict_fn`` (not pre-computed ``outputs``) so mlflow builds
+a per-row trace carrying the ``RETRIEVER`` span that
+``RetrievalGroundedness`` scores against. :func:`_run_predictions_parallel`
+is anvil's own tested thread-pool primitive for direct/pre-compute
+paths that do not need traces.
 
 Public surface:
 
@@ -26,6 +32,8 @@ import inspect
 import os
 import sys
 from collections import defaultdict
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -394,6 +402,64 @@ def _load_memory_system(
     return cls(llm_client=llm_client, model=model)
 
 
+# mlflow reads this env var to size the predict/score thread pools inside
+# ``mlflow.genai.evaluate`` (default 10 when unset). anvil wires
+# ``eval.n_workers`` into it so the configured value controls concurrency
+# rather than mlflow's default.
+_MLFLOW_MAX_WORKERS_ENV = "MLFLOW_GENAI_EVAL_MAX_WORKERS"
+
+
+def _run_predictions_parallel(
+    predict_fn: Callable[[str], str],
+    queries: list[str],
+    n_workers: int = 1,
+) -> list[str]:
+    """Run ``predict_fn`` across ``queries`` in parallel.
+
+    Uses :class:`concurrent.futures.ThreadPoolExecutor` — the runtime
+    agent's work is I/O-bound (LLM / tool HTTP calls), so threads are
+    sufficient and avoid the serialization overhead of processes. When
+    ``n_workers <= 1`` the function runs sequentially (backward compatible
+    with the pre-parallel eval path).
+
+    Results preserve input order regardless of completion order: each
+    future is keyed by its input index, so the slot it writes is fixed. A
+    prediction that raises is recorded as an empty string and logged, so
+    one bad row does not abort the whole eval — mirroring mlflow's own
+    per-row error isolation in ``_run_predict``.
+
+    Thread-safety: ``predict_fn`` must be safe to invoke from multiple
+    threads concurrently. For prompt mode ``AnvilAgent.predict`` issues
+    stateless HTTP calls against the runtime endpoint (thread-safe); for
+    code mode a ``MemorySystem.predict`` subclass is thread-safe as long
+    as it does not mutate shared state inside ``predict``.
+
+    Note:
+        The live ``evaluate_branch`` flow delegates predict parallelism to
+        mlflow's own harness (sized via ``MLFLOW_GENAI_EVAL_MAX_WORKERS``)
+        so that mlflow builds a per-row trace carrying the ``RETRIEVER``
+        span that ``RetrievalGroundedness`` scores against. Pre-computing
+        outputs here and passing them as a static dataset would yield a
+        root-span-only trace and make ``RetrievalGroundedness`` raise, so
+        this primitive is exercised directly by the unit tests and is
+        available for offline/pre-compute paths that do not need traces.
+    """
+    if n_workers <= 1:
+        return [predict_fn(q) for q in queries]
+
+    results: list[str | None] = [None] * len(queries)
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        future_to_idx = {executor.submit(predict_fn, q): i for i, q in enumerate(queries)}
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                results[idx] = future.result()
+            except Exception as exc:  # noqa: BLE001 — isolate per-row failures
+                print(f"[eval] prediction failed for row {idx}: {exc}")
+                results[idx] = ""
+    return results  # type: ignore[return-value]
+
+
 def evaluate_branch(
     *,
     scaffold_root: Path | str,
@@ -495,11 +561,29 @@ def evaluate_branch(
     )
     dataset = _build_dataset(selected)
 
-    result = mlflow.genai.evaluate(
-        data=dataset,
-        scorers=scorers,
-        predict_fn=predict_fn,
-    )
+    # Wire anvil's ``eval.n_workers`` into mlflow's parallel predict/score
+    # pool. mlflow's harness already runs ``predict_fn`` per row in a
+    # ``ThreadPoolExecutor`` sized by ``MLFLOW_GENAI_EVAL_MAX_WORKERS``
+    # (default 10); setting it from the config makes the configured value
+    # actually control concurrency. We keep passing ``predict_fn`` (not
+    # pre-computed ``outputs``) so mlflow builds a per-row trace carrying
+    # the ``RETRIEVER`` span that ``RetrievalGroundedness`` requires — a
+    # static-dataset trace is root-span-only and makes that scorer raise.
+    # The env var is saved/restored so the override is scoped to this call.
+    n_workers = max(1, cfg.n_workers)
+    _prev_workers = os.environ.get(_MLFLOW_MAX_WORKERS_ENV)
+    os.environ[_MLFLOW_MAX_WORKERS_ENV] = str(n_workers)
+    try:
+        result = mlflow.genai.evaluate(
+            data=dataset,
+            scorers=scorers,
+            predict_fn=predict_fn,
+        )
+    finally:
+        if _prev_workers is None:
+            os.environ.pop(_MLFLOW_MAX_WORKERS_ENV, None)
+        else:
+            os.environ[_MLFLOW_MAX_WORKERS_ENV] = _prev_workers
 
     experiment = mlflow.get_experiment_by_name(snapshot.config.experiments.eval)
     return _aggregate_report(
