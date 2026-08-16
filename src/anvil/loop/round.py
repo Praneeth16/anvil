@@ -92,6 +92,7 @@ def run_round(
     scaffold_root = Path(scaffold_root or (repo_root / "scaffold")).resolve()
 
     mode = _read_optimization_mode(scaffold_root)
+    optimizer_endpoint = _read_optimizer_endpoint(scaffold_root)
     print(f"[round {round_id}] mode={mode}")
 
     _starting_branch = current_branch(repo_root)
@@ -123,6 +124,7 @@ def run_round(
             cwd=str(repo_root),
             max_turns=max_turns,
             profile=profile,
+            optimizer_endpoint=optimizer_endpoint,
         )
     )
 
@@ -373,6 +375,21 @@ def _read_optimization_mode(scaffold_root: Path | str) -> str:
             f"unknown optimization mode {mode!r}; expected 'prompt' or 'code'"
         )
     return mode
+
+
+def _read_optimizer_endpoint(scaffold_root: Path | str) -> str | None:
+    """Read the ``optimizer_endpoint`` FMAPI model from harness/config.yaml.
+
+    Returns None when the file or field is absent, so the optimizer
+    session falls back to its built-in default model. Only this field is
+    read here; the full-file ``extra="forbid"`` validation is enforced
+    by the runtime loader.
+    """
+    path = default_runtime_config_path(Path(scaffold_root))
+    if not path.is_file():
+        return None
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return raw.get("optimizer_endpoint")
 
 
 def _build_critique_md(

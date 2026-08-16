@@ -265,8 +265,7 @@ class EvalConfig(BaseModel):
         for s in self.scorers:
             if s.name in seen:
                 raise ValueError(
-                    f"duplicate scorer name {s.name!r} — "
-                    "each scorer must have a unique name"
+                    f"duplicate scorer name {s.name!r} — each scorer must have a unique name"
                 )
             seen.add(s.name)
         return self
@@ -298,9 +297,16 @@ class RuntimeYAML(BaseModel):
     # Dotted Python module path or .py file path of the active agent in
     # code mode. Ignored in prompt mode. Default: the passthrough baseline.
     agent_module: str = "anvil.agents.baseline"
-    runtime_endpoint: str
-    optimizer_endpoint: str
-    judge_endpoint: str
+    # LLM model names for the AI Gateway. These are FMAPI model names
+    # (e.g. ``databricks-claude-sonnet-4-6``), not serving-endpoint URLs.
+    # All three routes go through the same AI Gateway unified URL; the
+    # model name selects which FMAPI model the gateway routes to. The
+    # optimizer path uses the Claude Agent SDK against the gateway's
+    # Anthropic route (``optimizer_endpoint`` is the FMAPI model name
+    # for that route too).
+    runtime_endpoint: str  # FMAPI model for the runtime agent
+    optimizer_endpoint: str  # FMAPI model for the optimizer
+    judge_endpoint: str  # FMAPI model for the judge
     experiments: ExperimentsConfig
     loop: LoopConfig = Field(default_factory=LoopConfig)
     eval: EvalConfig = Field(default_factory=EvalConfig)

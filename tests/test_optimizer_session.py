@@ -9,13 +9,14 @@ contract on dataclass fakes that mimic the SDK shapes.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
 from anvil.optimizer.parser import parse_action
 from anvil.optimizer.session import extract_message_text
-
 
 # ---------------------------------------------------------------------------
 # Fake SDK shapes — only the attributes ``extract_message_text`` reads.
@@ -161,3 +162,53 @@ def test_round_trip_legacy_str_repr_does_not_parse() -> None:
     assert result.parse_status == "no_block"
     # And confirms the new extractor would NOT touch this — only test that
     # the parser itself is regex-strict.
+
+
+# ---------------------------------------------------------------------------
+# optimizer_endpoint wiring — the configured model must reach the CLI
+# ---------------------------------------------------------------------------
+
+
+def test_setup_anthropic_env_uses_optimizer_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``optimizer_endpoint`` config value becomes the Claude Code CLI's
+    default model — proving the optimizer uses the configured model, not a
+    hardcoded one."""
+    from anvil.optimizer.session import setup_anthropic_env
+
+    # Avoid real SDK + secret reads.
+    monkeypatch.setattr("databricks.sdk.WorkspaceClient", lambda *a, **k: SimpleNamespace())
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gw.example/anthropic")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok")
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_DEFAULT_OPUS_MODEL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_DEFAULT_SONNET_MODEL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_DEFAULT_HAIKU_MODEL", raising=False)
+
+    setup_anthropic_env(optimizer_endpoint="databricks-claude-opus-5")
+
+    assert os.environ["ANTHROPIC_MODEL"] == "databricks-claude-opus-5"
+    assert os.environ["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-claude-opus-5"
+    # The sonnet/haiku tier defaults are independent of optimizer_endpoint.
+    assert os.environ["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-6"
+    assert os.environ["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "databricks-claude-haiku-4-5"
+
+
+def test_setup_anthropic_env_falls_back_to_default_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``optimizer_endpoint`` is None (field absent), the built-in
+    default model is used — preserves backward compatibility."""
+    from anvil.optimizer.session import setup_anthropic_env
+
+    monkeypatch.setattr("databricks.sdk.WorkspaceClient", lambda *a, **k: SimpleNamespace())
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gw.example/anthropic")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok")
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_DEFAULT_OPUS_MODEL", raising=False)
+
+    setup_anthropic_env(optimizer_endpoint=None)
+
+    assert os.environ["ANTHROPIC_MODEL"] == "databricks-claude-opus-4-7"
+    assert os.environ["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-claude-opus-4-7"

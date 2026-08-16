@@ -22,6 +22,7 @@ function loop-side-agnostic and trivially mockable in tests.
 
 from __future__ import annotations
 
+import contextlib
 import os
 
 import mlflow
@@ -40,12 +41,21 @@ from anvil.optimizer.parser import ParseResult, parse_action
 ANTHROPIC_BASE_URL = os.environ.get("ANVIL_AI_GATEWAY_URL", "")
 
 
-def setup_anthropic_env(profile: str | None = None) -> None:
+def setup_anthropic_env(
+    profile: str | None = None,
+    optimizer_endpoint: str | None = None,
+) -> None:
     """Point the Claude Agent SDK at the Databricks-hosted Anthropic gateway.
 
     Idempotent: existing values in ``os.environ`` are left alone so a
     developer running with a direct Anthropic key locally is not
     overridden.
+
+    ``optimizer_endpoint`` is the FMAPI model name from
+    ``harness/config.yaml > optimizer_endpoint``. When set, it becomes
+    the Claude Code CLI's default model (``ANTHROPIC_MODEL`` and
+    ``ANTHROPIC_DEFAULT_OPUS_MODEL``). When None, falls back to the
+    built-in default (``databricks-claude-opus-4-7``).
 
     Reads ``ANTHROPIC_AUTH_TOKEN`` from the Databricks Secret
     ``anvil/anthropic_auth_token`` if it is not already set in env.
@@ -67,8 +77,9 @@ def setup_anthropic_env(profile: str | None = None) -> None:
         os.environ["ANTHROPIC_AUTH_TOKEN"] = _read_secret(
             ws, scope="anvil", key="anthropic_auth_token"
         )
-    os.environ.setdefault("ANTHROPIC_MODEL", "databricks-claude-opus-4-7")
-    os.environ.setdefault("ANTHROPIC_DEFAULT_OPUS_MODEL", "databricks-claude-opus-4-7")
+    optimizer_model = optimizer_endpoint or "databricks-claude-opus-4-7"
+    os.environ.setdefault("ANTHROPIC_MODEL", optimizer_model)
+    os.environ.setdefault("ANTHROPIC_DEFAULT_OPUS_MODEL", optimizer_model)
     os.environ.setdefault("ANTHROPIC_DEFAULT_SONNET_MODEL", "databricks-claude-sonnet-4-6")
     os.environ.setdefault("ANTHROPIC_DEFAULT_HAIKU_MODEL", "databricks-claude-haiku-4-5")
     os.environ.setdefault(
@@ -95,6 +106,7 @@ async def run_optimizer_session(
     max_turns: int = 30,
     profile: str | None = None,
     setup_env: bool = True,
+    optimizer_endpoint: str | None = None,
     experiment_name: str | None = None,
     round_id: int | None = None,
 ) -> tuple[OptimizerAction, str, ParseResult]:
@@ -110,6 +122,10 @@ async def run_optimizer_session(
         profile: Databricks CLI profile for the secret read.
         setup_env: If True (default), call :func:`setup_anthropic_env`
             before opening the session. Disable in tests.
+        optimizer_endpoint: FMAPI model name from
+            ``harness/config.yaml > optimizer_endpoint``. Forwarded to
+            :func:`setup_anthropic_env` so the Claude Code CLI uses the
+            configured model. When None, the built-in default is used.
         experiment_name: When set, the session opens an MLflow trace
             under this experiment and turns on
             ``mlflow.anthropic.autolog`` so each Anthropic API call
@@ -124,7 +140,7 @@ async def run_optimizer_session(
         and ``parse_result`` carries diagnostic metadata about the parse.
     """
     if setup_env:
-        setup_anthropic_env(profile=profile)
+        setup_anthropic_env(profile=profile, optimizer_endpoint=optimizer_endpoint)
 
     if experiment_name:
         if profile:
@@ -132,13 +148,11 @@ async def run_optimizer_session(
         mlflow.set_experiment(experiment_name)
         # Turn on Anthropic autolog so each LLM call inside the Claude
         # Code subprocess becomes a CHAT_MODEL child span. Idempotent.
-        try:
+        # autolog can fail at import time on unsupported SDK versions;
+        # the trace still wraps the session, just without per-call
+        # children.
+        with contextlib.suppress(Exception):
             mlflow.anthropic.autolog()
-        except Exception:
-            # autolog can fail at import time on unsupported SDK
-            # versions; the trace still wraps the session, just
-            # without per-call children.
-            pass
 
     options = ClaudeAgentOptions(
         cwd=cwd,
@@ -164,10 +178,8 @@ async def run_optimizer_session(
             if round_id is not None:
                 tags["round"] = str(round_id)
             tags["max_turns"] = str(max_turns)
-            try:
+            with contextlib.suppress(Exception):
                 mlflow.update_current_trace(tags=tags)
-            except Exception:
-                pass
             span.set_inputs({"prompt_chars": len(prompt), "round_id": round_id})
             transcript = await _drain_session()
             span.set_outputs({"transcript_chars": len(transcript)})
