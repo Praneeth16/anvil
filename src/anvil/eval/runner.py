@@ -29,6 +29,7 @@ import contextlib
 import importlib
 import importlib.util
 import inspect
+import logging
 import os
 import sys
 from collections import defaultdict
@@ -54,6 +55,8 @@ from anvil.runtime.client import build_databricks_client
 from anvil.runtime.loader import default_runtime_config_path, load_harness
 from anvil.runtime.models import EvalConfig, ScorerConfig
 from anvil.tools.search_knowledge_base import make_kb_executor
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -445,7 +448,18 @@ def _run_predictions_parallel(
         available for offline/pre-compute paths that do not need traces.
     """
     if n_workers <= 1:
-        return [predict_fn(q) for q in queries]
+        # Sequential path — same per-row error isolation as the parallel
+        # path so the acceptance contract ("a prediction that raises is
+        # recorded as an empty string and does not abort the whole eval")
+        # holds uniformly for both paths, not just the parallel one.
+        results = []
+        for i, q in enumerate(queries):
+            try:
+                results.append(predict_fn(q))
+            except Exception as exc:  # noqa: BLE001 — isolate per-row failures
+                logger.warning("prediction failed for row %s: %s", i, exc)
+                results.append("")
+        return results
 
     results: list[str | None] = [None] * len(queries)
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
@@ -455,9 +469,12 @@ def _run_predictions_parallel(
             try:
                 results[idx] = future.result()
             except Exception as exc:  # noqa: BLE001 — isolate per-row failures
-                print(f"[eval] prediction failed for row {idx}: {exc}")
+                logger.warning("prediction failed for row %s: %s", idx, exc)
                 results[idx] = ""
-    return results  # type: ignore[return-value]
+    # as_completed yields every submitted future, so every slot is filled
+    # — with a result on success or "" on failure — before we reach here.
+    assert all(r is not None for r in results)
+    return results
 
 
 def evaluate_branch(
@@ -570,6 +587,9 @@ def evaluate_branch(
     # the ``RETRIEVER`` span that ``RetrievalGroundedness`` requires — a
     # static-dataset trace is root-span-only and makes that scorer raise.
     # The env var is saved/restored so the override is scoped to this call.
+    # NOTE: the env var is process-global, so this override is not safe for
+    # concurrent ``evaluate_branch`` calls in one process; the optimizer
+    # runs rounds/evals synchronously, so this is not a live issue today.
     n_workers = max(1, cfg.n_workers)
     _prev_workers = os.environ.get(_MLFLOW_MAX_WORKERS_ENV)
     os.environ[_MLFLOW_MAX_WORKERS_ENV] = str(n_workers)

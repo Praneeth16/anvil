@@ -21,6 +21,7 @@ and the runtime agent are mocked.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from pathlib import Path
@@ -182,7 +183,7 @@ def test_run_predictions_parallel_single_worker_equivalent_to_sequential() -> No
 
 
 def test_run_predictions_failed_row_recorded_empty_not_raised(
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A prediction that raises is recorded as an empty string and
     logged; the surrounding rows still complete and the call does not
@@ -194,16 +195,16 @@ def test_run_predictions_failed_row_recorded_empty_not_raised(
             raise RuntimeError("synthetic failure")
         return f"ok-{q}"
 
-    out = _run_predictions_parallel(predict_fn, ["a", "boom", "c"], n_workers=3)
+    with caplog.at_level(logging.WARNING, logger="anvil.eval.runner"):
+        out = _run_predictions_parallel(predict_fn, ["a", "boom", "c"], n_workers=3)
     assert out == ["ok-a", "", "ok-c"]
 
-    captured = capsys.readouterr()
-    assert "prediction failed for row 1" in captured.out
-    assert "synthetic failure" in captured.out
+    assert "prediction failed for row 1" in caplog.text
+    assert "synthetic failure" in caplog.text
 
 
 def test_run_predictions_all_fail_returns_all_empty(
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Every row failing still yields a full-length list of empty
     strings — the eval is not aborted by a uniformly broken agent."""
@@ -212,20 +213,21 @@ def test_run_predictions_all_fail_returns_all_empty(
     def predict_fn(q: str) -> str:
         raise ValueError("nope")
 
-    out = _run_predictions_parallel(predict_fn, ["a", "b", "c"], n_workers=2)
+    with caplog.at_level(logging.WARNING, logger="anvil.eval.runner"):
+        out = _run_predictions_parallel(predict_fn, ["a", "b", "c"], n_workers=2)
     assert out == ["", "", ""]
-    assert capsys.readouterr().out.count("prediction failed") == 3
+    assert caplog.text.count("prediction failed") == 3
 
 
-def test_run_predictions_sequential_failure_also_isolated(
-    capsys: pytest.CaptureFixture[str],
+def test_run_predictions_sequential_failure_isolated(
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The sequential path (n_workers <= 1) is the backward-compatible
-    baseline; a failing row there is NOT swallowed (no executor to
-    catch it) — it raises, matching a plain list comprehension. This
-    documents the intended divergence: isolation is a parallel-path
-    feature, and sequential mode keeps the historic raise-on-error
-    behavior so a single broken row is loud during local debugging."""
+    """The sequential path (n_workers <= 1) isolates failures the same way
+    the parallel path does: a row that raises is recorded as an empty
+    string and logged, and the surrounding rows still complete — the call
+    does not propagate the exception. This unifies the acceptance contract
+    ("a prediction that raises is recorded as an empty string and does not
+    abort the whole eval") across both paths."""
     from anvil.eval.runner import _run_predictions_parallel
 
     def predict_fn(q: str) -> str:
@@ -233,8 +235,11 @@ def test_run_predictions_sequential_failure_also_isolated(
             raise RuntimeError("synthetic failure")
         return q
 
-    with pytest.raises(RuntimeError, match="synthetic failure"):
-        _run_predictions_parallel(predict_fn, ["a", "boom", "c"], n_workers=1)
+    with caplog.at_level(logging.WARNING, logger="anvil.eval.runner"):
+        out = _run_predictions_parallel(predict_fn, ["a", "boom", "c"], n_workers=1)
+    assert out == ["a", "", "c"]
+    assert "prediction failed for row 1" in caplog.text
+    assert "synthetic failure" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +361,34 @@ def test_evaluate_branch_restores_prior_max_workers(
     # The pre-call value "2" is restored, not the override "8".
     assert os.environ.get("MLFLOW_GENAI_EVAL_MAX_WORKERS") == "2"
     monkeypatch.delenv("MLFLOW_GENAI_EVAL_MAX_WORKERS", raising=False)
+
+
+def test_evaluate_branch_restores_env_on_evaluate_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If ``mlflow.genai.evaluate`` raises, the ``finally`` block still
+    restores the prior ``MLFLOW_GENAI_EVAL_MAX_WORKERS`` value — the
+    override never leaks past the call, even on the error path."""
+    from anvil.eval import runner
+
+    _patch_runner_common(monkeypatch, _wiring_config(n_workers=3))
+    monkeypatch.delenv("MLFLOW_GENAI_EVAL_MAX_WORKERS", raising=False)
+
+    def boom_evaluate(**_kwargs: object) -> object:
+        raise RuntimeError("evaluate blew up")
+
+    monkeypatch.setattr(runner.mlflow.genai, "evaluate", boom_evaluate)
+
+    with pytest.raises(RuntimeError, match="evaluate blew up"):
+        runner.evaluate_branch(
+            scaffold_root=tmp_path / "scaffold",
+            runtime_config_path=tmp_path / "config.yaml",
+            runtime_client=SimpleNamespace(),
+            judge_client=SimpleNamespace(),
+        )
+
+    # finally restored the env var: unset before the call → unset after.
+    assert "MLFLOW_GENAI_EVAL_MAX_WORKERS" not in os.environ
 
 
 def test_evaluate_branch_sequential_when_n_workers_one(
