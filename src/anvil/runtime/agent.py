@@ -29,7 +29,7 @@ from mlflow.types.responses import ResponsesAgentRequest, ResponsesAgentResponse
 from openai import OpenAI
 
 from anvil.observability import SOURCE_PRODUCTION, SourceTag, tag_current_trace
-from anvil.runtime.client import build_databricks_client
+from anvil.runtime.client import build_gateway_client
 from anvil.runtime.loader import HarnessSnapshot, default_runtime_config_path, load_harness
 from anvil.runtime.models import ToolRef
 
@@ -66,10 +66,8 @@ class AnvilAgent(ResponsesAgent):
             if runtime_config_path is not None
             else default_runtime_config_path(self._scaffold_root)
         )
-        self._snapshot: HarnessSnapshot = load_harness(
-            self._scaffold_root, resolved_runtime_config
-        )
-        self._client: OpenAI = client if client is not None else build_databricks_client()
+        self._snapshot: HarnessSnapshot = load_harness(self._scaffold_root, resolved_runtime_config)
+        self._client: OpenAI = client if client is not None else build_gateway_client()
         self._tool_executor: ToolExecutor = tool_executor or _no_tools_executor
         self._source: SourceTag = source
 

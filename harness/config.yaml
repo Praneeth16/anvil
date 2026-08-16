@@ -23,16 +23,23 @@
 mode: prompt
 # agent_module: anvil.agents.baseline
 
-# Endpoint the runtime agent calls. Provider-agnostic — any
-# OpenAI-compatible Databricks serving endpoint works.
+# LLM model names (FMAPI) routed through the Databricks AI Gateway.
+# All three paths (runtime, optimizer, judge) use the same gateway
+# unified URL — the model name determines which FMAPI model is called.
+# Set DATABRICKS_HOST and DATABRICKS_TOKEN in the environment (or a
+# ~/.databrickscfg profile); the gateway client refreshes the SP token
+# on each request.
 runtime_endpoint: databricks-claude-sonnet-4-6
 
-# Endpoint the ANVIL optimizer loop calls for trace analysis +
-# mutation planning. Not read by the runtime agent.
+# FMAPI model the ANVIL optimizer loop uses for trace analysis +
+# mutation planning. Reached via the gateway's Anthropic route (the
+# Claude Agent SDK), not the OpenAI-compatible route. Not read by the
+# runtime agent.
 optimizer_endpoint: databricks-claude-opus-4-7
 
-# Endpoint the MLflow LLM judges call. Same as runtime by default;
-# kept separate so a future round can pin a different judge model.
+# FMAPI model the MLflow LLM judges call — through the same gateway
+# client as the runtime agent. Kept separate so a future round can pin
+# a different judge model.
 judge_endpoint: databricks-claude-sonnet-4-6
 
 # MLflow experiment paths. Stable, declared here, NOT driven by

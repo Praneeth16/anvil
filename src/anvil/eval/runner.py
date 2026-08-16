@@ -42,7 +42,7 @@ from anvil.eval.cache import compute_scorer_fingerprint
 from anvil.eval.scorers import build_scorers
 from anvil.observability import SOURCE_EVAL, enable_runtime_tracing
 from anvil.runtime.agent import AnvilAgent
-from anvil.runtime.client import build_databricks_client
+from anvil.runtime.client import build_gateway_client
 from anvil.runtime.loader import default_runtime_config_path, load_harness
 from anvil.runtime.models import EvalConfig, ScorerConfig
 from anvil.tools.search_knowledge_base import make_kb_executor
@@ -133,9 +133,7 @@ def _build_dataset(examples: list[dict]) -> list[dict]:
         # through the real runner. This is additive — existing scorers
         # ignore unknown keys in the expectations dict.
         for key, val in ex.items():
-            if key not in expectations and (
-                key.startswith("json_") or key.startswith("expected_")
-            ):
+            if key not in expectations and (key.startswith("json_") or key.startswith("expected_")):
                 expectations[key] = val
         rows.append(
             {
@@ -434,8 +432,13 @@ def evaluate_branch(
 
     enable_runtime_tracing()
 
-    runtime_client = runtime_client or build_databricks_client(profile=profile)
-    judge_client = judge_client or build_databricks_client(profile=profile)
+    # Both the runtime agent and the judge route through the AI Gateway
+    # client (the sole LLM route). The gateway resolves host + token from
+    # the environment; when ``profile`` is set above it is already in
+    # ``DATABRICKS_CONFIG_PROFILE``, which the SDK honors at token-refresh
+    # time. ``profile`` is therefore not passed to the factory.
+    runtime_client = runtime_client or build_gateway_client()
+    judge_client = judge_client or build_gateway_client()
 
     examples = load_golden_set(golden_set_path)
     selected = select_subset(examples, buckets=mode_config.buckets)

@@ -146,9 +146,7 @@ def test_baseline_with_mock_llm_client() -> None:
         choices=[SimpleNamespace(message=SimpleNamespace(content="LLM reply"))]
     )
     client = SimpleNamespace(
-        chat=SimpleNamespace(
-            completions=SimpleNamespace(create=lambda **kw: response)
-        )
+        chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: response))
     )
     agent = BaselineExtractor(llm_client=client, model="test-model")
     answer, metadata = agent.predict("question")
@@ -508,9 +506,7 @@ def _patch_runner_common(
     """Patch the runner's external dependencies for a mocked eval run."""
     from anvil.eval import runner
 
-    monkeypatch.setattr(
-        runner, "load_harness", lambda *a, **kw: SimpleNamespace(config=config)
-    )
+    monkeypatch.setattr(runner, "load_harness", lambda *a, **kw: SimpleNamespace(config=config))
     monkeypatch.setattr(
         runner, "load_golden_set", lambda _p: [_gold("g1", "hello"), _gold("g2", "world")]
     )
@@ -712,7 +708,7 @@ def test_evaluate_branch_code_mode_real_baseline_passthrough(
         ),
     )
     _patch_runner_common(monkeypatch, config)
-    monkeypatch.setattr(runner, "build_databricks_client", lambda **kw: None)
+    monkeypatch.setattr(runner, "build_gateway_client", lambda **kw: None)
 
     captured: dict[str, object] = {}
 
