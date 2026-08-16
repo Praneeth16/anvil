@@ -529,6 +529,10 @@ def test_aggregate_report_weighted_average() -> None:
     assert set(report.scorers) == {"correctness", "exact_match"}
     assert report.n_rows == 2
     assert report.mode == "quick"
+    assert report.cost_metrics == {
+        "total_context_chars": float(len("q-g1") + len("q-g2")),
+        "n_rows": 2.0,
+    }
 
 
 def test_aggregate_report_uniform_weights_is_unweighted_mean() -> None:

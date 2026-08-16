@@ -94,9 +94,10 @@ class CachedBaseline:
     # before this field existed — :func:`is_compatible` treats an empty
     # fingerprint on either side as "not checked" for backward compat.
     scorer_fingerprint: str = ""
+    cost_metrics: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "scaffold_commit_sha": self.scaffold_commit_sha,
             "evaluated_at": self.evaluated_at,
             "mode": self.mode,
@@ -110,6 +111,12 @@ class CachedBaseline:
             "mlflow_run_id": self.mlflow_run_id,
             "scorer_fingerprint": self.scorer_fingerprint,
         }
+        # Keep the historical on-disk schema byte-for-byte compatible for
+        # baselines created before cost tracking, while retaining metrics
+        # whenever the eval report supplies them.
+        if self.cost_metrics:
+            payload["cost_metrics"] = dict(self.cost_metrics)
+        return payload
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> CachedBaseline:
@@ -126,6 +133,7 @@ class CachedBaseline:
             n_examples=int(raw.get("n_examples", 0)),
             mlflow_run_id=raw.get("mlflow_run_id"),
             scorer_fingerprint=raw.get("scorer_fingerprint", ""),
+            cost_metrics={k: float(v) for k, v in raw.get("cost_metrics", {}).items()},
         )
 
 
@@ -222,4 +230,5 @@ def report_to_baseline(
         n_examples=report.n_rows,
         mlflow_run_id=report.run_id,
         scorer_fingerprint=getattr(report, "scorer_fingerprint", ""),
+        cost_metrics=dict(getattr(report, "cost_metrics", {})),
     )

@@ -37,7 +37,7 @@ from anvil.loop.frontier import (
     scores_from_baseline,
     scores_from_eval,
 )
-from anvil.runtime.models import GateConfig, RuntimeYAML
+from anvil.runtime.models import GateConfig, ParetoConfig, ParetoObjective, RuntimeYAML
 
 # Realistic objective keys (per-judge scores + the aggregate), matching
 # the live baseline.json.
@@ -246,6 +246,24 @@ def test_serialization_round_trip(tmp_path: Path) -> None:
     assert roundtripped.best == f.best
 
 
+def test_direction_aware_pareto_minimizes_cost() -> None:
+    f = Frontier.from_scores(
+        {"quality": 0.8, "cost": 100.0},
+        directions={"quality": "maximize", "cost": "minimize"},
+    )
+    assert f.update({"quality": 0.8, "cost": 80.0}) is True
+    assert f.best == {"quality": 0.8, "cost": 80.0}
+    assert f.update({"quality": 0.81, "cost": 90.0}) is False
+
+
+def test_directions_survive_serialization() -> None:
+    f = Frontier.from_scores(
+        {"quality": 0.8, "cost": 100.0},
+        directions={"quality": "maximize", "cost": "minimize"},
+    )
+    assert Frontier.from_dict(f.to_dict()).directions == f.directions
+
+
 def test_load_save_round_trip(tmp_path: Path) -> None:
     f = Frontier.from_scores(BASELINE)
     f.update({**BASELINE, "correctness": 0.5, AGGREGATE_KEY: 0.786})
@@ -283,6 +301,19 @@ def test_scores_from_eval_and_baseline() -> None:
         "retrieval_groundedness": 0.8,
         AGGREGATE_KEY: 0.55,
     }
+
+
+def test_scores_from_eval_extracts_configured_cost_metrics() -> None:
+    report = SimpleNamespace(
+        aggregate=0.7,
+        cost_metrics={"total_context_chars": 1234.0, "n_rows": 8.0},
+        n_rows=8,
+    )
+    objectives = [
+        ParetoObjective(name="quality", source="aggregate"),
+        ParetoObjective(name="cost", direction="minimize", source="context_chars"),
+    ]
+    assert scores_from_eval(report, objectives) == {"quality": 0.7, "cost": 1234.0}
 
 
 # ---------------------------------------------------------------------------
@@ -544,7 +575,7 @@ def test_load_gate_config_defaults_when_file_missing(tmp_path: Path) -> None:
     assert cfg == GateConfig()
     assert cfg.type == "frontier"
     assert cfg.epsilon == 0.0
-    assert cfg.pareto is True
+    assert cfg.pareto == ParetoConfig(enabled=False)
 
 
 def test_load_gate_config_defaults_when_section_absent(tmp_path: Path) -> None:
@@ -604,4 +635,20 @@ def test_real_harness_config_parses_with_gate() -> None:
     cfg = RuntimeYAML.model_validate(raw)
     assert cfg.gate.type == "frontier"
     assert cfg.gate.epsilon == 0.0
-    assert cfg.gate.pareto is True
+    assert cfg.gate.pareto == ParetoConfig(enabled=False)
+
+
+def test_gate_config_parses_structured_pareto_objectives() -> None:
+    cfg = GateConfig.model_validate(
+        {
+            "pareto": {
+                "enabled": True,
+                "objectives": [
+                    {"name": "quality", "source": "aggregate"},
+                    {"name": "cost", "direction": "minimize", "source": "n_rows"},
+                ],
+            }
+        }
+    )
+    assert cfg.pareto.enabled is True
+    assert [o.name for o in cfg.pareto.objectives] == ["quality", "cost"]

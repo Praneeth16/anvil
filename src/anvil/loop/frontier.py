@@ -41,7 +41,7 @@ import yaml
 
 from anvil.loop.decision import Decision, decide
 from anvil.runtime.loader import default_runtime_config_path
-from anvil.runtime.models import GateConfig
+from anvil.runtime.models import GateConfig, ParetoConfig, ParetoObjective
 
 # Key under which the aggregate score is tracked alongside the per-judge
 # scores. The objectives of the frontier are the per-judge keys plus this.
@@ -83,6 +83,7 @@ class Frontier:
         *,
         objectives: list[str] | None = None,
         pareto: bool = True,
+        directions: dict[str, str] | None = None,
         epsilon: float = DEFAULT_EPSILON,
     ) -> None:
         self.best: dict[str, float] = {k: float(v) for k, v in best.items()} if best else {}
@@ -93,6 +94,9 @@ class Frontier:
         else:
             self._objectives = []
         self.pareto = pareto
+        self.directions = {
+            obj: (directions or {}).get(obj, "maximize") for obj in self._objectives
+        }
         self.epsilon = float(epsilon)
 
     @property
@@ -105,10 +109,11 @@ class Frontier:
         scores: dict[str, float],
         *,
         pareto: bool = True,
+        directions: dict[str, str] | None = None,
         epsilon: float = DEFAULT_EPSILON,
     ) -> Frontier:
         """Initialize a frontier whose best-so-far IS ``scores`` (round 1)."""
-        return cls(best=scores, pareto=pareto, epsilon=epsilon)
+        return cls(best=scores, pareto=pareto, directions=directions, epsilon=epsilon)
 
     @staticmethod
     def should_keep(
@@ -118,6 +123,7 @@ class Frontier:
         epsilon: float = DEFAULT_EPSILON,
         pareto: bool = True,
         objectives: list[str] | None = None,
+        directions: dict[str, str] | None = None,
     ) -> bool:
         """Gate decision: keep iff the mutation extends the frontier.
 
@@ -186,7 +192,8 @@ class Frontier:
             if cur is None:
                 improves_any = True  # frontier has no best yet → extends
                 continue
-            delta = new - cur
+            direction = (directions or {}).get(obj, "maximize")
+            delta = (new - cur) if direction == "maximize" else (cur - new)
             if delta < -epsilon:
                 return False  # regressed beyond epsilon → dominated → revert
             if delta > epsilon:
@@ -220,6 +227,7 @@ class Frontier:
             for k in scores:
                 if k not in self._objectives:
                     self._objectives.append(k)
+                    self.directions[k] = "maximize"
 
         kept = self.should_keep(
             scores,
@@ -227,13 +235,19 @@ class Frontier:
             epsilon=self.epsilon,
             pareto=self.pareto,
             objectives=self._objectives,
+            directions=self.directions,
         )
         if kept:
             for obj in self._objectives:
                 if obj not in scores:
                     continue
                 cur = self.best.get(obj)
-                if cur is None or scores[obj] > cur:
+                better = cur is None or (
+                    scores[obj] > cur
+                    if self.directions.get(obj, "maximize") == "maximize"
+                    else scores[obj] < cur
+                )
+                if better:
                     self.best[obj] = float(scores[obj])
         return kept
 
@@ -242,6 +256,7 @@ class Frontier:
             "best": {k: float(v) for k, v in self.best.items()},
             "objectives": list(self._objectives),
             "pareto": self.pareto,
+            "directions": dict(self.directions),
             "epsilon": self.epsilon,
         }
 
@@ -251,6 +266,7 @@ class Frontier:
             best={k: float(v) for k, v in raw.get("best", {}).items()},
             objectives=list(raw.get("objectives", [])),
             pareto=bool(raw.get("pareto", True)),
+            directions=dict(raw.get("directions", {})),
             epsilon=float(raw.get("epsilon", DEFAULT_EPSILON)),
         )
 
@@ -261,6 +277,7 @@ class Frontier:
             self.best == other.best
             and self._objectives == other._objectives
             and self.pareto == other.pareto
+            and self.directions == other.directions
             and self.epsilon == other.epsilon
         )
 
@@ -276,15 +293,47 @@ class Frontier:
 # ---------------------------------------------------------------------------
 
 
-def scores_from_eval(eval_report: Any) -> dict[str, float]:
-    """Per-judge scores + aggregate from an :class:`EvalReport`."""
+def _scores_for_objectives(report: Any, objectives: list[ParetoObjective]) -> dict[str, float]:
+    scores: dict[str, float] = {}
+    cost_metrics = getattr(report, "cost_metrics", {}) or {}
+    for objective in objectives:
+        if objective.source == "aggregate":
+            value = report.aggregate
+        else:
+            metric = {
+                "tokens": "total_tokens",
+                "context_chars": "total_context_chars",
+                "n_rows": "n_rows",
+            }[objective.source]
+            if metric == "n_rows" and metric not in cost_metrics:
+                value = getattr(report, "n_rows", getattr(report, "n_examples", None))
+            else:
+                value = cost_metrics.get(metric)
+            if value is None:
+                raise ValueError(
+                    f"Pareto objective {objective.name!r} requires unavailable cost metric {metric!r}"
+                )
+        scores[objective.name] = float(value)
+    return scores
+
+
+def scores_from_eval(
+    eval_report: Any, objectives: list[ParetoObjective] | None = None
+) -> dict[str, float]:
+    """Extract configured objectives, or legacy judge scores + aggregate."""
+    if objectives is not None:
+        return _scores_for_objectives(eval_report, objectives)
     scores: dict[str, float] = {k: float(v) for k, v in eval_report.per_judge.items()}
     scores[AGGREGATE_KEY] = float(eval_report.aggregate)
     return scores
 
 
-def scores_from_baseline(baseline: Any) -> dict[str, float]:
+def scores_from_baseline(
+    baseline: Any, objectives: list[ParetoObjective] | None = None
+) -> dict[str, float]:
     """Per-judge scores + aggregate from a :class:`CachedBaseline`."""
+    if objectives is not None:
+        return _scores_for_objectives(baseline, objectives)
     scores: dict[str, float] = {k: float(v) for k, v in baseline.per_judge.items()}
     scores[AGGREGATE_KEY] = float(baseline.aggregate)
     return scores
@@ -325,7 +374,7 @@ def load_gate_config(scaffold_root: Path | str) -> GateConfig:
     """Read the ``gate`` section of ``harness/config.yaml``.
 
     Falls back to :class:`GateConfig` defaults (``type=frontier``,
-    ``epsilon=0.0``, ``pareto=True``) when the file or the section is
+    ``epsilon=0.0``, Pareto disabled) when the file or the section is
     absent, so the loop keeps running on a repo that predates the gate
     config. Only the ``gate`` section is validated here; the full-file
     ``extra="forbid"`` check is enforced by the runtime loader.
@@ -347,7 +396,7 @@ def gate_decision(
     repo_root: Path | str,
     gate_type: str,
     epsilon: float,
-    pareto: bool,
+    pareto: ParetoConfig | bool,
     baseline_scores: dict[str, float] | None,
     baseline_aggregate: float | None,
     mutated_scores: dict[str, float] | None,
@@ -413,6 +462,24 @@ def gate_decision(
     if mutated_scores is None:
         return Decision.INFRA_FAIL, None
 
+    if isinstance(pareto, bool):
+        pareto_enabled = pareto
+        objectives = None
+        directions: dict[str, str] = {}
+    else:
+        pareto_enabled = pareto.enabled
+        objectives = (
+            [objective.name for objective in pareto.objectives] or [AGGREGATE_KEY]
+            if pareto.enabled
+            else [AGGREGATE_KEY]
+        )
+        directions = (
+            {objective.name: objective.direction for objective in pareto.objectives}
+            or {AGGREGATE_KEY: "maximize"}
+            if pareto.enabled
+            else {AGGREGATE_KEY: "maximize"}
+        )
+
     frontier = load_frontier(repo_root)
     if frontier is None:
         # First scored round: initialize the frontier from the baseline.
@@ -421,12 +488,20 @@ def gate_decision(
             # make a comparative decision. Treat as an infra failure rather
             # than silently keeping or reverting.
             return Decision.INFRA_FAIL, None
-        frontier = Frontier.from_scores(baseline_scores, pareto=pareto, epsilon=epsilon)
+        frontier = Frontier.from_scores(
+            baseline_scores,
+            pareto=pareto_enabled,
+            directions=directions,
+            epsilon=epsilon,
+        )
         save_frontier(repo_root, frontier)
     else:
         # Adopt the current gate config rather than trusting a stale file.
-        frontier.pareto = pareto
+        frontier.pareto = pareto_enabled
         frontier.epsilon = epsilon
+        if objectives is not None:
+            frontier._objectives = objectives
+            frontier.directions = directions
 
     kept = frontier.update(mutated_scores)
     # Persist after every scored round (KEEP updates the best-so-far; REVERT

@@ -199,8 +199,15 @@ def run_round(
             )
 
     gate_cfg = load_gate_config(scaffold_root)
-    baseline_scores = scores_from_baseline(baseline) if baseline else None
-    mutated_scores = scores_from_eval(eval_report) if eval_report is not None else None
+    configured_objectives = gate_cfg.pareto.objectives if gate_cfg.pareto.enabled else None
+    if gate_cfg.pareto.enabled and not configured_objectives:
+        configured_objectives = None
+    baseline_scores = (
+        scores_from_baseline(baseline, configured_objectives) if baseline else None
+    )
+    mutated_scores = (
+        scores_from_eval(eval_report, configured_objectives) if eval_report is not None else None
+    )
     decision, frontier = gate_decision(
         repo_root=repo_root,
         gate_type=gate_cfg.type,

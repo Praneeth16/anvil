@@ -45,6 +45,7 @@ REQUIRED_FIELDS = [
     "n_examples",
     "mlflow_run_id",
     "scorer_fingerprint",
+    "cost_metrics",
 ]
 
 _SHA = "a" * 40
@@ -81,6 +82,7 @@ def _fake_report() -> EvalReport:
         scorers=["correctness", "retrieval_groundedness", "refusal_appropriateness"],
         evaluated_at="2026-08-16T12:00:00+00:00",
         trace_ids=["t0", "t1"],
+        cost_metrics={"total_context_chars": 128.0, "n_rows": 8.0},
         scorer_fingerprint=(
             '[{"check_function": null, "name": "correctness", '
             '"type": "llm", "weight": 1.0}]'
@@ -119,6 +121,7 @@ def test_report_to_baseline_maps_all_fields() -> None:
     assert baseline.per_judge == report.per_judge
     assert baseline.per_bucket == report.per_bucket
     assert baseline.scorer_fingerprint == report.scorer_fingerprint
+    assert baseline.cost_metrics == report.cost_metrics
 
     # Fields sourced from the caller (git + config), not the report.
     assert baseline.scaffold_commit_sha == _SHA
