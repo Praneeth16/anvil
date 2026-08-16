@@ -29,6 +29,12 @@ class MemorySystem(ABC):
     benchmark scores them.
 
     Inspired by meta-harness's MemorySystem pattern.
+
+    Thread-safety: ``predict`` may be invoked concurrently from multiple
+    threads when ``eval.n_workers > 1`` (code-mode parallel eval). A
+    subclass must therefore keep ``predict`` free of unsynchronized
+    shared-state mutation; stateful learning belongs in
+    ``learn_from_batch``, which runs between batches (not per-row).
     """
 
     @abstractmethod
