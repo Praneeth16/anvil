@@ -22,7 +22,9 @@ from __future__ import annotations
 import contextlib
 import importlib
 import importlib.util
+import inspect
 import os
+import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -328,7 +330,17 @@ def _import_agent_module(module_path: str) -> ModuleType:
         if spec is None or spec.loader is None:
             raise ImportError(f"cannot create import spec for agent module: {path}")
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        # Register before exec so @dataclass, __init_subclass__, and runtime
+        # type-resolution mechanisms that look up the module in sys.modules
+        # work during import. Mirrors importlib.import_module's contract.
+        sys.modules[spec.name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            # Remove the broken module so a retry doesn't find a partially-
+            # initialized entry.
+            sys.modules.pop(spec.name, None)
+            raise
         return module
     return importlib.import_module(module_path)
 
@@ -349,16 +361,17 @@ def _find_memory_system_subclass(module: ModuleType) -> type[MemorySystem]:
             and issubclass(obj, MemorySystem)
             and obj is not MemorySystem
             and getattr(obj, "__module__", None) == module.__name__
+            and not inspect.isabstract(obj)
         ):
             candidates.append(obj)
     if len(candidates) == 1:
         return candidates[0]
     if not candidates:
         raise ValueError(
-            f"no MemorySystem subclass found in agent module {module.__name__!r}"
+            f"no concrete MemorySystem subclass found in agent module {module.__name__!r}"
         )
     raise ValueError(
-        f"multiple MemorySystem subclasses found in {module.__name__!r}: "
+        f"multiple concrete MemorySystem subclasses found in {module.__name__!r}: "
         f"{[c.__name__ for c in candidates]}"
     )
 

@@ -336,7 +336,7 @@ def test_load_memory_system_no_subclass_raises(tmp_path: Path) -> None:
         "from anvil.agents.memory_system import MemorySystem\n# no subclass\n",
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="no MemorySystem subclass"):
+    with pytest.raises(ValueError, match="no concrete MemorySystem subclass"):
         _load_memory_system(str(agent_file))
 
 
@@ -400,6 +400,100 @@ def test_find_subclass_ignores_imported_base_class(tmp_path: Path) -> None:
     module = _import_agent_module(str(agent_file))
     cls = _find_memory_system_subclass(module)
     assert cls.__name__ == "MyAgent"
+
+
+def test_load_memory_system_file_path_with_dataclass(tmp_path: Path) -> None:
+    """A MemorySystem subclass using @dataclass must import correctly
+    when loaded from a .py file path. This requires the module to be
+    registered in sys.modules before exec_module — @dataclass and other
+    runtime type-resolution mechanisms look up the defining module there."""
+    from anvil.agents.memory_system import MemorySystem
+    from anvil.eval.runner import _load_memory_system
+
+    agent_file = tmp_path / "dataclass_agent.py"
+    agent_file.write_text(
+        textwrap.dedent(
+            """\
+            from dataclasses import dataclass
+            from anvil.agents.memory_system import MemorySystem
+
+            @dataclass
+            class DataclassAgent(MemorySystem):
+                llm_client: object = None
+                model: str = ""
+
+                def predict(self, input: str):
+                    return "dataclass", {}
+
+                def learn_from_batch(self, batch_results: list):
+                    pass
+            """
+        ),
+        encoding="utf-8",
+    )
+    ms = _load_memory_system(str(agent_file))
+    assert isinstance(ms, MemorySystem)
+    assert ms.__class__.__name__ == "DataclassAgent"
+
+
+def test_find_subclass_ignores_abstract_helpers(tmp_path: Path) -> None:
+    """An abstract intermediate subclass plus one concrete implementation
+    should find only the concrete class — abstract helpers are filtered
+    out via inspect.isabstract so they don't trigger the 'multiple
+    subclasses' error."""
+    from anvil.eval.runner import _find_memory_system_subclass, _import_agent_module
+
+    agent_file = tmp_path / "abstract_agent.py"
+    agent_file.write_text(
+        textwrap.dedent(
+            """\
+            from abc import abstractmethod
+            from anvil.agents.memory_system import MemorySystem
+
+            class AbstractHelper(MemorySystem):
+                @abstractmethod
+                def extra_method(self) -> str:
+                    ...
+
+            class ConcreteAgent(AbstractHelper):
+                def predict(self, input: str):
+                    return "x", {}
+                def learn_from_batch(self, batch_results: list):
+                    pass
+                def extra_method(self) -> str:
+                    return "done"
+            """
+        ),
+        encoding="utf-8",
+    )
+    module = _import_agent_module(str(agent_file))
+    cls = _find_memory_system_subclass(module)
+    assert cls.__name__ == "ConcreteAgent"
+
+
+def test_find_subclass_all_abstract_raises(tmp_path: Path) -> None:
+    """A module with only abstract subclasses should raise a clear
+    ValueError, not an opaque TypeError at instantiation time."""
+    from anvil.eval.runner import _find_memory_system_subclass, _import_agent_module
+
+    agent_file = tmp_path / "only_abstract.py"
+    agent_file.write_text(
+        textwrap.dedent(
+            """\
+            from abc import abstractmethod
+            from anvil.agents.memory_system import MemorySystem
+
+            class StillAbstract(MemorySystem):
+                @abstractmethod
+                def extra_method(self) -> str:
+                    ...
+            """
+        ),
+        encoding="utf-8",
+    )
+    module = _import_agent_module(str(agent_file))
+    with pytest.raises(ValueError, match="no concrete MemorySystem subclass"):
+        _find_memory_system_subclass(module)
 
 
 # ---------------------------------------------------------------------------
