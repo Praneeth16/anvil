@@ -235,6 +235,7 @@ def test_apply_delete_rule_removes_file_and_registry_entry(tmp_path: Path) -> No
     assert not (root / "rules" / "existing.md").exists()
     assert _read_yaml(root / "harness.yaml")["rules"] == []
     assert result.files_removed == ["scaffold/rules/existing.md"]
+    assert "scaffold/harness.yaml" in result.files_changed
 
 
 def test_apply_delete_identity_skill_rejected(tmp_path: Path) -> None:
@@ -245,6 +246,39 @@ def test_apply_delete_identity_skill_rejected(tmp_path: Path) -> None:
         )
     assert (root / "skills" / "identity.md").is_file()
     assert _read_yaml(root / "harness.yaml")["skills"] == [{"file": "identity.md"}]
+
+
+def test_apply_delete_crlf_identity_skill_rejected(tmp_path: Path) -> None:
+    root = _bare_scaffold(tmp_path)
+    (root / "skills" / "identity.md").write_bytes(
+        b"---\r\nskill_id: identity\r\nkind: identity\r\napplies_to: runtime\r\n"
+        b"---\r\n\r\n# role\r\ntest agent\r\n"
+    )
+
+    with pytest.raises(ApplyError, match="cannot delete identity skill"):
+        apply_action(
+            DeleteSkillAction(target="skills/identity.md", rationale="bad idea"), root
+        )
+
+    assert (root / "skills" / "identity.md").is_file()
+    assert _read_yaml(root / "harness.yaml")["skills"] == [{"file": "identity.md"}]
+
+
+def test_apply_delete_orphan_file_does_not_rewrite_harness(tmp_path: Path) -> None:
+    root = _bare_scaffold(tmp_path)
+    orphan = root / "rules" / "orphan.md"
+    orphan.write_text("# orphan\n", encoding="utf-8")
+    harness_path = root / "harness.yaml"
+    harness_before = harness_path.read_bytes()
+
+    result = apply_action(
+        DeleteRuleAction(target="rules/orphan.md", rationale="remove orphan"), root
+    )
+
+    assert not orphan.exists()
+    assert harness_path.read_bytes() == harness_before
+    assert result.files_changed == []
+    assert result.files_removed == ["scaffold/rules/orphan.md"]
 
 
 @pytest.mark.parametrize(

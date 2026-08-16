@@ -167,12 +167,16 @@ def _apply_delete_file(
         entry for entry in entries
         if not (isinstance(entry, dict) and entry.get("file") == filename)
     ]
-    harness[list_key] = remaining
-    _dump_yaml(harness_path, harness)
     path.unlink()
 
+    files_changed = []
+    if remaining != entries:
+        harness[list_key] = remaining
+        _dump_yaml(harness_path, harness)
+        files_changed.append(str(harness_path.relative_to(root.parent)))
+
     return ApplyResult(
-        files_changed=[str(harness_path.relative_to(root.parent))],
+        files_changed=files_changed,
         files_removed=[f"scaffold/{target}"],
         action_summary=f"delete_{role} {target}: {rationale[:120]}",
     )
@@ -208,12 +212,12 @@ def _dump_yaml(path: Path, data: dict) -> None:
 
 def _frontmatter(path: Path) -> dict:
     raw = path.read_text(encoding="utf-8")
-    if not raw.startswith("---\n"):
+    if not raw.startswith("---"):
         return {}
-    end = raw.find("\n---", 4)
+    end = raw.find("\n---", 3)
     if end == -1:
         return {}
-    metadata = yaml.safe_load(raw[4:end]) or {}
+    metadata = yaml.safe_load(raw[3:end].strip()) or {}
     return metadata if isinstance(metadata, dict) else {}
 
 

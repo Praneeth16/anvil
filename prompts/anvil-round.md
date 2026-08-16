@@ -111,11 +111,26 @@ with `.md`.
 
 #### `delete_skill`
 
-Delete an existing non-identity skill using `target: "skills/<existing>.md"`.
+Delete uses `target` (not the `target_file` used by add/edit). Delete an
+existing non-identity skill with:
+
+```json-action
+{
+  "action": "delete_skill",
+  "target": "skills/<existing>.md",
+  "rationale": "<rationale>"
+}
+```
 
 #### `delete_rule`
 
-Delete an existing rule using `target: "rules/<existing>.md"`.
+```json-action
+{
+  "action": "delete_rule",
+  "target": "rules/<existing>.md",
+  "rationale": "<rationale>"
+}
+```
 
 #### `change_sampling`
 
