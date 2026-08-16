@@ -54,6 +54,21 @@ def has_changes(repo_root: Path | str) -> bool:
     return bool(res.stdout)
 
 
+def has_staged_changes(repo_root: Path | str) -> bool:
+    """True if the index has changes staged and ready to commit.
+
+    Unlike :func:`has_changes` (which inspects the *entire* working
+    tree — staged and unstaged), this inspects only the index. It stays
+    ``False`` when the applier wrote nothing under ``scaffold/``/
+    ``agents/`` even if unrelated files elsewhere in the tree are dirty,
+    so :func:`commit_all` can decide whether ``git commit`` has anything
+    to commit without risking a non-zero exit on an empty index
+    (``"no changes added to commit"``).
+    """
+    res = _run(repo_root, ["diff", "--cached", "--name-only"], check=False)
+    return bool(res.stdout)
+
+
 def check_clean_worktree() -> None:
     """Raise if the Git working tree containing the current directory is dirty."""
     status = _run(Path.cwd(), ["status", "--porcelain"])
@@ -82,8 +97,13 @@ def create_round_branch(
 def commit_all(repo_root: Path | str, *, message: str) -> str:
     """Stage ``scaffold/`` (and ``agents/`` when present) and commit.
 
-    Returns the new SHA, or the current SHA when there is nothing to
-    commit (e.g. a ``noop`` action or content identical to HEAD).
+    Returns the new SHA, or the current SHA when nothing is staged to
+    commit (e.g. a ``noop`` action, or content identical to HEAD).
+    Checking the *index* (:func:`has_staged_changes`) rather than the
+    whole working tree means unrelated dirty files outside
+    ``scaffold/``/``agents/`` can no longer trick this into running
+    ``git commit`` on an empty index — which exits non-zero
+    (``"no changes added to commit"``) and aborts the multi-round run.
 
     In code mode the optimizer writes agent modules under ``agents/``
     (a repo-root sibling of ``scaffold/``); staging only ``scaffold/``
@@ -94,8 +114,10 @@ def commit_all(repo_root: Path | str, *, message: str) -> str:
     _run(repo_root, ["add", "scaffold/"])
     if (Path(repo_root) / "agents").is_dir():
         _run(repo_root, ["add", "agents/"])
-    if not has_changes(repo_root):
-        # Nothing to commit (e.g. noop action or applier wrote identical content).
+    if not has_staged_changes(repo_root):
+        # Nothing staged to commit (e.g. noop action, or applier wrote
+        # content identical to HEAD). Return the current SHA so no
+        # caller can crash on an empty ``git commit``.
         return current_sha(repo_root)
     _run(repo_root, ["commit", "-m", message])
     return current_sha(repo_root)
