@@ -251,7 +251,7 @@ def run_round(
     # 9. Write round JSON (combines aggregate + decision + delta).
     round_json_path = repo_root / "eval" / "runs" / f"round_{round_id:03d}.json"
     round_json_path.parent.mkdir(parents=True, exist_ok=True)
-    round_json_path.write_text(
+    round_payload = (
         json.dumps(
             _build_round_json(
                 round_id=round_id,
@@ -269,10 +269,10 @@ def run_round(
             ),
             indent=2,
         )
-        + "\n",
-        encoding="utf-8",
+        + "\n"
     )
-    _save_dashboard_round(repo_root, round_id, round_json_path.read_text(encoding="utf-8"))
+    round_json_path.write_text(round_payload, encoding="utf-8")
+    _save_dashboard_round(repo_root, round_id, round_payload)
 
     # 10. Append mutations log.
     record = MutationRecord.new(

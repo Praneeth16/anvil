@@ -18,7 +18,14 @@ def load_frontier(repo_root: Path | str) -> dict[str, Any] | None:
 def load_round_history(repo_root: Path | str) -> list[dict[str, Any]]:
     """Load round reports from ``data``, sorted by numeric round id."""
     paths = (Path(repo_root) / "data").glob("round_*.json")
-    rounds = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+    rounds = []
+    for path in paths:
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(report, dict):
+            rounds.append(report)
     return sorted(rounds, key=lambda report: int(report.get("round_id", 0)))
 
 
@@ -64,6 +71,11 @@ def all_round_points(round_history: list[dict], objectives: list[dict]) -> list[
         }
         for report in round_history
     ]
+    complete_points = [
+        point
+        for point in points
+        if all(point.get(_name(objective)) is not None for objective in objectives)
+    ]
 
     def dominates(left: dict, right: dict) -> bool:
         no_worse, better = True, False
@@ -84,7 +96,7 @@ def all_round_points(round_history: list[dict], objectives: list[dict]) -> list[
         return no_worse and better
 
     for point in points:
-        point["on_frontier"] = not any(
-            other is not point and dominates(other, point) for other in points
+        point["on_frontier"] = point in complete_points and not any(
+            other is not point and dominates(other, point) for other in complete_points
         )
     return points

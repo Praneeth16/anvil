@@ -19,6 +19,7 @@ def test_load_frontier_and_rounds(tmp_path):
     (data / "frontier.json").write_text(json.dumps(raw), encoding="utf-8")
     (data / "round_010.json").write_text('{"round_id": 10}', encoding="utf-8")
     (data / "round_002.json").write_text('{"round_id": 2}', encoding="utf-8")
+    (data / "round_003.json").write_text("not json", encoding="utf-8")
     assert load_frontier(tmp_path) == raw
     assert [row["round_id"] for row in load_round_history(tmp_path)] == [2, 10]
     assert load_frontier(tmp_path / "missing") is None
@@ -27,6 +28,13 @@ def test_load_frontier_and_rounds(tmp_path):
 def test_pareto_point_extraction():
     raw = {"points": [{"round_id": 2, "scores": {"accuracy": 0.8, "tokens": 90}}]}
     assert pareto_frontier_points(raw) == [{"round_id": 2, "accuracy": 0.8, "tokens": 90}]
+
+
+def test_pareto_point_extraction_from_production_frontier_shape():
+    raw = Frontier.from_scores({"accuracy": 0.8, "tokens": 90}).to_dict()
+    assert pareto_frontier_points(raw) == [
+        {"round_id": None, "accuracy": 0.8, "tokens": 90}
+    ]
 
 
 def test_all_round_points_marks_non_dominated_rounds():
@@ -41,6 +49,36 @@ def test_all_round_points_marks_non_dominated_rounds():
     ]
     points = all_round_points(rounds, objectives)
     assert [point["on_frontier"] for point in points] == [False, True, True]
+
+
+def test_all_round_points_excludes_rounds_with_missing_objectives():
+    rounds = [
+        {"round_id": 1, "aggregate": 0.9},
+        {"round_id": 2},
+    ]
+    objectives = [{"name": "quality", "source": "aggregate"}]
+    assert [point["on_frontier"] for point in all_round_points(rounds, objectives)] == [
+        True,
+        False,
+    ]
+
+
+def test_cost_objective_uses_preserved_source():
+    frontier = Frontier.from_scores(
+        {"cost": 1234},
+        directions={"cost": "minimize"},
+        sources={"cost": "context_chars"},
+    ).to_dict()
+    objective = {
+        "name": "cost",
+        "source": frontier["sources"].get("cost", "cost"),
+        "direction": frontier["directions"]["cost"],
+    }
+    points = all_round_points(
+        [{"round_id": 1, "cost_metrics": {"total_context_chars": 1234}}],
+        [objective],
+    )
+    assert points == [{"round_id": 1, "cost": 1234, "on_frontier": True}]
 
 
 def test_frontier_is_persisted_for_dashboard(tmp_path):

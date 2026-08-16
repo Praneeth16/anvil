@@ -35,8 +35,13 @@ def main() -> None:
         return
     rounds = load_round_history(repo_root)
     directions = frontier.get("directions", {})
+    sources = frontier.get("sources", {})
     objectives = [
-        {"name": objective, "source": objective, "direction": directions.get(objective, "maximize")}
+        {
+            "name": objective,
+            "source": sources.get(objective, objective),
+            "direction": directions.get(objective, "maximize"),
+        }
         if isinstance(objective, str)
         else objective
         for objective in frontier.get("objectives", [])

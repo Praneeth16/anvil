@@ -84,6 +84,7 @@ class Frontier:
         objectives: list[str] | None = None,
         pareto: bool = True,
         directions: dict[str, str] | None = None,
+        sources: dict[str, str] | None = None,
         epsilon: float = DEFAULT_EPSILON,
     ) -> None:
         self.best: dict[str, float] = {k: float(v) for k, v in best.items()} if best else {}
@@ -97,6 +98,7 @@ class Frontier:
         self.directions = {
             obj: (directions or {}).get(obj, "maximize") for obj in self._objectives
         }
+        self.sources = {obj: (sources or {}).get(obj, obj) for obj in self._objectives}
         self.epsilon = float(epsilon)
 
     @property
@@ -110,10 +112,17 @@ class Frontier:
         *,
         pareto: bool = True,
         directions: dict[str, str] | None = None,
+        sources: dict[str, str] | None = None,
         epsilon: float = DEFAULT_EPSILON,
     ) -> Frontier:
         """Initialize a frontier whose best-so-far IS ``scores`` (round 1)."""
-        return cls(best=scores, pareto=pareto, directions=directions, epsilon=epsilon)
+        return cls(
+            best=scores,
+            pareto=pareto,
+            directions=directions,
+            sources=sources,
+            epsilon=epsilon,
+        )
 
     @staticmethod
     def should_keep(
@@ -228,6 +237,7 @@ class Frontier:
                 if k not in self._objectives:
                     self._objectives.append(k)
                     self.directions[k] = "maximize"
+                    self.sources[k] = k
 
         kept = self.should_keep(
             scores,
@@ -257,6 +267,7 @@ class Frontier:
             "objectives": list(self._objectives),
             "pareto": self.pareto,
             "directions": dict(self.directions),
+            "sources": dict(self.sources),
             "epsilon": self.epsilon,
         }
 
@@ -267,6 +278,7 @@ class Frontier:
             objectives=list(raw.get("objectives", [])),
             pareto=bool(raw.get("pareto", True)),
             directions=dict(raw.get("directions", {})),
+            sources=dict(raw.get("sources", {})),
             epsilon=float(raw.get("epsilon", DEFAULT_EPSILON)),
         )
 
@@ -278,6 +290,7 @@ class Frontier:
             and self._objectives == other._objectives
             and self.pareto == other.pareto
             and self.directions == other.directions
+            and self.sources == other.sources
             and self.epsilon == other.epsilon
         )
 
@@ -361,10 +374,11 @@ def save_frontier(repo_root: Path | str, frontier: Frontier) -> Path:
     """Persist ``frontier`` to ``eval/runs/frontier.json``. Returns the path."""
     path = frontier_path(repo_root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(frontier.to_dict(), indent=2) + "\n", encoding="utf-8")
+    payload = json.dumps(frontier.to_dict(), indent=2) + "\n"
+    path.write_text(payload, encoding="utf-8")
     dashboard_path = Path(repo_root) / "data" / "frontier.json"
     dashboard_path.parent.mkdir(parents=True, exist_ok=True)
-    dashboard_path.write_text(json.dumps(frontier.to_dict(), indent=2) + "\n", encoding="utf-8")
+    dashboard_path.write_text(payload, encoding="utf-8")
     return path
 
 
@@ -469,6 +483,7 @@ def gate_decision(
         pareto_enabled = pareto
         objectives = None
         directions: dict[str, str] = {}
+        sources: dict[str, str] = {}
     else:
         pareto_enabled = pareto.enabled
         objectives = (
@@ -481,6 +496,12 @@ def gate_decision(
             or {AGGREGATE_KEY: "maximize"}
             if pareto.enabled
             else {AGGREGATE_KEY: "maximize"}
+        )
+        sources = (
+            {objective.name: objective.source for objective in pareto.objectives}
+            or {AGGREGATE_KEY: AGGREGATE_KEY}
+            if pareto.enabled
+            else {AGGREGATE_KEY: AGGREGATE_KEY}
         )
 
     frontier = load_frontier(repo_root)
@@ -495,6 +516,7 @@ def gate_decision(
             baseline_scores,
             pareto=pareto_enabled,
             directions=directions,
+            sources=sources,
             epsilon=epsilon,
         )
         save_frontier(repo_root, frontier)
@@ -505,6 +527,7 @@ def gate_decision(
         if objectives is not None:
             frontier._objectives = objectives
             frontier.directions = directions
+            frontier.sources = sources
 
     kept = frontier.update(mutated_scores)
     # Persist after every scored round (KEEP updates the best-so-far; REVERT
