@@ -299,3 +299,132 @@ def _gold(example_id: str, answer: str) -> dict:
         "must_not_include": [],
         "notes_for_judge": "",
     }
+
+
+# ---------------------------------------------------------------------------
+# 5. Resilience — a missing per-row trace must NEVER crash the run
+# ---------------------------------------------------------------------------
+#
+# The live flakiness (a row's trace not retrievable by request_id on the
+# Databricks Tracing Server, so ``eval_item.trace`` is None) is not
+# offline-reproducible. These tests exercise the crash PATH deterministically
+# against the REAL mlflow harness (no fakes, no network/LLM) by forcing a
+# None trace the same way the red baseline above does — a ``predict_fn`` that
+# creates no span, with trace validation skipped so the harness does not
+# auto-wrap it.
+
+
+def test_resilient_harness_completes_when_trace_is_missing(
+    local_mlruns: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for the live ``make_baseline`` crash. When a row's trace is
+    not retrievable by request_id (``eval_item.trace`` None), the raw harness
+    crashes in ``_get_new_expectations`` (see
+    ``test_untraced_predict_fn_crashes_eval_harness`` above). Under
+    ``_resilient_eval_harness`` the same no-trace scenario must COMPLETE:
+    the ``_run_predict`` fallback synthesizes a minimal trace per row (fetched
+    by its own just-created ``trace_id``, the reliable mechanism) so the run
+    produces a real result DataFrame, and the ``_get_new_expectations`` shim
+    yields no expectations for any residual None trace. Drives the REAL
+    ``mlflow.genai.evaluate`` over a local file store with a trivial
+    programmatic scorer — no network/LLM."""
+    import mlflow
+
+    from anvil.eval.runner import _resilient_eval_harness
+
+    # Skip trace validation so the harness does NOT auto-wrap the predict_fn
+    # (mirroring the live flow where autolog produced a span during validation
+    # and suppressed the auto-wrap). With no span, get_trace(request_id)
+    # returns None — the live crash condition.
+    monkeypatch.setenv("MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION", "True")
+    mlflow.set_experiment("test_resilient_completes")
+
+    def predict_fn(query, **_kwargs):
+        # No span created — mimics a row whose trace is not retrievable by
+        # request_id, leaving eval_item.trace None.
+        return "answer"
+
+    with _resilient_eval_harness():
+        result = mlflow.genai.evaluate(
+            data=[_gold_row("r1"), _gold_row("r2"), _gold_row("r3")],
+            scorers=[_make_passing_scorer()],
+            predict_fn=predict_fn,
+        )
+
+    # No crash — the run completed with a real result DataFrame whose rows
+    # each carry a trace_id from the create_minimal_trace fallback.
+    assert result is not None
+    assert result.result_df is not None
+    trace_ids = list(result.result_df["trace_id"])
+    assert len(trace_ids) == 3
+    assert all(tid for tid in trace_ids), "every row must carry a (fallback) trace"
+
+
+def test_get_new_expectations_shim_none_safe_and_passthrough(
+    local_mlruns: Path,
+) -> None:
+    """Exercise the shim against the REAL mlflow harness symbol
+    (``mlflow.genai.evaluation.harness._get_new_expectations``) with an eval
+    item whose ``trace`` is None — the deterministic scoring-path crash that
+    is not offline-reproducible via the live backend. Asserts:
+
+    * the ORIGINAL symbol raises ``AttributeError`` on a None-trace item —
+      the raw mlflow 3.11.x bug (``eval_item.trace.info.assessments`` deref
+      with no None check, harness.py:936), proving the shim is necessary;
+    * under ``_resilient_eval_harness`` the patched symbol does NOT raise and
+      yields ``[]`` for a None-trace item;
+    * a normal trace-present item is UNAFFECTED — the patched symbol
+      delegates to the original and returns the same expectations.
+
+    No network/LLM: a real trace is built via ``create_minimal_trace`` over a
+    local file store."""
+    import mlflow
+    import mlflow.genai.evaluation.harness as harness
+    from mlflow.genai.evaluation.entities import EvalItem
+    from mlflow.genai.utils.trace_utils import create_minimal_trace
+
+    from anvil.eval.runner import _resilient_eval_harness
+
+    mlflow.set_experiment("test_shim_none_safe")
+    expectations = {"expected_facts": ["fact-a"], "should_refuse": False}
+
+    # A row whose trace the backend never returned — the crash condition.
+    item_none = EvalItem(
+        request_id="none-1",
+        inputs={"query": "q"},
+        outputs="answer",
+        expectations=expectations,
+        trace=None,
+    )
+
+    # 1. Red proof: the raw mlflow symbol derefs eval_item.trace.info without
+    #    a None check and raises — exactly the live make_baseline crash.
+    with pytest.raises(AttributeError, match="NoneType"):
+        harness._get_new_expectations(item_none)
+
+    # 2. Under the shim, the same None-trace item yields no expectations
+    #    instead of raising.
+    with _resilient_eval_harness():
+        assert harness._get_new_expectations(item_none) == []
+
+    # 3. A normal (trace-present) item is unaffected: the patched symbol
+    #    delegates to the original and returns the same expectations.
+    with mlflow.start_run():
+        item_with_trace = EvalItem(
+            request_id="trace-1",
+            inputs={"query": "q"},
+            outputs="answer",
+            expectations=expectations,
+        )
+        item_with_trace.trace = create_minimal_trace(item_with_trace)
+        assert item_with_trace.trace is not None
+
+        # Baseline from the original (outside the shim).
+        baseline = harness._get_new_expectations(item_with_trace)
+        assert len(baseline) > 0, "trace-present item should yield expectations"
+
+        with _resilient_eval_harness():
+            shim_result = harness._get_new_expectations(item_with_trace)
+
+        # Delegates to the original — same expectations, unaffected.
+        assert shim_result == baseline
