@@ -43,12 +43,8 @@ def _arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--round-id", type=int, default=None, help="explicit round id")
     p.add_argument("--rounds", type=int, default=1, help="number of consecutive rounds")
-    p.add_argument(
-        "--profile", default="DEFAULT", help="Databricks CLI profile"
-    )
-    p.add_argument(
-        "--parent-branch", default="anvil/exp", help="branch to fork from + ff-merge to"
-    )
+    p.add_argument("--profile", default="DEFAULT", help="Databricks CLI profile")
+    p.add_argument("--parent-branch", default="anvil/exp", help="branch to fork from + ff-merge to")
     p.add_argument(
         "--eval-mode",
         choices=["quick", "standard", "full"],
@@ -65,6 +61,11 @@ def _arg_parser() -> argparse.ArgumentParser:
         "--allow-dirty",
         action="store_true",
         help="skip the clean-worktree safety check",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="run even when eval/runs/finalized.json exists",
     )
     return p
 
@@ -83,6 +84,11 @@ def _next_round_id(repo_root: Path) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = _arg_parser().parse_args(argv)
 
+    finalized_path = REPO_ROOT / "eval" / "runs" / "finalized.json"
+    if finalized_path.is_file() and not args.force:
+        print(f"ERROR: optimization is finalized ({finalized_path}); pass --force to override.")
+        return 1
+
     if args.allow_dirty:
         print("WARNING: --allow-dirty specified; skipping clean-worktree safety check.")
     else:
@@ -97,9 +103,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     if proc.returncode != 0:
         print(f"ERROR: parent branch {args.parent_branch!r} does not exist.")
-        print(
-            f"Create it first: git -C {REPO_ROOT} checkout -b {args.parent_branch} main"
-        )
+        print(f"Create it first: git -C {REPO_ROOT} checkout -b {args.parent_branch} main")
         return 2
 
     next_id = args.round_id if args.round_id is not None else _next_round_id(REPO_ROOT)

@@ -182,8 +182,7 @@ def _aggregate_report(
     n_rows = len(result_df)
 
     per_judge_rows: dict[str, list[float | None]] = {
-        name: [_row_score(result_df.iloc[i], name) for i in range(n_rows)]
-        for name in scorer_names
+        name: [_row_score(result_df.iloc[i], name) for i in range(n_rows)] for name in scorer_names
     }
 
     def _mean(values: list[float | None]) -> float:
@@ -223,9 +222,7 @@ def _aggregate_report(
         if trace_id:
             trace_ids.append(str(trace_id))
         judge_failures = [
-            name
-            for name in scorer_names
-            if (s := per_judge_rows[name][i]) is not None and s < 1.0
+            name for name in scorer_names if (s := per_judge_rows[name][i]) is not None and s < 1.0
         ]
         if not judge_failures:
             continue
@@ -265,6 +262,7 @@ def evaluate_branch(
     golden_set_path: Path | str = "data/golden_set.jsonl",
     profile: str | None = None,
     mode: str | None = None,
+    allow_test: bool = False,
     include_safety: bool = False,
     runtime_client: OpenAI | None = None,
     judge_client: OpenAI | None = None,
@@ -280,10 +278,11 @@ def evaluate_branch(
     snapshot = load_harness(scaffold_path, runtime_path)
     cfg: EvalConfig = snapshot.config.eval
     selected_mode = mode or cfg.default_mode
+    if selected_mode == "test" and not allow_test:
+        raise ValueError("test mode is held out and may only be run by explicit finalization")
     if selected_mode not in cfg.modes:
         raise ValueError(
-            f"mode {selected_mode!r} not in harness/config.yaml > eval.modes "
-            f"({list(cfg.modes)})"
+            f"mode {selected_mode!r} not in harness/config.yaml > eval.modes ({list(cfg.modes)})"
         )
     mode_config = cfg.modes[selected_mode]
 

@@ -139,6 +139,7 @@ class EvalConfig(BaseModel):
     """Eval-side configuration."""
 
     default_mode: Literal["quick", "standard", "full"] = "standard"
+    held_out_test: bool = False
     modes: dict[str, EvalModeConfig] = Field(default_factory=dict)
     n_workers: int = 4
     inter_row_cooldown_s: float = 0.0
