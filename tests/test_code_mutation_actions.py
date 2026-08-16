@@ -588,3 +588,156 @@ def test_write_agent_derives_repo_root_from_scaffold_parent(tmp_path: Path) -> N
 
     assert (tmp_path / "agents" / "derived.py").is_file()
     assert "agents/derived.py" in result.files_added
+
+
+# ---------------------------------------------------------------------------
+# 10. Code-mode commit includes agents/ files (B1)
+# ---------------------------------------------------------------------------
+
+
+def test_commit_includes_agents_directory(tmp_path: Path) -> None:
+    """commit_all() must stage agents/ as well as scaffold/ so that
+    code-mode mutations (write_agent) land in the commit. Without
+    this, the round branch's merge/revert would miss or lose the
+    mutation, since code-mode writes live under agents/ not scaffold/.
+    """
+    import subprocess
+
+    from anvil.loop.git_ops import commit_all
+
+    repo = tmp_path
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@e.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    # Seed scaffold/ + an initial commit so HEAD exists.
+    (repo / "scaffold").mkdir()
+    (repo / "scaffold" / "harness.yaml").write_text("tools: []\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"], check=True)
+
+    # Simulate a code-mode mutation: write a file under agents/.
+    (repo / "agents").mkdir()
+    (repo / "agents" / "candidate.py").write_text("# new agent\n", encoding="utf-8")
+
+    sha = commit_all(repo, message="round 001: write_agent agents/candidate.py")
+
+    changed = subprocess.run(
+        ["git", "-C", str(repo), "diff-tree", "--no-commit-id", "--name-only", "-r", sha],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert "agents/candidate.py" in changed
+
+
+def test_commit_all_noop_without_agents_dir(tmp_path: Path) -> None:
+    """commit_all() must not blow up when agents/ is absent (prompt
+    mode). ``git add`` on a missing pathspec is fatal, so the
+    existence guard is load-bearing here."""
+    import subprocess
+
+    from anvil.loop.git_ops import commit_all
+
+    repo = tmp_path
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@e.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "scaffold").mkdir()
+    (repo / "scaffold" / "harness.yaml").write_text("tools: []\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"], check=True)
+
+    # No agents/ dir, no changes — commit_all returns the current SHA.
+    sha = commit_all(repo, message="noop round")
+    assert sha == subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True,
+    ).stdout.strip()
+
+
+# ---------------------------------------------------------------------------
+# 11. Symlink containment (B2)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_write_agent_rejects_symlink_escape(tmp_path: Path) -> None:
+    """A symlink inside agents/ pointing outside the repo must be
+    rejected — the resolved path would escape agents/, allowing an
+    arbitrary write. The lexical _check_agent_path cannot see this;
+    the resolver-level _check_path_safe in the applier must catch it.
+    """
+    scaffold_root = _code_mode_scaffold(tmp_path)
+    repo_root = tmp_path
+
+    external = repo_root / "external"
+    external.mkdir()
+    (repo_root / "agents" / "evil").symlink_to(external)
+
+    action = WriteAgentAction(
+        target_file="agents/evil/foo.py",
+        content=_AGENT_SOURCE,
+        rationale="escape via symlink",
+    )
+    with pytest.raises(ApplyError, match="resolves outside agents/"):
+        apply_action(action, scaffold_root, mode="code", repo_root=repo_root)
+
+    # No file was written outside agents/.
+    assert not (external / "foo.py").exists()
+
+
+def test_apply_delete_agent_rejects_symlink_escape(tmp_path: Path) -> None:
+    """A symlink under agents/ pointing outside the repo must not let
+    delete_agent erase an external file."""
+    scaffold_root = _code_mode_scaffold(tmp_path)
+    repo_root = tmp_path
+
+    external = repo_root / "external"
+    external.mkdir()
+    (repo_root / "agents" / "evil").symlink_to(external)
+    (external / "victim.py").write_text("# secret\n", encoding="utf-8")
+
+    action = DeleteAgentAction(
+        target="agents/evil/victim.py",
+        rationale="escape via symlink",
+    )
+    with pytest.raises(ApplyError, match="resolves outside agents/"):
+        apply_action(action, scaffold_root, mode="code", repo_root=repo_root)
+
+    # The external file survives.
+    assert (external / "victim.py").is_file()
+    assert (external / "victim.py").read_text(encoding="utf-8") == "# secret\n"
+
+
+# ---------------------------------------------------------------------------
+# 12. Mode validation fails closed (B3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["hybrid", "", "cod", "CODE", "code "])
+def test_validate_action_mode_rejects_unknown_mode(mode: str) -> None:
+    """Unknown mode values must raise, not silently permit every
+    action (the old code only fired on exact 'prompt'/'code' matches,
+    so a typo let everything through)."""
+    from anvil.optimizer.applier import _validate_action_mode
+
+    with pytest.raises(ApplyError, match="unknown optimization mode"):
+        _validate_action_mode("write_agent", mode)
+
+
+def test_validate_action_mode_unknown_mode_rejects_prompt_action_too() -> None:
+    """An unknown mode must reject even prompt-mode actions, so a
+    typo can't widen the vocabulary either direction."""
+    from anvil.optimizer.applier import _validate_action_mode
+
+    with pytest.raises(ApplyError, match="unknown optimization mode"):
+        _validate_action_mode("add_skill", "hybrid")
+
+
+def test_read_optimization_mode_rejects_invalid_value(tmp_path: Path) -> None:
+    """An invalid mode in config.yaml must fail at the source rather
+    than reach the applier as a permissive unknown mode."""
+    from anvil.loop.round import _read_optimization_mode
+
+    scaffold_root = tmp_path / "scaffold"
+    config = tmp_path / "harness" / "config.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text("mode: hybrid\nruntime_endpoint: x\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="unknown optimization mode"):
+        _read_optimization_mode(scaffold_root)

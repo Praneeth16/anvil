@@ -80,8 +80,20 @@ def create_round_branch(
 
 
 def commit_all(repo_root: Path | str, *, message: str) -> str:
-    """Stage everything under ``scaffold/`` and commit. Returns the new SHA."""
+    """Stage ``scaffold/`` (and ``agents/`` when present) and commit.
+
+    Returns the new SHA, or the current SHA when there is nothing to
+    commit (e.g. a ``noop`` action or content identical to HEAD).
+
+    In code mode the optimizer writes agent modules under ``agents/``
+    (a repo-root sibling of ``scaffold/``); staging only ``scaffold/``
+    would leave those mutations uncommitted and break the round's
+    keep/revert branch operations. ``git add`` on a missing pathspec is
+    fatal, so ``agents/`` is staged only when the directory exists.
+    """
     _run(repo_root, ["add", "scaffold/"])
+    if (Path(repo_root) / "agents").is_dir():
+        _run(repo_root, ["add", "agents/"])
     if not has_changes(repo_root):
         # Nothing to commit (e.g. noop action or applier wrote identical content).
         return current_sha(repo_root)

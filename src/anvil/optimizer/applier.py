@@ -146,20 +146,29 @@ def _validate_action_mode(action_kind: str, mode: str) -> None:
 
     * ``prompt`` mode → only skill/rule/sampling actions + ``noop``.
     * ``code``   mode → only ``write_agent`` / ``delete_agent`` + ``noop``.
+    * anything else → rejected (fail-closed).
 
     This prevents the optimizer from accidentally mixing prompt and
     code mutations in the same round — e.g. editing a skill while the
-    eval expects a code-mode agent module.
+    eval expects a code-mode agent module — and ensures an unknown
+    mode value (typo, empty string, ``hybrid``) cannot silently permit
+    every action because neither branch fires.
     """
-    if mode == "prompt" and action_kind in _CODE_ACTIONS:
+    if mode == "prompt":
+        if action_kind in _CODE_ACTIONS:
+            raise ApplyError(
+                f"action {action_kind!r} is only valid in code mode "
+                f"(harness/config.yaml > mode: code)"
+            )
+    elif mode == "code":
+        if action_kind in _PROMPT_ACTIONS:
+            raise ApplyError(
+                f"action {action_kind!r} is only valid in prompt mode "
+                f"(harness/config.yaml > mode: prompt)"
+            )
+    else:
         raise ApplyError(
-            f"action {action_kind!r} is only valid in code mode "
-            f"(harness/config.yaml > mode: code)"
-        )
-    if mode == "code" and action_kind in _PROMPT_ACTIONS:
-        raise ApplyError(
-            f"action {action_kind!r} is only valid in prompt mode "
-            f"(harness/config.yaml > mode: prompt)"
+            f"unknown optimization mode {mode!r}; expected 'prompt' or 'code'"
         )
 
 
@@ -265,6 +274,26 @@ def _apply_change_sampling(
     )
 
 
+def _check_path_safe(target_path: Path, repo_root: Path) -> None:
+    """Verify the resolved target path is beneath the resolved agents/ dir.
+
+    The model-level :func:`anvil.optimizer.actions._check_agent_path` only
+    inspects the *string* (no ``..``, starts with ``agents/``, ``.py``
+    suffix). It cannot catch a symlink inside ``agents/`` that points
+    outside the repo, which would allow arbitrary writes/deletes. This
+    resolver-level check closes that gap by resolving symlinks on both
+    the target and the ``agents/`` directory before the containment test.
+    """
+    agents_dir = (repo_root / "agents").resolve()
+    resolved = target_path.resolve()
+    try:
+        resolved.relative_to(agents_dir)
+    except ValueError:
+        raise ApplyError(
+            f"target path {target_path} resolves outside agents/"
+        ) from None
+
+
 def _apply_write_agent(action: WriteAgentAction, repo_root: Path) -> ApplyResult:
     """Write a new agent module, validating it first.
 
@@ -275,6 +304,7 @@ def _apply_write_agent(action: WriteAgentAction, repo_root: Path) -> ApplyResult
     :class:`CodeValidationError` and leaves the target untouched.
     """
     target_path = repo_root / action.target_file
+    _check_path_safe(target_path, repo_root)
     target_existed = target_path.is_file()
 
     # Write content to a temp file for validation. We never write
@@ -315,6 +345,7 @@ def _apply_delete_agent(
     next round would break the loop.
     """
     target_path = repo_root / action.target
+    _check_path_safe(target_path, repo_root)
 
     # Protect the configured agent module.
     agent_module = _read_agent_module(scaffold_root)
