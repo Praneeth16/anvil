@@ -18,6 +18,7 @@ Returns an :class:`ApplyResult` listing the files touched + an
 
 from __future__ import annotations
 
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -27,13 +28,16 @@ from anvil.optimizer.actions import (
     AddRuleAction,
     AddSkillAction,
     ChangeSamplingAction,
+    DeleteAgentAction,
     DeleteRuleAction,
     DeleteSkillAction,
     EditRuleAction,
     EditSkillAction,
     NoopAction,
     OptimizerAction,
+    WriteAgentAction,
 )
+from anvil.optimizer.code_validation import validate_code_candidate
 
 
 @dataclass
@@ -53,9 +57,46 @@ class ApplyError(Exception):
     """
 
 
-def apply_action(action: OptimizerAction, scaffold_root: Path | str) -> ApplyResult:
-    """Apply ``action`` to ``scaffold_root``. Returns paths touched."""
+# Actions that belong to each optimization mode. ``noop`` is always
+# valid regardless of mode. These sets drive the mode-aware validation
+# that prevents the optimizer from mixing prompt and code mutations in
+# the same round.
+_PROMPT_ACTIONS: frozenset[str] = frozenset(
+    {
+        "add_skill",
+        "edit_skill",
+        "delete_skill",
+        "add_rule",
+        "edit_rule",
+        "delete_rule",
+        "change_sampling",
+    }
+)
+_CODE_ACTIONS: frozenset[str] = frozenset({"write_agent", "delete_agent"})
+
+
+def apply_action(
+    action: OptimizerAction,
+    scaffold_root: Path | str,
+    *,
+    mode: str = "prompt",
+    repo_root: Path | str | None = None,
+) -> ApplyResult:
+    """Apply ``action`` to ``scaffold_root``. Returns paths touched.
+
+    ``mode`` selects which action vocabulary is allowed: ``prompt``
+    mode accepts skill/rule/sampling mutations; ``code`` mode accepts
+    write_agent/delete_agent. Mismatched actions raise :class:`ApplyError`.
+
+    ``repo_root`` is the repo root for code-mode file paths (agents/
+    lives at the repo root, not under scaffold/). When ``None`` it is
+    derived from ``scaffold_root.parent`` (the convention: scaffold/
+    and harness/ are siblings under the repo root).
+    """
     root = Path(scaffold_root)
+    repo_root = root.parent if repo_root is None else Path(repo_root)
+
+    _validate_action_mode(action.action, mode)
 
     if isinstance(action, NoopAction):
         return ApplyResult(action_summary=f"noop: {action.rationale}")
@@ -92,8 +133,34 @@ def apply_action(action: OptimizerAction, scaffold_root: Path | str) -> ApplyRes
         return _apply_change_sampling(
             root, field_name=action.field, value=action.value, rationale=action.rationale,
         )
+    if isinstance(action, WriteAgentAction):
+        return _apply_write_agent(action, repo_root)
+    if isinstance(action, DeleteAgentAction):
+        return _apply_delete_agent(action, repo_root, root)
 
     raise ApplyError(f"unknown action type: {type(action).__name__}")
+
+
+def _validate_action_mode(action_kind: str, mode: str) -> None:
+    """Reject actions that do not match the active optimization mode.
+
+    * ``prompt`` mode → only skill/rule/sampling actions + ``noop``.
+    * ``code``   mode → only ``write_agent`` / ``delete_agent`` + ``noop``.
+
+    This prevents the optimizer from accidentally mixing prompt and
+    code mutations in the same round — e.g. editing a skill while the
+    eval expects a code-mode agent module.
+    """
+    if mode == "prompt" and action_kind in _CODE_ACTIONS:
+        raise ApplyError(
+            f"action {action_kind!r} is only valid in code mode "
+            f"(harness/config.yaml > mode: code)"
+        )
+    if mode == "code" and action_kind in _PROMPT_ACTIONS:
+        raise ApplyError(
+            f"action {action_kind!r} is only valid in prompt mode "
+            f"(harness/config.yaml > mode: prompt)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +263,120 @@ def _apply_change_sampling(
         files_changed=[str(harness_path.relative_to(root.parent))],
         action_summary=f"change_sampling {field_name}: {old!r} → {value!r}: {rationale[:120]}",
     )
+
+
+def _apply_write_agent(action: WriteAgentAction, repo_root: Path) -> ApplyResult:
+    """Write a new agent module, validating it first.
+
+    The code is written to a **temp file**, run through
+    :func:`validate_code_candidate` (AST denylist + isolated import),
+    and only then written to its final location. Unvalidated code is
+    never persisted to disk — a validation failure raises
+    :class:`CodeValidationError` and leaves the target untouched.
+    """
+    target_path = repo_root / action.target_file
+    target_existed = target_path.is_file()
+
+    # Write content to a temp file for validation. We never write
+    # unvalidated code to the final location.
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".py",
+        prefix="anvil_candidate_",
+        delete=False,
+        encoding="utf-8",
+    ) as f:
+        f.write(action.content)
+        temp_path = Path(f.name)
+
+    try:
+        validate_code_candidate(temp_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+    # Validation passed — write to the final location.
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(action.content, encoding="utf-8")
+
+    return ApplyResult(
+        files_added=[action.target_file] if not target_existed else [],
+        files_changed=[action.target_file] if target_existed else [],
+        action_summary=f"write_agent {action.target_file}: {action.rationale[:120]}",
+    )
+
+
+def _apply_delete_agent(
+    action: DeleteAgentAction, repo_root: Path, scaffold_root: Path,
+) -> ApplyResult:
+    """Delete an agent module, protecting the configured baseline.
+
+    The active ``agent_module`` (read from ``harness/config.yaml``) is
+    protected from deletion — removing the file the eval would load
+    next round would break the loop.
+    """
+    target_path = repo_root / action.target
+
+    # Protect the configured agent module.
+    agent_module = _read_agent_module(scaffold_root)
+    protected = _agent_module_to_agents_path(agent_module)
+    if protected is not None and protected == action.target:
+        raise ApplyError(
+            f"cannot delete active agent module {action.target!r} "
+            f"(configured as agent_module: {agent_module!r})"
+        )
+
+    if not target_path.is_file():
+        raise ApplyError(
+            f"agent {action.target!r} does not exist and cannot be deleted"
+        )
+
+    target_path.unlink()
+
+    return ApplyResult(
+        files_removed=[action.target],
+        action_summary=f"delete_agent {action.target}: {action.rationale[:120]}",
+    )
+
+
+def _read_agent_module(scaffold_root: Path) -> str:
+    """Read ``agent_module`` from ``harness/config.yaml``.
+
+    Returns the default (``"anvil.agents.baseline"``) when the file or
+    field is absent, so the protection check works on repos that
+    predate the ``agent_module`` config field.
+    """
+    config_path = scaffold_root.parent / "harness" / "config.yaml"
+    if not config_path.is_file():
+        return "anvil.agents.baseline"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    return raw.get("agent_module", "anvil.agents.baseline")
+
+
+def _agent_module_to_agents_path(agent_module: str) -> str | None:
+    """Convert an ``agent_module`` config value to a repo-root-relative
+    path under ``agents/``, or ``None`` if the module is not a file in
+    ``agents/``.
+
+    The ``agent_module`` config accepts two forms:
+
+    * A dotted Python path (e.g. ``"anvil.agents.baseline"``) — a
+      package module, not in ``agents/``. Returns ``None``.
+    * A ``.py`` file path (e.g. ``"agents/extractor_v2.py"``) — already
+      a path. Returned as-is when it starts with ``agents/``.
+
+    Dotted paths starting with ``agents.`` (e.g.
+    ``"agents.extractor_v2"``) are converted to ``agents/extractor_v2.py``.
+    """
+    if agent_module.endswith(".py") and "/" in agent_module:
+        parts = agent_module.split("/")
+        if parts[0] == "agents":
+            return agent_module
+        return None
+    # Dotted path.
+    parts = agent_module.split(".")
+    if len(parts) >= 2 and parts[0] == "agents":
+        return "/".join(parts) + ".py"
+    return None
 
 
 def _load_yaml(path: Path) -> dict:

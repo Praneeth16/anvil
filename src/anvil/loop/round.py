@@ -127,7 +127,7 @@ def run_round(
     )
 
     # 3. Apply the action (writes scaffold files, edits harness.yaml).
-    apply_result = apply_action(action, scaffold_root)
+    apply_result = apply_action(action, scaffold_root, mode=mode, repo_root=repo_root)
 
     # 4. Commit (no-op if nothing changed, e.g. noop action).
     commit_message = f"round {round_id:03d}: {apply_result.action_summary or 'noop'}"

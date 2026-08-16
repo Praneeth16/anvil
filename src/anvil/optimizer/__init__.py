@@ -16,12 +16,14 @@ from anvil.optimizer.actions import (
     AddRuleAction,
     AddSkillAction,
     ChangeSamplingAction,
+    DeleteAgentAction,
     DeleteRuleAction,
     DeleteSkillAction,
     EditRuleAction,
     EditSkillAction,
     NoopAction,
     OptimizerAction,
+    WriteAgentAction,
 )
 from anvil.optimizer.applier import ApplyError, ApplyResult, apply_action
 from anvil.optimizer.parser import ParseResult, parse_action
@@ -33,6 +35,7 @@ __all__ = [
     "ApplyError",
     "ApplyResult",
     "ChangeSamplingAction",
+    "DeleteAgentAction",
     "DeleteRuleAction",
     "DeleteSkillAction",
     "EditRuleAction",
@@ -40,6 +43,7 @@ __all__ = [
     "NoopAction",
     "OptimizerAction",
     "ParseResult",
+    "WriteAgentAction",
     "apply_action",
     "parse_action",
     "run_optimizer_session",
