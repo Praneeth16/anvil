@@ -508,6 +508,100 @@ def _synchronous_trace_logging():
             os.environ[_MLFLOW_ASYNC_TRACE_LOGGING_ENV] = previous
 
 
+@contextmanager
+def _resilient_eval_harness():
+    """Scope a defensive shim around ``mlflow.genai.evaluate``'s harness.
+
+    Workaround for a known mlflow 3.11.x bug (verified against 3.11.1, the
+    newest in-range release on the internal proxy — no patch bump is
+    available to fix this). When ``predict_fn`` is supplied, the harness
+    retrieves each row's trace via ``mlflow.get_trace(request_id,
+    silent=True)`` (``harness._run_predict``, ~line 782). On the Databricks
+    Tracing Server that trace is sometimes not retrievable at scoring time
+    — even with synchronous export forced from process start (see
+    ``anvil/__init__.py``) and PR #16's root span — leaving
+    ``eval_item.trace`` None for some rows. The harness then dereferences it
+    without a None check and aborts the whole run:
+
+    * ``_get_new_expectations`` (``harness.py``:934-942) reads
+      ``eval_item.trace.info.assessments`` and raises
+      ``AttributeError: 'NoneType' object has no attribute 'info'`` — the
+      live ``make_baseline`` crash, typically ~row 2-3 of 8.
+
+    This context manager monkeypatches two harness symbols, scoped to the
+    ``mlflow.genai.evaluate`` call (restored on exit — NOT a global
+    import-time patch), so a missing per-row trace never crashes the run:
+
+    1. ``_get_new_expectations`` → a None-safe wrapper that yields ``[]``
+       (no trace-derived expectations) for a None-trace row instead of
+       raising, and delegates to the original implementation otherwise.
+       This directly neutralizes the confirmed crash site. Rows WITH a
+       trace are scored normally — ``RetrievalGroundedness`` and the other
+       scorers are NOT globally disabled; a None-trace row simply
+       contributes no expectations and its scorers run as-is (scorer
+       exceptions are already caught by the harness at ``run_scorer``:874
+       and recorded as error feedbacks, never aborting the run).
+
+    2. ``_run_predict`` → a wrapper that, after the original runs, falls
+       back to ``create_minimal_trace(eval_item)`` when
+       ``mlflow.get_trace(request_id)`` returned None. This is the SAME
+       fallback the static-dataset path uses (``harness.py``:795) but the
+       ``predict_fn`` path omits. ``create_minimal_trace`` fetches the
+       trace by its own just-created ``trace_id`` under
+       ``is_evaluate=True`` (synchronous export) — the reliable retrieval
+       mechanism, not the failing request_id lookup. This ensures every
+       row carries a trace so the eval COMPLETES with a real result
+       DataFrame, instead of merely moving the crash one step downstream
+       into ``batch_link_traces_to_run`` (``trace_utils.py``:1014, an
+       unguarded ``eval_item.trace.info.trace_id`` list-comprehension) or
+       ``construct_eval_result_df`` (``trace_utils.py``:925, caught but
+       yields a None DataFrame that breaks ``_aggregate_report``).
+
+    The shim (1) is the direct guard against the confirmed crash; the
+    fallback (2) is the root-cause fix that prevents the crash from
+    relocating. Together they bring the ``predict_fn`` path to the same
+    per-row-trace reliability the production static-dataset path already
+    relies on.
+    """
+    import mlflow.genai.evaluation.harness as _harness
+    from mlflow.genai.utils.trace_utils import create_minimal_trace
+
+    _orig_get_new_expectations = _harness._get_new_expectations
+    _orig_run_predict = _harness._run_predict
+
+    def _get_new_expectations_none_safe(eval_item):
+        # mlflow 3.11.x harness.py:936 derefs ``eval_item.trace.info.assessments``
+        # without a None check. A row whose trace the Databricks backend did not
+        # return leaves ``eval_item.trace`` None and crashes here. Yield no
+        # expectations for that row instead of raising; rows with a trace are
+        # scored normally via the original implementation.
+        if eval_item.trace is None:
+            return []
+        return _orig_get_new_expectations(eval_item)
+
+    def _run_predict_with_minimal_trace_fallback(
+        eval_item, predict_fn, run_id, rate_limiter, max_retries=0, experiment_id=None
+    ):
+        _orig_run_predict(
+            eval_item, predict_fn, run_id, rate_limiter, max_retries, experiment_id
+        )
+        # harness.py:782 sets ``eval_item.trace = mlflow.get_trace(request_id)``.
+        # On the Databricks backend that returns None for some rows. The
+        # static-dataset path (harness.py:795) falls back to a minimal trace;
+        # the predict_fn path does not, so apply the same fallback here. This
+        # fetches by the just-created trace_id (reliable, sync), not request_id.
+        if predict_fn is not None and eval_item.trace is None:
+            eval_item.trace = create_minimal_trace(eval_item)
+
+    _harness._get_new_expectations = _get_new_expectations_none_safe
+    _harness._run_predict = _run_predict_with_minimal_trace_fallback
+    try:
+        yield
+    finally:
+        _harness._get_new_expectations = _orig_get_new_expectations
+        _harness._run_predict = _orig_run_predict
+
+
 def _run_predictions_parallel(
     predict_fn: Callable[[str], str],
     queries: list[str],
@@ -728,8 +822,16 @@ def evaluate_branch(
         # On the Databricks Tracing Server, async export can race the eval
         # harness's immediate per-row get_trace(request_id). A missing trace
         # then reaches scoring as None and crashes _get_new_expectations.
-        # Keep export synchronous until evaluate has finished reading traces.
-        with _synchronous_trace_logging():
+        # Keep export synchronous until evaluate has finished reading traces
+        # (PR #17; the env var is also forced from process start in
+        # anvil/__init__.py because the exporter caches the flag at construction).
+        # ``_resilient_eval_harness`` is the guarantee: even if a row's trace
+        # is still None despite the above, the harness shim yields no
+        # expectations for that row (no crash) and the _run_predict fallback
+        # synthesizes a minimal trace so the run completes with a real
+        # result DataFrame. See its docstring for the exact harness.py
+        # symbols and lines patched.
+        with _resilient_eval_harness(), _synchronous_trace_logging():
             result = mlflow.genai.evaluate(
                 data=dataset,
                 scorers=scorers,
