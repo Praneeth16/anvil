@@ -22,6 +22,7 @@ dev = [
 # so test runs stay light.
 dashboard = [
     "streamlit>=1.39.0",
+    "plotly>=5.0",
     "altair>=5.0",
     "pandas>=2.0",
     "tabulate>=0.9",

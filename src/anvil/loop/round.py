@@ -272,6 +272,7 @@ def run_round(
         + "\n",
         encoding="utf-8",
     )
+    _save_dashboard_round(repo_root, round_id, round_json_path.read_text(encoding="utf-8"))
 
     # 10. Append mutations log.
     record = MutationRecord.new(
@@ -349,6 +350,14 @@ def run_round(
 def asdict_baseline(baseline) -> dict:
     """Convert a CachedBaseline to a plain dict for the prompt builder."""
     return baseline.to_dict()
+
+
+def _save_dashboard_round(repo_root: Path | str, round_id: int, payload: str) -> Path:
+    """Persist serialized round JSON in the dashboard data directory."""
+    path = Path(repo_root) / "data" / f"round_{round_id:03d}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(payload, encoding="utf-8")
+    return path
 
 
 def _read_optimization_mode(scaffold_root: Path | str) -> str:
@@ -457,6 +466,7 @@ def _build_round_json(
                 "aggregate": eval_report.aggregate,
                 "per_judge": dict(eval_report.per_judge),
                 "per_bucket": {k: dict(v) for k, v in eval_report.per_bucket.items()},
+                "cost_metrics": dict(getattr(eval_report, "cost_metrics", {})),
                 "failures": list(eval_report.failures),
                 "trace_ids": list(eval_report.trace_ids),
                 "mlflow": {

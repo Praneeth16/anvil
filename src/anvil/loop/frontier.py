@@ -362,6 +362,9 @@ def save_frontier(repo_root: Path | str, frontier: Frontier) -> Path:
     path = frontier_path(repo_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(frontier.to_dict(), indent=2) + "\n", encoding="utf-8")
+    dashboard_path = Path(repo_root) / "data" / "frontier.json"
+    dashboard_path.parent.mkdir(parents=True, exist_ok=True)
+    dashboard_path.write_text(json.dumps(frontier.to_dict(), indent=2) + "\n", encoding="utf-8")
     return path
 
 
