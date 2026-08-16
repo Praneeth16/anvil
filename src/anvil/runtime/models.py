@@ -68,6 +68,25 @@ class LoopConfig(BaseModel):
     max_optimizer_turns: int = 30
 
 
+class ParetoObjective(BaseModel):
+    """One named objective used by the frontier gate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    direction: Literal["maximize", "minimize"] = "maximize"
+    source: Literal["aggregate", "tokens", "context_chars", "n_rows"] = "aggregate"
+
+
+class ParetoConfig(BaseModel):
+    """Optional multi-objective configuration for the frontier gate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    objectives: list[ParetoObjective] = Field(default_factory=list)
+
+
 class GateConfig(BaseModel):
     """Configuration for the round keep/revert gate.
 
@@ -91,11 +110,9 @@ class GateConfig(BaseModel):
       the cached baseline aggregate (``score_delta > 0``). The frontier
       file is neither written nor read.
 
-    ``pareto`` (only consulted when ``type: frontier``): ``true`` for
-    multi-objective Pareto dominance across all tracked objectives;
-    ``false`` to fall back to single-objective "aggregate vs best-so-far
-    aggregate" — still measured against the frontier, never the frozen
-    baseline.
+    ``pareto`` configures named, direction-aware objectives. When it is
+    disabled the frontier uses only the aggregate score, preserving the
+    single-objective behavior.
 
     ``epsilon`` is the minimum improvement on an objective to count as
     "better". With ``0.0`` a strict positive delta is required, so a tie
@@ -106,7 +123,16 @@ class GateConfig(BaseModel):
 
     type: Literal["frontier", "delta"] = "frontier"
     epsilon: float = 0.0
-    pareto: bool = True
+    pareto: ParetoConfig = Field(default_factory=ParetoConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _upgrade_legacy_pareto_bool(cls, data):
+        """Accept the pre-structured ``pareto: bool`` YAML shape."""
+        if isinstance(data, dict) and isinstance(data.get("pareto"), bool):
+            data = dict(data)
+            data["pareto"] = {"enabled": data["pareto"]}
+        return data
 
     @field_validator("epsilon")
     @classmethod

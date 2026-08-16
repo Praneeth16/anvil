@@ -136,11 +136,15 @@ gate:
   # strict positive delta is required — a tie (no objective improves)
   # does not extend the frontier and is reverted.
   epsilon: 0.0
-  # Multi-objective switch (only used when type: frontier).
-  #   true  — Pareto dominance across all tracked objectives (per-judge +
-  #           aggregate): keep iff >=1 objective improves by > epsilon
-  #           and no objective regresses by > epsilon.
-  #   false — Single-objective: keep iff the aggregate improves vs the
-  #           best-so-far aggregate by > epsilon. Still measured against
-  #           the frontier, NOT the frozen baseline.
-  pareto: true
+  # Multi-objective optimization (only used when type: frontier). Disabled
+  # preserves the single aggregate objective used by older configurations.
+  pareto:
+    enabled: false
+    # Example:
+    # objectives:
+    #   - name: quality
+    #     direction: maximize
+    #     source: aggregate
+    #   - name: cost
+    #     direction: minimize
+    #     source: context_chars  # or tokens when trace usage is available

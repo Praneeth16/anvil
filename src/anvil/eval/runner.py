@@ -57,6 +57,10 @@ class EvalReport:
     scorers: list[str]
     evaluated_at: str
     trace_ids: list[str] = field(default_factory=list)
+    # Always-available eval cost proxies. Token usage may be added when
+    # supplied by MLflow traces; context characters and row count do not
+    # require another service call.
+    cost_metrics: dict[str, float] = field(default_factory=dict)
     # JSON fingerprint of the aggregate scorer configs (name, type,
     # weight, check_function) that produced this report's aggregate.
     # Carried into ``CachedBaseline`` so the frontier gate can detect a
@@ -288,6 +292,12 @@ def _aggregate_report(
         scorers=list(scorer_names),
         evaluated_at=datetime.now(UTC).isoformat(timespec="seconds"),
         trace_ids=trace_ids,
+        cost_metrics={
+            "total_context_chars": float(
+                sum(len(str(ex.get("query", ""))) for ex in examples[:n_rows])
+            ),
+            "n_rows": float(n_rows),
+        },
         scorer_fingerprint=scorer_fingerprint,
     )
 
