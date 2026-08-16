@@ -288,6 +288,16 @@ class RuntimeYAML(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    # Optimization mode — what FORGE mutates.
+    #   prompt — prompt scaffolds (skills/rules/sampling in markdown + YAML).
+    #            The default; backward compatible with all existing rounds.
+    #   code   — agent Python code (MemorySystem subclasses in agents/).
+    #            The eval imports the active agent module instead of
+    #            composing a prompt from scaffold/.
+    mode: Literal["prompt", "code"] = "prompt"
+    # Dotted Python module path or .py file path of the active agent in
+    # code mode. Ignored in prompt mode. Default: the passthrough baseline.
+    agent_module: str = "anvil.agents.baseline"
     runtime_endpoint: str
     optimizer_endpoint: str
     judge_endpoint: str
@@ -300,6 +310,8 @@ class RuntimeYAML(BaseModel):
 class HarnessConfig(BaseModel):
     """Merged view of both YAML files. Built by the loader."""
 
+    mode: Literal["prompt", "code"] = "prompt"
+    agent_module: str = "anvil.agents.baseline"
     runtime_endpoint: str
     optimizer_endpoint: str
     judge_endpoint: str
@@ -315,6 +327,8 @@ class HarnessConfig(BaseModel):
     @classmethod
     def from_split(cls, scaffold: ScaffoldYAML, runtime: RuntimeYAML) -> HarnessConfig:
         return cls(
+            mode=runtime.mode,
+            agent_module=runtime.agent_module,
             runtime_endpoint=runtime.runtime_endpoint,
             optimizer_endpoint=runtime.optimizer_endpoint,
             judge_endpoint=runtime.judge_endpoint,
@@ -334,6 +348,8 @@ class HarnessConfig(BaseModel):
 # one of the canonical fields on the opposite side of the split.
 RUNTIME_FIELDS: frozenset[str] = frozenset(
     {
+        "mode",
+        "agent_module",
         "runtime_endpoint",
         "optimizer_endpoint",
         "judge_endpoint",

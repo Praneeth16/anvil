@@ -20,17 +20,23 @@ Public surface:
 from __future__ import annotations
 
 import contextlib
+import importlib
+import importlib.util
+import inspect
 import os
+import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import mlflow
 from mlflow.types.responses import ResponsesAgentRequest
 from openai import OpenAI
 
+from anvil.agents.memory_system import MemorySystem
 from anvil.data import load_golden_set, select_subset
 from anvil.eval.cache import compute_scorer_fingerprint
 from anvil.eval.scorers import build_scorers
@@ -302,6 +308,92 @@ def _aggregate_report(
     )
 
 
+# ---------------------------------------------------------------------------
+# Code-mode agent loading
+# ---------------------------------------------------------------------------
+
+
+def _import_agent_module(module_path: str) -> ModuleType:
+    """Import an agent module from a dotted path or a ``.py`` file path.
+
+    A dotted path (e.g. ``anvil.agents.baseline``) is resolved via
+    :func:`importlib.import_module`. A path containing a separator or
+    ending in ``.py`` is loaded from disk via ``spec_from_file_location``
+    — this is how FORGE loads candidate modules the optimizer just wrote
+    to ``agents/`` that are not yet installed packages.
+    """
+    if module_path.endswith(".py") or "/" in module_path or os.sep in module_path:
+        path = Path(module_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"agent module not found: {path}")
+        spec = importlib.util.spec_from_file_location(path.stem, path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot create import spec for agent module: {path}")
+        module = importlib.util.module_from_spec(spec)
+        # Register before exec so @dataclass, __init_subclass__, and runtime
+        # type-resolution mechanisms that look up the module in sys.modules
+        # work during import. Mirrors importlib.import_module's contract.
+        sys.modules[spec.name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            # Remove the broken module so a retry doesn't find a partially-
+            # initialized entry.
+            sys.modules.pop(spec.name, None)
+            raise
+        return module
+    return importlib.import_module(module_path)
+
+
+def _find_memory_system_subclass(module: ModuleType) -> type[MemorySystem]:
+    """Find the concrete ``MemorySystem`` subclass defined in ``module``.
+
+    The class must be *defined* in this module (``__module__`` match) so
+    that a re-exported base class or an imported helper does not get
+    mistaken for the agent. Exactly one subclass is expected; zero or
+    multiple are configuration errors.
+    """
+    candidates: list[type[MemorySystem]] = []
+    for name in dir(module):
+        obj = getattr(module, name)
+        if (
+            isinstance(obj, type)
+            and issubclass(obj, MemorySystem)
+            and obj is not MemorySystem
+            and getattr(obj, "__module__", None) == module.__name__
+            and not inspect.isabstract(obj)
+        ):
+            candidates.append(obj)
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise ValueError(
+            f"no concrete MemorySystem subclass found in agent module {module.__name__!r}"
+        )
+    raise ValueError(
+        f"multiple concrete MemorySystem subclasses found in {module.__name__!r}: "
+        f"{[c.__name__ for c in candidates]}"
+    )
+
+
+def _load_memory_system(
+    module_path: str,
+    *,
+    llm_client: OpenAI | None = None,
+    model: str = "",
+) -> MemorySystem:
+    """Import an agent module and instantiate its ``MemorySystem`` subclass.
+
+    ``module_path`` is either a dotted Python module path (e.g.
+    ``anvil.agents.baseline``) or a ``.py`` file path. The module must
+    define exactly one concrete ``MemorySystem`` subclass, which is
+    instantiated with ``llm_client`` and ``model`` as constructor kwargs.
+    """
+    module = _import_agent_module(module_path)
+    cls = _find_memory_system_subclass(module)
+    return cls(llm_client=llm_client, model=model)
+
+
 def evaluate_branch(
     *,
     scaffold_root: Path | str,
@@ -348,26 +440,42 @@ def evaluate_branch(
     examples = load_golden_set(golden_set_path)
     selected = select_subset(examples, buckets=mode_config.buckets)
 
-    tool_executor = make_kb_executor(kb_dir)
-    agent = AnvilAgent(
-        scaffold_root=scaffold_path,
-        runtime_config_path=runtime_path,
-        source=SOURCE_EVAL,
-        client=runtime_client,
-        tool_executor=tool_executor,
-    )
-
-    def predict_fn(query: str, **_kwargs: Any) -> str:
-        request = ResponsesAgentRequest(
-            input=[{"type": "message", "role": "user", "content": query}]
+    if snapshot.config.mode == "code":
+        # Code mode: import the active MemorySystem subclass and call
+        # predict() per row instead of the LLM agent tool-calling loop.
+        # The same scorers (programmatic + LLM judges) score the output.
+        memory_system = _load_memory_system(
+            snapshot.config.agent_module,
+            llm_client=runtime_client,
+            model=snapshot.config.runtime_endpoint,
         )
-        response = agent.predict(request)
-        # Drain async export queue so eval_item.trace is not None
-        # downstream. Documented in the legacy lessons (rounds 3-5).
-        mlflow.flush_trace_async_logging()
-        with contextlib.suppress(AttributeError, TypeError):
-            mlflow.end_trace()
-        return _extract_final_text(response)
+
+        def predict_fn(query: str, **_kwargs: Any) -> str:
+            answer, _metadata = memory_system.predict(query)
+            return answer
+    else:
+        # Prompt mode: compose the system prompt from scaffold/ and run
+        # the AnvilAgent tool-calling loop against the runtime endpoint.
+        tool_executor = make_kb_executor(kb_dir)
+        agent = AnvilAgent(
+            scaffold_root=scaffold_path,
+            runtime_config_path=runtime_path,
+            source=SOURCE_EVAL,
+            client=runtime_client,
+            tool_executor=tool_executor,
+        )
+
+        def predict_fn(query: str, **_kwargs: Any) -> str:
+            request = ResponsesAgentRequest(
+                input=[{"type": "message", "role": "user", "content": query}]
+            )
+            response = agent.predict(request)
+            # Drain async export queue so eval_item.trace is not None
+            # downstream. Documented in the legacy lessons (rounds 3-5).
+            mlflow.flush_trace_async_logging()
+            with contextlib.suppress(AttributeError, TypeError):
+                mlflow.end_trace()
+            return _extract_final_text(response)
 
     aggregate_scorer_configs = list(cfg.scorers)
     aggregate_scorer_names = [c.name for c in aggregate_scorer_configs]

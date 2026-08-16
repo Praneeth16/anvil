@@ -17,6 +17,8 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import yaml
+
 from anvil.eval import evaluate_branch, load_baseline
 from anvil.loop.builder import build_round_prompt
 from anvil.loop.decision import Decision
@@ -40,6 +42,7 @@ from anvil.optimizer import (
     apply_action,
     run_optimizer_session,
 )
+from anvil.runtime.loader import default_runtime_config_path
 
 
 @dataclass
@@ -50,6 +53,7 @@ class RoundReport:
     action_kind: str
     parse_status: str
     diff_summary: str
+    mode: str = "prompt"
     files_added: list[str] = field(default_factory=list)
     files_changed: list[str] = field(default_factory=list)
     files_removed: list[str] = field(default_factory=list)
@@ -86,6 +90,9 @@ def run_round(
     """
     repo_root = Path(repo_root).resolve()
     scaffold_root = Path(scaffold_root or (repo_root / "scaffold")).resolve()
+
+    mode = _read_optimization_mode(scaffold_root)
+    print(f"[round {round_id}] mode={mode}")
 
     _starting_branch = current_branch(repo_root)
     parent_sha = current_sha(repo_root)
@@ -321,6 +328,7 @@ def run_round(
         action_kind=action.action,
         parse_status=parse_result.parse_status,
         diff_summary=apply_result.action_summary,
+        mode=mode,
         files_added=apply_result.files_added,
         files_changed=apply_result.files_changed,
         files_removed=apply_result.files_removed,
@@ -340,6 +348,21 @@ def run_round(
 def asdict_baseline(baseline) -> dict:
     """Convert a CachedBaseline to a plain dict for the prompt builder."""
     return baseline.to_dict()
+
+
+def _read_optimization_mode(scaffold_root: Path | str) -> str:
+    """Read the optimization mode from ``harness/config.yaml``.
+
+    Returns ``"prompt"`` (the default) when the file or field is absent,
+    so the loop keeps running on a repo that predates the mode field.
+    Only the ``mode`` key is read here; the full-file ``extra="forbid"``
+    check is enforced by the runtime loader.
+    """
+    path = default_runtime_config_path(Path(scaffold_root))
+    if not path.is_file():
+        return "prompt"
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return raw.get("mode", "prompt")
 
 
 def _build_critique_md(
