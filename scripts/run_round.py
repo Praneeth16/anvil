@@ -26,6 +26,11 @@ The runner expects:
 
 from __future__ import annotations
 
+import os
+
+# Set before other imports in case they initialize MLflow tracing.
+os.environ.setdefault("MLFLOW_ENABLE_ASYNC_TRACE_LOGGING", "false")
+
 import argparse
 import re
 import subprocess

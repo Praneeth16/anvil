@@ -496,7 +496,12 @@ _PREDICT_SPAN_NAME = "anvil.predict"
 
 @contextmanager
 def _synchronous_trace_logging():
-    """Temporarily force MLflow trace export to complete synchronously."""
+    """Defensively request synchronous MLflow trace export during evaluation.
+
+    The effective mechanism is the process-start default in ``anvil.__init__``.
+    This context manager alone is insufficient because MLflow's exporter caches
+    the environment setting when the exporter is constructed.
+    """
     previous = os.environ.get(_MLFLOW_ASYNC_TRACE_LOGGING_ENV)
     os.environ[_MLFLOW_ASYNC_TRACE_LOGGING_ENV] = "false"
     try:
