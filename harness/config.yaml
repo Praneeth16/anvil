@@ -12,6 +12,17 @@
 # Anything mutation-worthy (sampling, skills, rules, tools) lives in
 # `scaffold/harness.yaml`.
 
+# Optimization mode — what FORGE mutates.
+#   prompt — prompt scaffolds (skills/rules/sampling in markdown + YAML).
+#            The default; backward compatible with all existing rounds.
+#   code   — agent Python code (MemorySystem subclasses in agents/).
+#            The eval imports the active agent module instead of
+#            composing a prompt from scaffold/. When code, set
+#            agent_module below (or accept the default
+#            anvil.agents.baseline).
+mode: prompt
+# agent_module: anvil.agents.baseline
+
 # Endpoint the runtime agent calls. Provider-agnostic — any
 # OpenAI-compatible Databricks serving endpoint works.
 runtime_endpoint: databricks-claude-sonnet-4-6
