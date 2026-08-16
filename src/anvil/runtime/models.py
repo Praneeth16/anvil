@@ -19,7 +19,7 @@ import math
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class SamplingConfig(BaseModel):
@@ -135,6 +135,58 @@ class EvalModeConfig(BaseModel):
     buckets: dict[str, int] = Field(default_factory=dict)
 
 
+class ScorerConfig(BaseModel):
+    """Configuration for one eval scorer — LLM judge or programmatic.
+
+    Two scorer ``type`` values contribute to the aggregate:
+
+    * ``llm`` (default) — an MLflow judge scorer (Correctness,
+      RetrievalGroundedness, the custom refusal judge, Safety). Scored
+      by ``mlflow.genai.evaluate`` exactly as before.
+    * ``programmatic`` — a deterministic check function loaded from
+      ``data/evaluator.py`` and referenced by ``check_function``. Makes
+      no LLM call; the check runs inside the same evaluate pipeline and
+      returns a ``Feedback`` with the function's score.
+
+    ``weight`` scales the scorer's contribution to the aggregate. The
+    aggregate is a weighted average across all configured scorers; with
+    the default weight of 1.0 for every scorer it reduces to the
+    unweighted mean (the legacy behavior), so shipped scaffolds that
+    list scorers as bare strings keep scoring identically.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    type: Literal["llm", "programmatic"] = "llm"
+    weight: float = 1.0
+    check_function: str | None = None
+
+    @field_validator("weight")
+    @classmethod
+    def _weight_must_be_positive(cls, v: float) -> float:
+        """Reject non-positive or non-finite weights.
+
+        A zero or negative weight in a weighted average is a config
+        mistake (use weight=1.0 or drop the scorer). NaN/inf breaks the
+        aggregate normalization.
+        """
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError("scorer weight must be > 0 and finite")
+        return v
+
+    @model_validator(mode="after")
+    def _check_function_only_on_programmatic(self) -> ScorerConfig:
+        """``check_function`` is required for ``programmatic`` and
+        forbidden for ``llm`` — a stray ``check_function`` on an llm
+        scorer is a misplaced config that should fail loudly."""
+        if self.type == "programmatic" and not self.check_function:
+            raise ValueError(f"scorer {self.name!r}: type=programmatic requires a check_function")
+        if self.type == "llm" and self.check_function is not None:
+            raise ValueError(f"scorer {self.name!r}: type=llm must not set check_function")
+        return self
+
+
 class EvalConfig(BaseModel):
     """Eval-side configuration."""
 
@@ -143,10 +195,55 @@ class EvalConfig(BaseModel):
     modes: dict[str, EvalModeConfig] = Field(default_factory=dict)
     n_workers: int = 4
     inter_row_cooldown_s: float = 0.0
-    scorers: list[str] = Field(
-        default_factory=lambda: ["correctness", "retrieval_groundedness", "refusal_appropriateness"]
+    scorers: list[ScorerConfig] = Field(
+        default_factory=lambda: [
+            ScorerConfig(name="correctness"),
+            ScorerConfig(name="retrieval_groundedness"),
+            ScorerConfig(name="refusal_appropriateness"),
+        ]
     )
     safety_guard_threshold: float = 0.95
+
+    @field_validator("scorers", mode="before")
+    @classmethod
+    def _coerce_scorers(cls, v: object) -> object:
+        """Backward compatibility: accept a list of bare scorer-name
+        strings (the legacy config shape) by promoting each to a
+        ``{name: <str>}`` dict, which :class:`ScorerConfig` then parses
+        with ``type=llm`` and ``weight=1.0``. A list of dicts (the new
+        shape) and a list of already-built ``ScorerConfig`` objects pass
+        through unchanged. The shipped NeoVolt scaffold lists scorers as
+        strings, so this keeps it scoring identically without a config
+        migration."""
+        if not isinstance(v, list):
+            return v
+        out: list[object] = []
+        for item in v:
+            if isinstance(item, str):
+                out.append({"name": item})
+            else:
+                out.append(item)
+        return out
+
+    @model_validator(mode="after")
+    def _scorer_names_must_be_unique(self) -> EvalConfig:
+        """Reject duplicate scorer names.
+
+        The aggregate stores weights by name (``weights = {c.name:
+        c.weight ...}``), so a duplicate name silently overwrites the
+        earlier weight while both entries remain in the
+        numerator/denominator. This produces incorrect weighting and
+        ambiguous MLflow columns (``{name}/value``, ``{name}/mean``).
+        """
+        seen: set[str] = set()
+        for s in self.scorers:
+            if s.name in seen:
+                raise ValueError(
+                    f"duplicate scorer name {s.name!r} — "
+                    "each scorer must have a unique name"
+                )
+            seen.add(s.name)
+        return self
 
 
 class ScaffoldYAML(BaseModel):

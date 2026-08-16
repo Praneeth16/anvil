@@ -179,6 +179,25 @@ def run_round(
         if (mutated_score is not None and baseline_aggregate is not None)
         else None
     )
+
+    # Validate scorer-config compatibility between the cached baseline
+    # and the current eval run. A weight or check_function change
+    # invalidates the comparison even when scorer names are unchanged —
+    # the cached aggregate has a different meaning under a different
+    # weighting, so the frontier gate could make an invalid decision.
+    # An empty fingerprint on either side (e.g. a baseline written
+    # before this field existed) skips the check for backward compat.
+    if baseline is not None and eval_report is not None:
+        if (
+            baseline.scorer_fingerprint
+            and eval_report.scorer_fingerprint
+            and baseline.scorer_fingerprint != eval_report.scorer_fingerprint
+        ):
+            raise RuntimeError(
+                "scorer configuration has changed since baseline was cached — "
+                "regenerate the baseline with scripts/make_baseline.py"
+            )
+
     gate_cfg = load_gate_config(scaffold_root)
     baseline_scores = scores_from_baseline(baseline) if baseline else None
     mutated_scores = scores_from_eval(eval_report) if eval_report is not None else None

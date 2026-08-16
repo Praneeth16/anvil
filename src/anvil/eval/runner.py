@@ -19,10 +19,11 @@ Public surface:
 
 from __future__ import annotations
 
+import contextlib
 import os
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -31,12 +32,13 @@ from mlflow.types.responses import ResponsesAgentRequest
 from openai import OpenAI
 
 from anvil.data import load_golden_set, select_subset
-from anvil.eval.scorers import DEFAULT_JUDGE_MODEL, build_scorers
+from anvil.eval.cache import compute_scorer_fingerprint
+from anvil.eval.scorers import build_scorers
 from anvil.observability import SOURCE_EVAL, enable_runtime_tracing
 from anvil.runtime.agent import AnvilAgent
 from anvil.runtime.client import build_databricks_client
 from anvil.runtime.loader import default_runtime_config_path, load_harness
-from anvil.runtime.models import EvalConfig
+from anvil.runtime.models import EvalConfig, ScorerConfig
 from anvil.tools.search_knowledge_base import make_kb_executor
 
 
@@ -55,6 +57,13 @@ class EvalReport:
     scorers: list[str]
     evaluated_at: str
     trace_ids: list[str] = field(default_factory=list)
+    # JSON fingerprint of the aggregate scorer configs (name, type,
+    # weight, check_function) that produced this report's aggregate.
+    # Carried into ``CachedBaseline`` so the frontier gate can detect a
+    # weight/check_function change that invalidates a cross-run
+    # comparison even when scorer names are unchanged. Empty when the
+    # report is built by code that predates this field.
+    scorer_fingerprint: str = ""
 
 
 def _extract_final_text(response: Any) -> str:
@@ -89,23 +98,42 @@ def _build_dataset(examples: list[dict]) -> list[dict]:
     # expected_facts. We use must_include as expected_facts; the
     # reference_answer stays in the row for human debugging via
     # mlflow.search_traces.
+    #
+    # ``must_include`` is ALSO projected under its golden-set name so
+    # programmatic check functions (data/evaluator.py) can read the
+    # familiar key directly from the expectations dict they receive as
+    # ``ground_truth``. This is additive — Correctness still reads
+    # ``expected_facts`` and ignores the alias.
     rows: list[dict] = []
     for ex in examples:
+        expectations: dict[str, Any] = {
+            "expected_facts": ex["must_include"],
+            "must_include": ex["must_include"],
+            "should_refuse": ex["should_refuse"],
+            "expected_doc_ids": ex["expected_doc_ids"],
+            "expected_citations": ex["expected_citations"],
+            "must_not_include": ex["must_not_include"],
+            "notes_for_judge": ex["notes_for_judge"],
+            "reference_answer": ex["reference_answer"],
+        }
+        # Pass through json_schema, expected_fields, and any other
+        # extension fields prefixed with ``json_`` or ``expected_`` so
+        # programmatic check functions (json_schema_validity,
+        # field_exact_match) receive their documented primary inputs
+        # through the real runner. This is additive — existing scorers
+        # ignore unknown keys in the expectations dict.
+        for key, val in ex.items():
+            if key not in expectations and (
+                key.startswith("json_") or key.startswith("expected_")
+            ):
+                expectations[key] = val
         rows.append(
             {
                 "inputs": {
                     "query": ex["query"],
                     "category": ex["category"],
                 },
-                "expectations": {
-                    "expected_facts": ex["must_include"],
-                    "should_refuse": ex["should_refuse"],
-                    "expected_doc_ids": ex["expected_doc_ids"],
-                    "expected_citations": ex["expected_citations"],
-                    "must_not_include": ex["must_not_include"],
-                    "notes_for_judge": ex["notes_for_judge"],
-                    "reference_answer": ex["reference_answer"],
-                },
+                "expectations": expectations,
                 "tags": {"example_id": ex["example_id"]},
             }
         )
@@ -174,10 +202,12 @@ def _aggregate_report(
     metrics: dict[str, float],
     scorer_names: list[str],
     aggregate_scorer_names: list[str],
+    weights: dict[str, float],
     examples: list[dict],
     run_id: str,
     experiment_id: str,
     mode: str,
+    scorer_fingerprint: str = "",
 ) -> EvalReport:
     n_rows = len(result_df)
 
@@ -197,11 +227,18 @@ def _aggregate_report(
         else:
             per_judge[name] = _mean(per_judge_rows[name])
 
-    aggregate = (
-        sum(per_judge[name] for name in aggregate_scorer_names) / len(aggregate_scorer_names)
-        if aggregate_scorer_names
-        else 0.0
-    )
+    # Weighted average across the configured scorers. ``weights`` maps a
+    # scorer name to its config weight (defaulting to 1.0); with uniform
+    # weights this collapses to the legacy unweighted mean, so a shipped
+    # scaffold that lists scorers as bare strings scores identically.
+    total_weight = sum(weights.get(name, 1.0) for name in aggregate_scorer_names)
+    if aggregate_scorer_names and total_weight > 0:
+        aggregate = (
+            sum(per_judge[name] * weights.get(name, 1.0) for name in aggregate_scorer_names)
+            / total_weight
+        )
+    else:
+        aggregate = 0.0
 
     bucket_rows: dict[str, list[int]] = defaultdict(list)
     for i in range(n_rows):
@@ -249,8 +286,9 @@ def _aggregate_report(
         n_rows=n_rows,
         mode=mode,
         scorers=list(scorer_names),
-        evaluated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        evaluated_at=datetime.now(UTC).isoformat(timespec="seconds"),
         trace_ids=trace_ids,
+        scorer_fingerprint=scorer_fingerprint,
     )
 
 
@@ -260,6 +298,7 @@ def evaluate_branch(
     runtime_config_path: Path | str | None = None,
     kb_dir: Path | str = "data/kb",
     golden_set_path: Path | str = "data/golden_set.jsonl",
+    evaluator_path: str | Path | None = None,
     profile: str | None = None,
     mode: str | None = None,
     allow_test: bool = False,
@@ -316,22 +355,25 @@ def evaluate_branch(
         # Drain async export queue so eval_item.trace is not None
         # downstream. Documented in the legacy lessons (rounds 3-5).
         mlflow.flush_trace_async_logging()
-        try:
+        with contextlib.suppress(AttributeError, TypeError):
             mlflow.end_trace()
-        except (AttributeError, TypeError):
-            pass
         return _extract_final_text(response)
 
-    aggregate_scorer_names = list(cfg.scorers)
+    aggregate_scorer_configs = list(cfg.scorers)
+    aggregate_scorer_names = [c.name for c in aggregate_scorer_configs]
+    weights = {c.name: c.weight for c in aggregate_scorer_configs}
+    scorer_fingerprint = compute_scorer_fingerprint(aggregate_scorer_configs)
+    active_scorer_configs = list(aggregate_scorer_configs)
     active_scorer_names = list(aggregate_scorer_names)
     if include_safety and "safety" not in active_scorer_names:
+        active_scorer_configs.append(ScorerConfig(name="safety"))
         active_scorer_names.append("safety")
 
     scorers = build_scorers(
         judge_client=judge_client,
         judge_model=snapshot.config.judge_endpoint,
-        active=active_scorer_names,
-        include_safety=False,  # already handled above
+        scorer_configs=active_scorer_configs,
+        evaluator_path=evaluator_path,
     )
     dataset = _build_dataset(selected)
 
@@ -347,8 +389,10 @@ def evaluate_branch(
         metrics=result.metrics,
         scorer_names=active_scorer_names,
         aggregate_scorer_names=aggregate_scorer_names,
+        weights=weights,
         examples=selected,
         run_id=result.run_id,
         experiment_id=experiment.experiment_id if experiment else "",
         mode=selected_mode,
+        scorer_fingerprint=scorer_fingerprint,
     )

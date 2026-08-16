@@ -37,12 +37,43 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from anvil.runtime.models import ScorerConfig
+
 if TYPE_CHECKING:
     # EvalReport lives in the sibling runner module. Referenced under
     # TYPE_CHECKING only so this module stays import-light (no mlflow /
     # openai pulled in just for a type hint). ``report_to_baseline``
     # reads attributes off the report, so it is duck-typed at runtime.
     from anvil.eval.runner import EvalReport
+
+
+def compute_scorer_fingerprint(scorer_configs: list[ScorerConfig]) -> str:
+    """Compute a stable JSON fingerprint of the active scorer configs.
+
+    Captures the full scorer specification (name, type, weight,
+    check_function) so a weight change or check_function swap invalidates
+    a cached baseline even when the scorer names are unchanged. The list
+    is sorted by name for deterministic output.
+
+    Storing the fingerprint in :class:`CachedBaseline` closes the
+    comparability hole where a cached uniform-weight baseline stayed
+    "compatible" after weights changed — the loop would then compare a
+    new weighted aggregate against an old uniform-weight aggregate and
+    make an invalid frontier decision.
+    """
+    specs = sorted(
+        [
+            {
+                "name": c.name,
+                "type": c.type,
+                "weight": c.weight,
+                "check_function": c.check_function,
+            }
+            for c in scorer_configs
+        ],
+        key=lambda s: s["name"],
+    )
+    return json.dumps(specs, sort_keys=True)
 
 
 @dataclass(frozen=True)
@@ -58,6 +89,11 @@ class CachedBaseline:
     per_bucket: dict[str, dict[str, float]] = field(default_factory=dict)
     n_examples: int = 0
     mlflow_run_id: str | None = None
+    # JSON fingerprint of the scorer configs that produced this baseline
+    # (see :func:`compute_scorer_fingerprint`). Empty on baselines written
+    # before this field existed — :func:`is_compatible` treats an empty
+    # fingerprint on either side as "not checked" for backward compat.
+    scorer_fingerprint: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -72,6 +108,7 @@ class CachedBaseline:
             "per_bucket": {k: dict(v) for k, v in self.per_bucket.items()},
             "n_examples": self.n_examples,
             "mlflow_run_id": self.mlflow_run_id,
+            "scorer_fingerprint": self.scorer_fingerprint,
         }
 
     @classmethod
@@ -88,6 +125,7 @@ class CachedBaseline:
             per_bucket={k: dict(v) for k, v in raw.get("per_bucket", {}).items()},
             n_examples=int(raw.get("n_examples", 0)),
             mlflow_run_id=raw.get("mlflow_run_id"),
+            scorer_fingerprint=raw.get("scorer_fingerprint", ""),
         )
 
 
@@ -117,14 +155,28 @@ def is_compatible(
     scorers: list[str],
     runtime_endpoint: str,
     judge_endpoint: str,
+    scorer_fingerprint: str = "",
 ) -> bool:
-    """Return True if ``cached`` is comparable with the requesting context."""
-    return (
-        cached.mode == mode
-        and list(cached.scorers) == list(scorers)
-        and cached.runtime_endpoint == runtime_endpoint
-        and cached.judge_endpoint == judge_endpoint
-    )
+    """Return True if ``cached`` is comparable with the requesting context.
+
+    When both sides carry a non-empty ``scorer_fingerprint``, the
+    fingerprints must match — a weight or check_function change
+    invalidates the comparison even if the scorer names are unchanged.
+    An empty fingerprint on either side (e.g. a baseline written before
+    this field existed) skips the fingerprint check for backward
+    compatibility.
+    """
+    if (
+        cached.mode != mode
+        or list(cached.scorers) != list(scorers)
+        or cached.runtime_endpoint != runtime_endpoint
+        or cached.judge_endpoint != judge_endpoint
+    ):
+        return False
+    if cached.scorer_fingerprint and scorer_fingerprint:
+        if cached.scorer_fingerprint != scorer_fingerprint:
+            return False
+    return True
 
 
 def report_to_baseline(
@@ -169,4 +221,5 @@ def report_to_baseline(
         per_bucket={k: dict(v) for k, v in report.per_bucket.items()},
         n_examples=report.n_rows,
         mlflow_run_id=report.run_id,
+        scorer_fingerprint=getattr(report, "scorer_fingerprint", ""),
     )
