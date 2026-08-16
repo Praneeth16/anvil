@@ -25,7 +25,6 @@ Public surface:
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import importlib
 import importlib.util
@@ -44,6 +43,7 @@ from types import ModuleType
 from typing import Any
 
 import mlflow
+from mlflow.entities import SpanType
 from mlflow.types.responses import ResponsesAgentRequest
 from openai import OpenAI
 
@@ -478,6 +478,12 @@ def _load_memory_system(
 # rather than mlflow's default.
 _MLFLOW_MAX_WORKERS_ENV = "MLFLOW_GENAI_EVAL_MAX_WORKERS"
 
+# Name of the per-row root span ``evaluate_branch`` wraps every
+# ``predict_fn`` invocation in. See ``evaluate_branch`` for why this is
+# required (mlflow.genai.evaluate crashes reading ``eval_item.trace.info``
+# when a row yields no trace).
+_PREDICT_SPAN_NAME = "anvil.predict"
+
 
 def _run_predictions_parallel(
     predict_fn: Callable[[str], str],
@@ -604,8 +610,13 @@ def evaluate_branch(
         )
 
         def predict_fn(query: str, **_kwargs: Any) -> str:
-            answer, _metadata = memory_system.predict(query)
-            return answer
+            # Wrap in an explicit root span so every row yields a trace.
+            # See the prompt-mode predict_fn below for the full rationale.
+            with mlflow.start_span(name=_PREDICT_SPAN_NAME, span_type=SpanType.CHAIN) as span:
+                span.set_inputs({"query": query})
+                answer, _metadata = memory_system.predict(query)
+                span.set_outputs({"response": answer})
+                return answer
     else:
         # Prompt mode: compose the system prompt from scaffold/ and run
         # the AnvilAgent tool-calling loop against the runtime endpoint.
@@ -619,16 +630,43 @@ def evaluate_branch(
         )
 
         def predict_fn(query: str, **_kwargs: Any) -> str:
-            request = ResponsesAgentRequest(
-                input=[{"type": "message", "role": "user", "content": query}]
-            )
-            response = agent.predict(request)
-            # Drain async export queue so eval_item.trace is not None
-            # downstream. Documented in the legacy lessons (rounds 3-5).
-            mlflow.flush_trace_async_logging()
-            with contextlib.suppress(AttributeError, TypeError):
-                mlflow.end_trace()
-            return _extract_final_text(response)
+            # Guarantee a per-row trace so ``mlflow.genai.evaluate``'s
+            # harness never sees ``eval_item.trace`` is None. The harness
+            # retrieves each row's trace via ``mlflow.get_trace(request_id)``
+            # and, when ``predict_fn`` is supplied, has NO fallback to a
+            # minimal trace — so a row that yields no span leaves
+            # ``eval_item.trace`` None and crashes in
+            # ``_get_new_expectations`` reading ``trace.info.assessments``
+            # (``AttributeError: 'NoneType' object has no attribute 'info'``).
+            #
+            # The runtime agent previously relied on
+            # ``mlflow.openai.autolog`` (``enable_runtime_tracing``) to
+            # produce that trace from ``chat.completions.create``. That is
+            # fragile: ``AnvilAgent.predict`` calls ``tag_current_trace``
+            # (``mlflow.update_current_trace``) before any chat call, when
+            # no span is active — the "No active trace found" warning — and
+            # on the live backend the autolog trace was not retrievable by
+            # the row's request id, so rows had no trace and the eval
+            # crashed partway through.
+            #
+            # This root CHAIN span fixes all three: it always yields a
+            # per-row trace (found by ``get_trace`` regardless of autolog);
+            # it gives ``tag_current_trace`` an active trace to tag (the
+            # warning disappears); and it nests autolog's CHAT_MODEL spans
+            # and the ``search_knowledge_base`` RETRIEVER span under one
+            # coherent per-row trace, which ``RetrievalGroundedness`` reads.
+            # The span ends (and the trace exports) when the ``with`` block
+            # exits — async logging is disabled during eval
+            # (``is_evaluate=True``), so the trace is available immediately.
+            with mlflow.start_span(name=_PREDICT_SPAN_NAME, span_type=SpanType.CHAIN) as span:
+                span.set_inputs({"query": query})
+                request = ResponsesAgentRequest(
+                    input=[{"type": "message", "role": "user", "content": query}]
+                )
+                response = agent.predict(request)
+                text = _extract_final_text(response)
+                span.set_outputs({"response": text})
+                return text
 
     aggregate_scorer_configs = list(cfg.scorers)
     aggregate_scorer_names = [c.name for c in aggregate_scorer_configs]
