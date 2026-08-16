@@ -152,6 +152,56 @@ existing non-identity skill with:
 }
 ```
 
+---
+
+### Code-mode actions (only when `mode: code`)
+
+When `harness/config.yaml > mode: code` is set, the optimizer mutates
+**agent Python code** instead of prompt scaffolds. The prompt-mode
+actions above (`add_skill`, `edit_skill`, `add_rule`, etc.) are
+**rejected** in code mode. Use only the two actions below, plus
+`noop`.
+
+#### `write_agent`
+
+Write or replace a Python agent module in `agents/`. The file must
+implement the `MemorySystem` ABC (see `src/anvil/agents/memory_system.py`).
+The applier validates the code — AST denylist (no references to test,
+eval, solution, golden, answer-key, or ground-truth data) plus an
+isolated import — **before** writing it to disk. Invalid code is
+rejected and nothing is written.
+
+```json-action
+{
+  "action": "write_agent",
+  "target_file": "agents/extractor_v2.py",
+  "content": "from anvil.agents.memory_system import MemorySystem\nclass ExtractorV2(MemorySystem):\n    def __init__(self, **kwargs):\n        self.history = []\n    def predict(self, input):\n        # retrieval logic here\n        return answer, {\"context_chars\": len(input)}\n    def learn_from_batch(self, batch_results):\n        self.history.extend(batch_results)\n",
+  "rationale": "<which failure cluster, why this algorithm, predicted Δ>"
+}
+```
+
+#### `delete_agent`
+
+Delete a candidate agent module from `agents/`. The active
+`agent_module` (configured in `harness/config.yaml`) is protected and
+cannot be deleted.
+
+```json-action
+{
+  "action": "delete_agent",
+  "target": "agents/extractor_v2.py",
+  "rationale": "<rationale>"
+}
+```
+
+> **Note:** `write_agent` and `delete_agent` are only available when
+> `mode: code`. The prompt-mode actions are only available when
+> `mode: prompt`. `noop` is always valid. The applier rejects any
+> mismatched action, so you cannot mix prompt and code mutations in
+> the same round.
+
+---
+
 ### Hard constraints on `content`
 
 * Skills and rules MUST start with YAML frontmatter delimited by
@@ -178,7 +228,8 @@ existing non-identity skill with:
   `git` commands. Inspect with `git diff` / `git log` if you want to
   see the parent state.
 * Do NOT touch `harness/config.yaml`, `data/`, `src/`, `tests/`, or
-  `prompts/`. Only `scaffold/`.
+  `prompts/`. In prompt mode, only `scaffold/`. In code mode, only
+  `agents/` (new candidate modules you write via `write_agent`).
 * Do NOT modify `scaffold/skills/identity.md` to remove the
   `kind: identity` frontmatter — the composer will refuse to load.
 

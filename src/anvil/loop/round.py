@@ -127,7 +127,7 @@ def run_round(
     )
 
     # 3. Apply the action (writes scaffold files, edits harness.yaml).
-    apply_result = apply_action(action, scaffold_root)
+    apply_result = apply_action(action, scaffold_root, mode=mode, repo_root=repo_root)
 
     # 4. Commit (no-op if nothing changed, e.g. noop action).
     commit_message = f"round {round_id:03d}: {apply_result.action_summary or 'noop'}"
@@ -194,16 +194,17 @@ def run_round(
     # weighting, so the frontier gate could make an invalid decision.
     # An empty fingerprint on either side (e.g. a baseline written
     # before this field existed) skips the check for backward compat.
-    if baseline is not None and eval_report is not None:
-        if (
-            baseline.scorer_fingerprint
-            and eval_report.scorer_fingerprint
-            and baseline.scorer_fingerprint != eval_report.scorer_fingerprint
-        ):
-            raise RuntimeError(
-                "scorer configuration has changed since baseline was cached — "
-                "regenerate the baseline with scripts/make_baseline.py"
-            )
+    if (
+        baseline is not None
+        and eval_report is not None
+        and baseline.scorer_fingerprint
+        and eval_report.scorer_fingerprint
+        and baseline.scorer_fingerprint != eval_report.scorer_fingerprint
+    ):
+        raise RuntimeError(
+            "scorer configuration has changed since baseline was cached — "
+            "regenerate the baseline with scripts/make_baseline.py"
+        )
 
     gate_cfg = load_gate_config(scaffold_root)
     configured_objectives = gate_cfg.pareto.objectives if gate_cfg.pareto.enabled else None
@@ -357,12 +358,21 @@ def _read_optimization_mode(scaffold_root: Path | str) -> str:
     so the loop keeps running on a repo that predates the mode field.
     Only the ``mode`` key is read here; the full-file ``extra="forbid"``
     check is enforced by the runtime loader.
+
+    Invalid values (e.g. ``hybrid``, a typo, or an empty string) raise
+    :class:`ValueError` so the loop fails closed at the source rather
+    than silently permitting every action downstream.
     """
     path = default_runtime_config_path(Path(scaffold_root))
     if not path.is_file():
         return "prompt"
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    return raw.get("mode", "prompt")
+    mode = raw.get("mode", "prompt")
+    if mode not in ("prompt", "code"):
+        raise ValueError(
+            f"unknown optimization mode {mode!r}; expected 'prompt' or 'code'"
+        )
+    return mode
 
 
 def _build_critique_md(

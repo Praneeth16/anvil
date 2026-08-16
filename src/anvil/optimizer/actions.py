@@ -129,6 +129,42 @@ class NoopAction(_ActionBase):
     action: Literal["noop"] = "noop"
 
 
+class WriteAgentAction(_ActionBase):
+    """Write or replace a Python agent module in ``agents/``.
+
+    In code mode, the optimizer writes a complete ``MemorySystem``
+    subclass as a Python file. The file path is relative to the repo
+    root and must be inside the ``agents/`` directory. The applier
+    validates the code (AST denylist + isolated import) BEFORE writing
+    it to disk — unvalidated code is never persisted.
+    """
+
+    action: Literal["write_agent"] = "write_agent"
+    target_file: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+
+    @field_validator("target_file")
+    @classmethod
+    def _validate_path(cls, v: str) -> str:
+        return _check_agent_path(v)
+
+
+class DeleteAgentAction(_ActionBase):
+    """Delete a Python agent module from ``agents/``.
+
+    Removes a candidate agent file. The active ``agent_module``
+    (configured in ``harness/config.yaml``) is protected from deletion.
+    """
+
+    action: Literal["delete_agent"] = "delete_agent"
+    target: str = Field(min_length=1)
+
+    @field_validator("target")
+    @classmethod
+    def _validate_path(cls, v: str) -> str:
+        return _check_agent_path(v)
+
+
 # Discriminated union over the literal ``action`` field.
 OptimizerAction = Annotated[
     AddSkillAction
@@ -138,6 +174,8 @@ OptimizerAction = Annotated[
     | EditRuleAction
     | DeleteRuleAction
     | ChangeSamplingAction
+    | WriteAgentAction
+    | DeleteAgentAction
     | NoopAction,
     Field(discriminator="action"),
 ]
@@ -160,4 +198,23 @@ def _check_relative_path(path: str, *, expected_dir: str) -> str:
         )
     if not path.endswith(".md"):
         raise ValueError(f"target_file must be a .md file, got {path!r}")
+    return path
+
+
+def _check_agent_path(path: str) -> str:
+    """Reject path traversal and require a ``.py`` file inside ``agents/``.
+
+    Same security model as :func:`_check_relative_path` but for code-mode
+    agent modules: the path is relative to the repo root (not scaffold/),
+    must start with ``agents/``, and must end with ``.py``.
+    """
+    if path.startswith("/") or ".." in path.split("/"):
+        raise ValueError(f"target must be relative, got {path!r}")
+    parts = path.split("/")
+    if parts[0] != "agents":
+        raise ValueError(
+            f"target must live under agents/, got first segment {parts[0]!r}"
+        )
+    if not path.endswith(".py"):
+        raise ValueError(f"target must be a .py file, got {path!r}")
     return path
