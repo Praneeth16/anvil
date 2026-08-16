@@ -363,6 +363,39 @@ def test_evaluate_branch_restores_prior_max_workers(
     monkeypatch.delenv("MLFLOW_GENAI_EVAL_MAX_WORKERS", raising=False)
 
 
+@pytest.mark.parametrize("prior", [None, "unexpected-value"])
+def test_evaluate_branch_scopes_synchronous_trace_logging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prior: str | None
+) -> None:
+    """Trace logging is synchronous only during evaluate, then restored."""
+    from anvil.eval import runner
+
+    _patch_runner_common(monkeypatch, _wiring_config(n_workers=2))
+    env_name = "MLFLOW_ENABLE_ASYNC_TRACE_LOGGING"
+    if prior is None:
+        monkeypatch.delenv(env_name, raising=False)
+    else:
+        monkeypatch.setenv(env_name, prior)
+
+    captured: dict[str, str | None] = {}
+
+    def fake_evaluate(**_kwargs: object) -> object:
+        captured["async_trace_logging"] = os.environ.get(env_name)
+        return SimpleNamespace(result_df=_result_df(), metrics={}, run_id="run-1")
+
+    monkeypatch.setattr(runner.mlflow.genai, "evaluate", fake_evaluate)
+
+    runner.evaluate_branch(
+        scaffold_root=tmp_path / "scaffold",
+        runtime_config_path=tmp_path / "config.yaml",
+        runtime_client=SimpleNamespace(),
+        judge_client=SimpleNamespace(),
+    )
+
+    assert captured["async_trace_logging"] == "false"
+    assert os.environ.get(env_name) == prior
+
+
 def test_evaluate_branch_restores_env_on_evaluate_exception(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
