@@ -19,6 +19,7 @@ and the Databricks SDK are stubbed.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -154,7 +155,8 @@ def test_token_uses_sdk_config_token_when_no_env(monkeypatch: pytest.MonkeyPatch
 
     fake_ws = SimpleNamespace(
         config=SimpleNamespace(
-            token="cfg-token", authenticate=lambda: ("Authorization", "should-not-be-used")
+            token="cfg-token",
+            authenticate=lambda: {"Authorization": "Bearer should-not-be-used"},
         )
     )
     monkeypatch.setattr("databricks.sdk.WorkspaceClient", lambda *a, **k: fake_ws)
@@ -165,13 +167,19 @@ def test_token_uses_sdk_config_token_when_no_env(monkeypatch: pytest.MonkeyPatch
 def test_token_uses_sdk_authenticate_when_config_token_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With no static token anywhere, the SDK mints a fresh bearer."""
+    """With no static token anywhere, the SDK mints a fresh bearer.
+
+    ``config.authenticate()`` returns a ``Dict[str, str]``; the token is
+    extracted from the ``Authorization: Bearer <token>`` header.
+    """
     from anvil.runtime.client import _get_fresh_sp_token
 
     monkeypatch.delenv("DATABRICKS_TOKEN", raising=False)
 
     fake_ws = SimpleNamespace(
-        config=SimpleNamespace(token="", authenticate=lambda: ("Authorization", "fresh-bearer"))
+        config=SimpleNamespace(
+            token="", authenticate=lambda: {"Authorization": "Bearer fresh-bearer"}
+        )
     )
     monkeypatch.setattr("databricks.sdk.WorkspaceClient", lambda *a, **k: fake_ws)
 
@@ -183,7 +191,7 @@ def test_token_raises_when_unresolvable(monkeypatch: pytest.MonkeyPatch) -> None
 
     monkeypatch.delenv("DATABRICKS_TOKEN", raising=False)
     fake_ws = SimpleNamespace(
-        config=SimpleNamespace(token="", authenticate=lambda: ("Authorization", ""))
+        config=SimpleNamespace(token="", authenticate=lambda: {"Authorization": ""})
     )
     monkeypatch.setattr("databricks.sdk.WorkspaceClient", lambda *a, **k: fake_ws)
 
@@ -210,6 +218,38 @@ def test_gateway_base_url_strips_trailing_slash(monkeypatch: pytest.MonkeyPatch)
     assert _gateway_base_url() == "https://foo.cloud.databricks.com/ai-proxy-api/llm/v1"
 
 
+def test_gateway_base_url_falls_back_to_sdk_config_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``DATABRICKS_HOST`` is unset (profile-only config), the host is
+    resolved from the SDK config (which reads ~/.databrickscfg profiles and
+    DATABRICKS_CONFIG_PROFILE)."""
+    from anvil.runtime.client import _gateway_base_url
+
+    monkeypatch.delenv("DATABRICKS_HOST", raising=False)
+
+    fake_ws = SimpleNamespace(config=SimpleNamespace(host="https://profile.cloud.databricks.com"))
+    monkeypatch.setattr("databricks.sdk.WorkspaceClient", lambda *a, **k: fake_ws)
+
+    assert _gateway_base_url() == "https://profile.cloud.databricks.com/ai-proxy-api/llm/v1"
+
+
+def test_gateway_base_url_raises_when_host_unresolvable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When no host can be resolved from env or SDK config, fail loudly
+    rather than producing an empty-host gateway URL."""
+    from anvil.runtime.client import _gateway_base_url
+
+    monkeypatch.delenv("DATABRICKS_HOST", raising=False)
+
+    fake_ws = SimpleNamespace(config=SimpleNamespace(host=None))
+    monkeypatch.setattr("databricks.sdk.WorkspaceClient", lambda *a, **k: fake_ws)
+
+    with pytest.raises(RuntimeError, match="Could not resolve Databricks host"):
+        _gateway_base_url()
+
+
 # ---------------------------------------------------------------------------
 # 4. build_gateway_client defaults + backward-compat build_databricks_client
 # ---------------------------------------------------------------------------
@@ -228,13 +268,18 @@ def test_build_gateway_client_defaults_use_env(monkeypatch: pytest.MonkeyPatch) 
     assert client._get_token() == "env-token"
 
 
-def test_build_databricks_client_delegates_to_gateway() -> None:
+def test_build_databricks_client_delegates_to_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """``build_databricks_client`` is a backward-compat wrapper returning a
-    ``GatewayClient``."""
+    ``GatewayClient``. The ``profile`` kwarg is honored — it sets
+    ``DATABRICKS_CONFIG_PROFILE`` so the SDK reads the profile."""
     from anvil.runtime.client import GatewayClient, build_databricks_client, build_gateway_client
 
+    monkeypatch.setenv("DATABRICKS_HOST", "https://test.cloud.databricks.com")
+
     assert isinstance(build_databricks_client(), GatewayClient)
-    # The legacy ``profile`` kwarg is accepted (and ignored — gateway uses env).
+    # The legacy ``profile`` kwarg is accepted and sets DATABRICKS_CONFIG_PROFILE.
     assert isinstance(build_databricks_client(profile="some-profile"), GatewayClient)
     # Extra kwargs (base_url, token_fn) pass through to build_gateway_client.
     delegating = build_databricks_client(base_url="https://custom/v1", token_fn=lambda: "t")
@@ -242,6 +287,23 @@ def test_build_databricks_client_delegates_to_gateway() -> None:
     assert delegating._base_url == "https://custom/v1"
     # The wrapper and the direct factory produce the same type.
     assert type(build_databricks_client()) is type(build_gateway_client())
+
+
+def test_build_databricks_client_sets_config_profile_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Passing ``profile=`` sets ``DATABRICKS_CONFIG_PROFILE`` so the SDK
+    reads the profile's host + credentials from ~/.databrickscfg. This
+    preserves the behavioral contract of the legacy call — the profile
+    must actually be used, not silently ignored."""
+    from anvil.runtime.client import build_databricks_client
+
+    monkeypatch.setenv("DATABRICKS_HOST", "https://test.cloud.databricks.com")
+    # Record a known starting value so monkeypatch restores it on teardown.
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "__pre_test__")
+
+    build_databricks_client(profile="my-profile")
+    assert os.environ["DATABRICKS_CONFIG_PROFILE"] == "my-profile"
 
 
 # ---------------------------------------------------------------------------

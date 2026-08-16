@@ -43,14 +43,16 @@ def _get_fresh_sp_token() -> str:
     from databricks.sdk import WorkspaceClient
 
     ws = WorkspaceClient()
-    # ``config.authenticate()`` returns a ``(header_name, header_value)``
-    # tuple where the header value is a fresh bearer token. Resolving via
-    # ``config.token`` first covers the case where a static PAT is
-    # configured on the profile.
+    # ``config.authenticate()`` returns a ``Dict[str, str]`` of header
+    # name → header value (e.g. ``{"Authorization": "Bearer <token>"}``).
+    # Resolving via ``config.token`` first covers the case where a static
+    # PAT is configured on the profile.
     token = ws.config.token
     if not token:
-        _header, value = ws.config.authenticate()
-        token = value
+        headers = ws.config.authenticate()  # Dict[str, str]
+        auth = headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth.removeprefix("Bearer ")
     if not token:
         raise RuntimeError(
             "Could not resolve a Databricks token. Set DATABRICKS_TOKEN or "
@@ -67,9 +69,21 @@ def _gateway_base_url() -> str:
     serves every FMAPI model; the ``model`` parameter in
     ``chat.completions.create`` selects which one the gateway routes to.
 
-    Reads ``DATABRICKS_HOST`` from the environment.
+    Reads ``DATABRICKS_HOST`` from the environment. When not set, falls
+    back to the Databricks SDK config (which reads ~/.databrickscfg
+    profiles and DATABRICKS_CONFIG_PROFILE).
     """
     host = os.environ.get("DATABRICKS_HOST", "").rstrip("/")
+    if not host:
+        from databricks.sdk import WorkspaceClient
+
+        ws = WorkspaceClient()
+        host = str(ws.config.host or "").rstrip("/")
+    if not host:
+        raise RuntimeError(
+            "Could not resolve Databricks host. Set DATABRICKS_HOST or "
+            "configure a profile in ~/.databrickscfg."
+        )
     return f"{host}/ai-proxy-api/llm/v1"
 
 
@@ -148,16 +162,17 @@ def build_gateway_client(
 
 
 def build_databricks_client(
-    profile: str | None = None,  # noqa: ARG001 — accepted for backward compat
+    profile: str | None = None,
     **kwargs: Any,
 ) -> GatewayClient:
     """Backward-compatible wrapper — delegates to the AI Gateway client.
 
-    ``profile`` is accepted to preserve the legacy call signature
-    (``build_databricks_client(profile=...)``) but the gateway client
-    resolves host + token from the environment. Callers that set
-    ``DATABRICKS_CONFIG_PROFILE`` in the env (the eval runner does this
-    when a ``--profile`` is passed) are respected: the SDK reads that env
-    var when minting a fresh token.
+    When ``profile`` is set, it is written to
+    ``DATABRICKS_CONFIG_PROFILE`` so the SDK reads the profile's host
+    and credentials from ~/.databrickscfg. This preserves the behavioral
+    contract of the legacy ``build_databricks_client(profile=...)``
+    call.
     """
+    if profile:
+        os.environ["DATABRICKS_CONFIG_PROFILE"] = profile
     return build_gateway_client(**kwargs)
