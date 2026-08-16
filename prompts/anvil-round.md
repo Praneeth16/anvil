@@ -109,6 +109,14 @@ The block must validate against the `OptimizerAction` Pydantic model.
 Same shape as skills. `target_file` must start with `rules/` and end
 with `.md`.
 
+#### `delete_skill`
+
+Delete an existing non-identity skill using `target: "skills/<existing>.md"`.
+
+#### `delete_rule`
+
+Delete an existing rule using `target: "rules/<existing>.md"`.
+
 #### `change_sampling`
 
 ```json-action

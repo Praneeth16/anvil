@@ -27,6 +27,8 @@ from anvil.optimizer.actions import (
     AddRuleAction,
     AddSkillAction,
     ChangeSamplingAction,
+    DeleteRuleAction,
+    DeleteSkillAction,
     EditRuleAction,
     EditSkillAction,
     NoopAction,
@@ -68,6 +70,10 @@ def apply_action(action: OptimizerAction, scaffold_root: Path | str) -> ApplyRes
             root, role="skill", target=action.target_file, content=action.content,
             rationale=action.rationale,
         )
+    if isinstance(action, DeleteSkillAction):
+        return _apply_delete_file(
+            root, role="skill", target=action.target, rationale=action.rationale,
+        )
     if isinstance(action, AddRuleAction):
         return _apply_add_file(
             root, role="rule", target=action.target_file, content=action.content,
@@ -77,6 +83,10 @@ def apply_action(action: OptimizerAction, scaffold_root: Path | str) -> ApplyRes
         return _apply_edit_file(
             root, role="rule", target=action.target_file, content=action.content,
             rationale=action.rationale,
+        )
+    if isinstance(action, DeleteRuleAction):
+        return _apply_delete_file(
+            root, role="rule", target=action.target, rationale=action.rationale,
         )
     if isinstance(action, ChangeSamplingAction):
         return _apply_change_sampling(
@@ -138,6 +148,36 @@ def _apply_edit_file(
     )
 
 
+def _apply_delete_file(
+    root: Path, *, role: str, target: str, rationale: str,
+) -> ApplyResult:
+    path = root / target
+    if not path.is_file():
+        raise ApplyError(f"{role} '{target}' does not exist and cannot be deleted")
+
+    if role == "skill" and _frontmatter(path).get("kind") == "identity":
+        raise ApplyError(f"cannot delete identity skill '{target}'")
+
+    harness_path = root / "harness.yaml"
+    harness = _load_yaml(harness_path)
+    list_key = "skills" if role == "skill" else "rules"
+    entries = list(harness.get(list_key) or [])
+    filename = target.split("/", 1)[1]
+    remaining = [
+        entry for entry in entries
+        if not (isinstance(entry, dict) and entry.get("file") == filename)
+    ]
+    harness[list_key] = remaining
+    _dump_yaml(harness_path, harness)
+    path.unlink()
+
+    return ApplyResult(
+        files_changed=[str(harness_path.relative_to(root.parent))],
+        files_removed=[f"scaffold/{target}"],
+        action_summary=f"delete_{role} {target}: {rationale[:120]}",
+    )
+
+
 def _apply_change_sampling(
     root: Path, *, field_name: str, value: float | int | str | None, rationale: str,
 ) -> ApplyResult:
@@ -164,6 +204,17 @@ def _load_yaml(path: Path) -> dict:
 def _dump_yaml(path: Path, data: dict) -> None:
     text = yaml.safe_dump(data, sort_keys=False, allow_unicode=True, default_flow_style=False)
     path.write_text(text, encoding="utf-8")
+
+
+def _frontmatter(path: Path) -> dict:
+    raw = path.read_text(encoding="utf-8")
+    if not raw.startswith("---\n"):
+        return {}
+    end = raw.find("\n---", 4)
+    if end == -1:
+        return {}
+    metadata = yaml.safe_load(raw[4:end]) or {}
+    return metadata if isinstance(metadata, dict) else {}
 
 
 def _ensure_trailing_newline(text: str) -> str:

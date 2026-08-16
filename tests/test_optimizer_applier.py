@@ -12,6 +12,8 @@ from anvil.optimizer.actions import (
     AddRuleAction,
     AddSkillAction,
     ChangeSamplingAction,
+    DeleteRuleAction,
+    DeleteSkillAction,
     EditRuleAction,
     EditSkillAction,
     NoopAction,
@@ -195,6 +197,67 @@ def test_apply_edit_skill_identity(tmp_path: Path) -> None:
     text = (root / "skills" / "identity.md").read_text(encoding="utf-8")
     assert "new role" in text
     assert "scaffold/skills/identity.md" in result.files_changed
+
+
+# ---------------------------------------------------------------------------
+# delete_*
+# ---------------------------------------------------------------------------
+
+
+def test_apply_delete_skill_removes_file_and_registry_entry(tmp_path: Path) -> None:
+    root = _bare_scaffold(tmp_path)
+    (root / "skills" / "retrieval.md").write_text(
+        "---\nskill_id: retrieval\napplies_to: runtime\n---\n\n# retrieval\n",
+        encoding="utf-8",
+    )
+    harness = _read_yaml(root / "harness.yaml")
+    harness["skills"].append({"file": "retrieval.md"})
+    (root / "harness.yaml").write_text(yaml.safe_dump(harness, sort_keys=False), encoding="utf-8")
+
+    result = apply_action(
+        DeleteSkillAction(target="skills/retrieval.md", rationale="hurts retrieval"), root
+    )
+
+    assert not (root / "skills" / "retrieval.md").exists()
+    assert [entry["file"] for entry in _read_yaml(root / "harness.yaml")["skills"]] == [
+        "identity.md"
+    ]
+    assert result.files_removed == ["scaffold/skills/retrieval.md"]
+    assert "scaffold/harness.yaml" in result.files_changed
+
+
+def test_apply_delete_rule_removes_file_and_registry_entry(tmp_path: Path) -> None:
+    root = _bare_scaffold(tmp_path)
+    result = apply_action(
+        DeleteRuleAction(target="rules/existing.md", rationale="too restrictive"), root
+    )
+
+    assert not (root / "rules" / "existing.md").exists()
+    assert _read_yaml(root / "harness.yaml")["rules"] == []
+    assert result.files_removed == ["scaffold/rules/existing.md"]
+
+
+def test_apply_delete_identity_skill_rejected(tmp_path: Path) -> None:
+    root = _bare_scaffold(tmp_path)
+    with pytest.raises(ApplyError, match="cannot delete identity skill"):
+        apply_action(
+            DeleteSkillAction(target="skills/identity.md", rationale="bad idea"), root
+        )
+    assert (root / "skills" / "identity.md").is_file()
+    assert _read_yaml(root / "harness.yaml")["skills"] == [{"file": "identity.md"}]
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        DeleteSkillAction(target="skills/missing.md", rationale="gone"),
+        DeleteRuleAction(target="rules/missing.md", rationale="gone"),
+    ],
+)
+def test_apply_delete_missing_file_rejected(tmp_path: Path, action: object) -> None:
+    root = _bare_scaffold(tmp_path)
+    with pytest.raises(ApplyError, match="does not exist and cannot be deleted"):
+        apply_action(action, root)
 
 
 # ---------------------------------------------------------------------------

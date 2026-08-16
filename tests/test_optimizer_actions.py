@@ -15,12 +15,12 @@ from anvil.optimizer.actions import (
     AddRuleAction,
     AddSkillAction,
     ChangeSamplingAction,
-    EditRuleAction,
+    DeleteRuleAction,
+    DeleteSkillAction,
     EditSkillAction,
     NoopAction,
 )
 from anvil.optimizer.parser import parse_action
-
 
 # ---------------------------------------------------------------------------
 # Action model validation
@@ -114,6 +114,32 @@ def test_parse_edit_skill() -> None:
     result = parse_action(transcript)
     assert result.parse_status == "ok"
     assert isinstance(result.action, EditSkillAction)
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_type"),
+    [
+        (
+            {"action": "delete_skill", "target": "skills/retrieval.md", "rationale": "harmful"},
+            DeleteSkillAction,
+        ),
+        (
+            {"action": "delete_rule", "target": "rules/specificity.md", "rationale": "too strict"},
+            DeleteRuleAction,
+        ),
+    ],
+)
+def test_parse_delete_actions(payload: dict, expected_type: type) -> None:
+    result = parse_action(_wrap_block(payload))
+    assert result.parse_status == "ok"
+    assert isinstance(result.action, expected_type)
+
+
+def test_delete_path_security() -> None:
+    with pytest.raises(ValueError, match="must be relative"):
+        DeleteSkillAction(target="skills/../identity.md", rationale="escape")
+    with pytest.raises(ValueError, match=r"under scaffold/rules"):
+        DeleteRuleAction(target="skills/identity.md", rationale="wrong tree")
 
 
 def test_parse_change_sampling() -> None:

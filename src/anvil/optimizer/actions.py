@@ -18,26 +18,30 @@ Why this shape (vs. arbitrary ``Edit`` / ``Write`` / ``Bash``):
 * **Auditable.** ``rationale`` is mandatory on every variant; the
   mutation Delta row carries it as ``diff_summary``.
 
-Six actions (today):
+Eight actions (today):
 
 * ``add_skill`` / ``edit_skill``      — add or edit a markdown skill
 * ``add_rule``  / ``edit_rule``       — add or edit a markdown rule
+* ``delete_skill`` / ``delete_rule``   — remove a markdown skill or rule
 * ``change_sampling``                  — tweak ``scaffold/harness.yaml > sampling.*``
 * ``noop``                             — the optimizer chose to do nothing
 
-Each non-``noop`` variant carries:
+Each file mutation carries a relative target path and a rationale. Add/edit
+actions also carry the full replacement ``content``; delete actions do not.
+
+The existing add/edit variants name their path field ``target_file``; delete
+variants use ``target``:
 
 * ``target_file``: relative path under ``scaffold/`` (without the
   ``scaffold/`` prefix; e.g. ``"skills/identity.md"``).
-* ``content``: full file content for skills/rules; ``str | float | int``
-  for sampling.
+* ``content``: full file content for add/edit skills and rules.
 * ``rationale``: short string explaining the why. Goes into the
   critique md and the mutations Delta row.
 """
 
 from __future__ import annotations
 
-from typing import Annotated, Literal, Union
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -69,6 +73,16 @@ class EditSkillAction(_ActionBase):
         return _check_relative_path(v, expected_dir="skills")
 
 
+class DeleteSkillAction(_ActionBase):
+    action: Literal["delete_skill"] = "delete_skill"
+    target: str = Field(min_length=1)
+
+    @field_validator("target")
+    @classmethod
+    def _validate_path(cls, v: str) -> str:
+        return _check_relative_path(v, expected_dir="skills")
+
+
 class AddRuleAction(_ActionBase):
     action: Literal["add_rule"] = "add_rule"
     target_file: str = Field(min_length=1)
@@ -91,6 +105,16 @@ class EditRuleAction(_ActionBase):
         return _check_relative_path(v, expected_dir="rules")
 
 
+class DeleteRuleAction(_ActionBase):
+    action: Literal["delete_rule"] = "delete_rule"
+    target: str = Field(min_length=1)
+
+    @field_validator("target")
+    @classmethod
+    def _validate_path(cls, v: str) -> str:
+        return _check_relative_path(v, expected_dir="rules")
+
+
 class ChangeSamplingAction(_ActionBase):
     """Edit a single field under ``scaffold/harness.yaml > sampling.*``."""
 
@@ -107,14 +131,14 @@ class NoopAction(_ActionBase):
 
 # Discriminated union over the literal ``action`` field.
 OptimizerAction = Annotated[
-    Union[
-        AddSkillAction,
-        EditSkillAction,
-        AddRuleAction,
-        EditRuleAction,
-        ChangeSamplingAction,
-        NoopAction,
-    ],
+    AddSkillAction
+    | EditSkillAction
+    | DeleteSkillAction
+    | AddRuleAction
+    | EditRuleAction
+    | DeleteRuleAction
+    | ChangeSamplingAction
+    | NoopAction,
     Field(discriminator="action"),
 ]
 
