@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 from collections import Counter
+from pathlib import Path
 
 import pytest
 
+from anvil.data import load_golden_set
 from anvil.eval import runner
+from anvil.runtime.loader import load_harness
 from anvil.runtime.models import EvalConfig, EvalModeConfig, SplitConfig
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _examples(count: int = 10_000) -> list[dict]:
@@ -74,8 +80,28 @@ def test_split_enabled_routes_dev_modes_to_dev_and_test_mode_to_test(
     cfg = _config(enabled=True)
 
     assert runner._select_mode_examples([], cfg=cfg, selected_mode="quick") == dev[:1]
-    assert runner._select_mode_examples([], cfg=cfg, selected_mode="full") == dev
+    with pytest.warns(UserWarning, match="scaled 'full' bucket counts"):
+        assert runner._select_mode_examples([], cfg=cfg, selected_mode="full") == dev[:1]
     assert runner._select_mode_examples([], cfg=cfg, selected_mode="test") == test
+
+
+def test_split_modes_run_against_shipped_golden_set() -> None:
+    examples = load_golden_set(REPO_ROOT / "data" / "golden_set.jsonl")
+    cfg = load_harness(REPO_ROOT / "scaffold").config.eval.model_copy(
+        update={"split": SplitConfig(enabled=True)}
+    )
+
+    with pytest.warns(UserWarning, match="scaled 'quick' bucket counts"):
+        quick = runner._select_mode_examples(examples, cfg=cfg, selected_mode="quick")
+    test = runner._select_mode_examples(examples, cfg=cfg, selected_mode="test")
+
+    assert Counter(row["category"] for row in quick) == {
+        "direct": 1,
+        "multi_hop": 1,
+        "distractor": 1,
+        "out_of_scope": 1,
+    }
+    assert len(test) == 5
 
 
 def test_split_disabled_preserves_full_dataset_selection(

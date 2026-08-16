@@ -72,9 +72,9 @@ eval:
   # Default mode for `evaluate_branch`. One of: quick, standard, full.
   default_mode: quick
   # Anti-overfit data split. When enabled, the golden set is partitioned
-  # into train (optimizer-visible, not scored), dev (round-by-round eval),
-  # and test (held-out finalization only). Split is deterministic by hash
-  # of example_id, so the same example always lands in the same partition.
+  # into train (reserved for optimizer-visible use; currently not scored),
+  # dev (round-by-round eval), and test (held-out finalization only). Split is
+  # deterministic by hash of example_id, so membership remains stable.
   # split:
   #   enabled: false
   #   train_ratio: 0.6

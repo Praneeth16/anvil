@@ -26,6 +26,7 @@ import importlib.util
 import inspect
 import os
 import sys
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -128,8 +129,20 @@ def _select_mode_examples(
     train, dev, test = partition_dataset(examples, cfg.split)
     _verify_no_overlap(train, dev, test)
     if selected_mode == "test":
-        return test
-    return select_subset(dev, buckets=mode_config.buckets)
+        return test[: mode_config.rows]
+
+    scaled_buckets = {
+        bucket: max(1, round(count * cfg.split.dev_ratio))
+        for bucket, count in mode_config.buckets.items()
+    }
+    if scaled_buckets != mode_config.buckets:
+        warnings.warn(
+            f"scaled {selected_mode!r} bucket counts for dev_ratio="
+            f"{cfg.split.dev_ratio}: {mode_config.buckets} -> {scaled_buckets}",
+            UserWarning,
+            stacklevel=2,
+        )
+    return select_subset(dev, buckets=scaled_buckets)
 
 
 def _extract_final_text(response: Any) -> str:

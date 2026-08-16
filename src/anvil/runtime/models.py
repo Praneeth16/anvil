@@ -164,8 +164,9 @@ class EvalModeConfig(BaseModel):
 class SplitConfig(BaseModel):
     """Data split configuration for anti-overfit enforcement.
 
-    The golden set is partitioned into train (optimizer-visible), dev
-    (round-by-round eval), and test (held-out finalization only).
+    The golden set is partitioned into train (reserved for optimizer-visible
+    use; currently excluded from scoring), dev (round-by-round eval), and test
+    (held-out finalization only).
     Split is by hash of example_id — deterministic and stable across runs.
     """
 
