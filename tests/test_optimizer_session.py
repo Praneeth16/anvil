@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from types import SimpleNamespace
 
 import pytest
 
@@ -177,8 +176,6 @@ def test_setup_anthropic_env_uses_optimizer_endpoint(
     hardcoded one."""
     from anvil.optimizer.session import setup_anthropic_env
 
-    # Avoid real SDK + secret reads.
-    monkeypatch.setattr("databricks.sdk.WorkspaceClient", lambda *a, **k: SimpleNamespace())
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gw.example/anthropic")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok")
     monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
@@ -202,7 +199,6 @@ def test_setup_anthropic_env_falls_back_to_default_model(
     default model is used — preserves backward compatibility."""
     from anvil.optimizer.session import setup_anthropic_env
 
-    monkeypatch.setattr("databricks.sdk.WorkspaceClient", lambda *a, **k: SimpleNamespace())
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gw.example/anthropic")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok")
     monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
@@ -212,3 +208,39 @@ def test_setup_anthropic_env_falls_back_to_default_model(
 
     assert os.environ["ANTHROPIC_MODEL"] == "databricks-claude-opus-4-7"
     assert os.environ["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-claude-opus-4-7"
+
+
+def test_setup_anthropic_env_uses_gateway_cli_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gateway mode leaves token auth unset and derives the gateway URL."""
+    import anvil.optimizer.session as session
+
+    def fail_if_secret_client_is_created(*args, **kwargs):
+        raise AssertionError("setup must not create a secret client")
+
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
+    monkeypatch.setattr(session, "ANTHROPIC_BASE_URL", "https://gw.example/anthropic")
+    monkeypatch.setattr("databricks.sdk.WorkspaceClient", fail_if_secret_client_is_created)
+
+    session.setup_anthropic_env(profile="test-profile")
+
+    assert os.environ["CLAUDE_CODE_USE_GATEWAY"] == "1"
+    assert os.environ["ANTHROPIC_BASE_URL"] == "https://gw.example/anthropic"
+    assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
+
+
+def test_setup_anthropic_env_preserves_operator_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicitly configured token remains an operator-controlled override."""
+    from anvil.optimizer.session import setup_anthropic_env
+
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gw.example/anthropic")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "operator-token")
+
+    setup_anthropic_env()
+
+    assert os.environ["ANTHROPIC_AUTH_TOKEN"] == "operator-token"

@@ -9,7 +9,7 @@ Two responsibilities:
 
 1. **Configure the env** — point the bundled Claude Code subprocess at
    the workspace's AI Gateway anthropic route (``ANTHROPIC_BASE_URL``,
-   ``ANTHROPIC_AUTH_TOKEN``, ``ANTHROPIC_DEFAULT_OPUS_MODEL``, the
+   ``ANTHROPIC_DEFAULT_OPUS_MODEL``, the
    custom coding-agent header, the experimental-betas opt-out).
 2. **Run one bounded session** — open ``ClaudeSDKClient`` with the
    prompt, drain ``receive_response`` into a transcript, and parse the
@@ -57,13 +57,11 @@ def setup_anthropic_env(
     ``ANTHROPIC_DEFAULT_OPUS_MODEL``). When None, falls back to the
     built-in default (``databricks-claude-opus-4-7``).
 
-    Reads ``ANTHROPIC_AUTH_TOKEN`` from the Databricks Secret
-    ``anvil/anthropic_auth_token`` if it is not already set in env.
+    Gateway authentication is handled automatically by Claude Code through
+    the Databricks CLI (using ``DATABRICKS_CONFIG_PROFILE`` or
+    ``DATABRICKS_HOST``), so no secret or token is required. An operator-set
+    ``ANTHROPIC_AUTH_TOKEN`` is preserved as an optional override.
     """
-    from databricks.sdk import WorkspaceClient
-
-    ws = WorkspaceClient(profile=profile) if profile else WorkspaceClient()
-
     if "ANTHROPIC_BASE_URL" not in os.environ:
         if not ANTHROPIC_BASE_URL:
             raise RuntimeError(
@@ -73,10 +71,7 @@ def setup_anthropic_env(
                 "https://<workspace-id>.ai-gateway.cloud.databricks.com/anthropic"
             )
         os.environ["ANTHROPIC_BASE_URL"] = ANTHROPIC_BASE_URL
-    if "ANTHROPIC_AUTH_TOKEN" not in os.environ:
-        os.environ["ANTHROPIC_AUTH_TOKEN"] = _read_secret(
-            ws, scope="anvil", key="anthropic_auth_token"
-        )
+    os.environ.setdefault("CLAUDE_CODE_USE_GATEWAY", "1")
     optimizer_model = optimizer_endpoint or "databricks-claude-opus-4-7"
     os.environ.setdefault("ANTHROPIC_MODEL", optimizer_model)
     os.environ.setdefault("ANTHROPIC_DEFAULT_OPUS_MODEL", optimizer_model)
@@ -86,17 +81,6 @@ def setup_anthropic_env(
         "ANTHROPIC_CUSTOM_HEADERS", "x-databricks-use-coding-agent-mode: true"
     )
     os.environ.setdefault("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1")
-
-
-def _read_secret(ws, *, scope: str, key: str) -> str:
-    """Resolve a Databricks Secret as a plain string."""
-    import base64
-
-    raw = ws.secrets.get_secret(scope=scope, key=key)
-    # The SDK returns either a base64-encoded string or a typed
-    # ``GetSecretResponse`` depending on version; handle both.
-    encoded = raw.value if hasattr(raw, "value") else str(raw)
-    return base64.b64decode(encoded).decode("utf-8")
 
 
 async def run_optimizer_session(
@@ -119,7 +103,7 @@ async def run_optimizer_session(
         max_turns: Hard cap on optimizer CLI turns. The session aborts
             and returns whatever transcript it has if exceeded; the
             parser then falls back to ``NoopAction``.
-        profile: Databricks CLI profile for the secret read.
+        profile: Databricks CLI profile used by Claude Code for gateway auth.
         setup_env: If True (default), call :func:`setup_anthropic_env`
             before opening the session. Disable in tests.
         optimizer_endpoint: FMAPI model name from
