@@ -1,9 +1,22 @@
 """Databricks AI Gateway client — the sole LLM route for FORGE.
 
 All three LLM call paths (runtime agent, optimizer, judge) route through
-the AI Gateway's unified OpenAI-compatible endpoint. The gateway routes
-by FMAPI model name, so a single client serves all models — no
-per-endpoint clients needed.
+a single OpenAI-compatible endpoint on the Databricks workspace. The
+endpoint routes by FMAPI model name, so a single client serves all
+models — no per-endpoint clients needed.
+
+Base URL resolution (lowest to highest precedence):
+
+* Default: ``https://<workspace_host>/serving-endpoints`` — the
+  OpenAI-compatible route of standard Databricks FMAPI serving endpoints.
+* ``ANVIL_GATEWAY_BASE_URL`` env var — used verbatim (only a trailing
+  slash is stripped). Set this to point at a dedicated AI Gateway proxy
+  on workspaces that have one.
+* An explicit ``base_url=`` argument to ``build_gateway_client``.
+
+The workspace host is read from ``DATABRICKS_HOST`` or, when unset, the
+Databricks SDK config (``~/.databrickscfg`` profile /
+``DATABRICKS_CONFIG_PROFILE``).
 
 SP token refresh: Databricks SP tokens expire (~1h). The client refreshes
 the token on each request to avoid expiry failures.
@@ -62,17 +75,29 @@ def _get_fresh_sp_token() -> str:
 
 
 def _gateway_base_url() -> str:
-    """Get the AI Gateway unified URL.
+    """Resolve the OpenAI-compatible base URL for LLM calls.
 
-    Format: ``https://<workspace_host>/ai-proxy-api/llm/v1`` — the
-    OpenAI-compatible route of the Databricks AI Gateway. The same URL
-    serves every FMAPI model; the ``model`` parameter in
-    ``chat.completions.create`` selects which one the gateway routes to.
+    This is only consulted when no explicit ``base_url`` was passed to
+    ``build_gateway_client`` (an explicit argument always wins). Within
+    this function:
 
-    Reads ``DATABRICKS_HOST`` from the environment. When not set, falls
-    back to the Databricks SDK config (which reads ~/.databrickscfg
+    1. ``ANVIL_GATEWAY_BASE_URL`` env var — used verbatim (only a
+       trailing slash is stripped). Set this to point at a dedicated AI
+       Gateway proxy on workspaces that have one; it bypasses host
+       resolution entirely.
+    2. Default: ``https://<workspace_host>/serving-endpoints`` — the
+       OpenAI-compatible route of standard Databricks FMAPI serving
+       endpoints. The ``model`` parameter in ``chat.completions.create``
+       selects which endpoint the request routes to.
+
+    The workspace host is read from ``DATABRICKS_HOST``. When not set,
+    falls back to the Databricks SDK config (which reads ~/.databrickscfg
     profiles and DATABRICKS_CONFIG_PROFILE).
     """
+    env_url = os.environ.get("ANVIL_GATEWAY_BASE_URL", "")
+    if env_url:
+        # Verbatim override — only strip a trailing slash, append nothing.
+        return env_url.rstrip("/")
     host = os.environ.get("DATABRICKS_HOST", "").rstrip("/")
     if not host:
         from databricks.sdk import WorkspaceClient
@@ -84,7 +109,7 @@ def _gateway_base_url() -> str:
             "Could not resolve Databricks host. Set DATABRICKS_HOST or "
             "configure a profile in ~/.databrickscfg."
         )
-    return f"{host}/ai-proxy-api/llm/v1"
+    return f"{host}/serving-endpoints"
 
 
 class GatewayClient:

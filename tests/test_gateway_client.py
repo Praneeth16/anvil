@@ -208,14 +208,16 @@ def test_gateway_base_url_built_from_host(monkeypatch: pytest.MonkeyPatch) -> No
     from anvil.runtime.client import _gateway_base_url
 
     monkeypatch.setenv("DATABRICKS_HOST", "https://foo.cloud.databricks.com")
-    assert _gateway_base_url() == "https://foo.cloud.databricks.com/ai-proxy-api/llm/v1"
+    monkeypatch.delenv("ANVIL_GATEWAY_BASE_URL", raising=False)
+    assert _gateway_base_url() == "https://foo.cloud.databricks.com/serving-endpoints"
 
 
 def test_gateway_base_url_strips_trailing_slash(monkeypatch: pytest.MonkeyPatch) -> None:
     from anvil.runtime.client import _gateway_base_url
 
     monkeypatch.setenv("DATABRICKS_HOST", "https://foo.cloud.databricks.com/")
-    assert _gateway_base_url() == "https://foo.cloud.databricks.com/ai-proxy-api/llm/v1"
+    monkeypatch.delenv("ANVIL_GATEWAY_BASE_URL", raising=False)
+    assert _gateway_base_url() == "https://foo.cloud.databricks.com/serving-endpoints"
 
 
 def test_gateway_base_url_falls_back_to_sdk_config_host(
@@ -227,11 +229,12 @@ def test_gateway_base_url_falls_back_to_sdk_config_host(
     from anvil.runtime.client import _gateway_base_url
 
     monkeypatch.delenv("DATABRICKS_HOST", raising=False)
+    monkeypatch.delenv("ANVIL_GATEWAY_BASE_URL", raising=False)
 
     fake_ws = SimpleNamespace(config=SimpleNamespace(host="https://profile.cloud.databricks.com"))
     monkeypatch.setattr("databricks.sdk.WorkspaceClient", lambda *a, **k: fake_ws)
 
-    assert _gateway_base_url() == "https://profile.cloud.databricks.com/ai-proxy-api/llm/v1"
+    assert _gateway_base_url() == "https://profile.cloud.databricks.com/serving-endpoints"
 
 
 def test_gateway_base_url_raises_when_host_unresolvable(
@@ -242,12 +245,74 @@ def test_gateway_base_url_raises_when_host_unresolvable(
     from anvil.runtime.client import _gateway_base_url
 
     monkeypatch.delenv("DATABRICKS_HOST", raising=False)
+    monkeypatch.delenv("ANVIL_GATEWAY_BASE_URL", raising=False)
 
     fake_ws = SimpleNamespace(config=SimpleNamespace(host=None))
     monkeypatch.setattr("databricks.sdk.WorkspaceClient", lambda *a, **k: fake_ws)
 
     with pytest.raises(RuntimeError, match="Could not resolve Databricks host"):
         _gateway_base_url()
+
+
+def test_gateway_base_url_env_override_used_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``ANVIL_GATEWAY_BASE_URL`` (when set, non-empty) is used verbatim —
+    only a trailing slash is stripped, no path is appended, and the
+    workspace host is not consulted."""
+    from anvil.runtime.client import _gateway_base_url
+
+    monkeypatch.setenv("DATABRICKS_HOST", "https://should-not-be-used.cloud.databricks.com")
+    monkeypatch.setenv("ANVIL_GATEWAY_BASE_URL", "https://gw-proxy.example/ai-proxy-api/llm/v1")
+
+    assert _gateway_base_url() == "https://gw-proxy.example/ai-proxy-api/llm/v1"
+
+
+def test_gateway_base_url_env_override_strips_trailing_slash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A trailing slash on ``ANVIL_GATEWAY_BASE_URL`` is stripped; the rest
+    of the value is used verbatim."""
+    from anvil.runtime.client import _gateway_base_url
+
+    monkeypatch.setenv("DATABRICKS_HOST", "https://should-not-be-used.cloud.databricks.com")
+    monkeypatch.setenv("ANVIL_GATEWAY_BASE_URL", "https://gw-proxy.example/proxy/")
+
+    assert _gateway_base_url() == "https://gw-proxy.example/proxy"
+
+
+def test_gateway_base_url_env_override_empty_falls_back_to_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty ``ANVIL_GATEWAY_BASE_URL`` is treated as unset, so the
+    default ``/serving-endpoints`` route is built from the resolved host."""
+    from anvil.runtime.client import _gateway_base_url
+
+    monkeypatch.setenv("DATABRICKS_HOST", "https://foo.cloud.databricks.com")
+    monkeypatch.setenv("ANVIL_GATEWAY_BASE_URL", "")
+
+    assert _gateway_base_url() == "https://foo.cloud.databricks.com/serving-endpoints"
+
+
+def test_gateway_base_url_env_override_beats_sdk_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The env override wins even when the host would otherwise come from
+    the SDK config (``DATABRICKS_HOST`` unset). The SDK is not consulted
+    at all when the override is set."""
+    from anvil.runtime.client import _gateway_base_url
+
+    monkeypatch.delenv("DATABRICKS_HOST", raising=False)
+    # If the SDK were consulted, this would blow up — proving it isn't.
+    import databricks.sdk as dbsdk
+
+    def _boom(*a, **k):
+        raise AssertionError("SDK must not be used when ANVIL_GATEWAY_BASE_URL is set")
+
+    monkeypatch.setattr(dbsdk, "WorkspaceClient", _boom)
+    monkeypatch.setenv("ANVIL_GATEWAY_BASE_URL", "https://gw-proxy.example/proxy")
+
+    assert _gateway_base_url() == "https://gw-proxy.example/proxy"
 
 
 # ---------------------------------------------------------------------------
@@ -261,11 +326,43 @@ def test_build_gateway_client_defaults_use_env(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setenv("DATABRICKS_HOST", "https://bar.cloud.databricks.com")
     monkeypatch.setenv("DATABRICKS_TOKEN", "env-token")
+    monkeypatch.delenv("ANVIL_GATEWAY_BASE_URL", raising=False)
 
     client = build_gateway_client()
-    assert client._base_url == "https://bar.cloud.databricks.com/ai-proxy-api/llm/v1"
+    assert client._base_url == "https://bar.cloud.databricks.com/serving-endpoints"
     # token_fn defaults to _get_fresh_sp_token, which reads the env token.
     assert client._get_token() == "env-token"
+
+
+def test_build_gateway_client_explicit_base_url_beats_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``base_url=`` argument to ``build_gateway_client`` takes
+    precedence over the ``ANVIL_GATEWAY_BASE_URL`` env var, which in turn
+    beats the default ``/serving-endpoints`` route."""
+    from anvil.runtime.client import build_gateway_client
+
+    monkeypatch.setenv("DATABRICKS_HOST", "https://foo.cloud.databricks.com")
+    monkeypatch.setenv("ANVIL_GATEWAY_BASE_URL", "https://env.example/proxy")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "env-token")
+
+    client = build_gateway_client(base_url="https://explicit.example/v1")
+    assert client._base_url == "https://explicit.example/v1"
+
+
+def test_build_gateway_client_env_base_url_beats_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no explicit ``base_url=`` argument, ``ANVIL_GATEWAY_BASE_URL``
+    wins over the default ``/serving-endpoints`` route built from the host."""
+    from anvil.runtime.client import build_gateway_client
+
+    monkeypatch.setenv("DATABRICKS_HOST", "https://foo.cloud.databricks.com")
+    monkeypatch.setenv("ANVIL_GATEWAY_BASE_URL", "https://env.example/proxy")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "env-token")
+
+    client = build_gateway_client()
+    assert client._base_url == "https://env.example/proxy"
 
 
 def test_build_databricks_client_delegates_to_gateway(
