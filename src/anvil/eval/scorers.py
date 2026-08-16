@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -227,6 +228,13 @@ def load_check_function(
 
 
 def _clamp_score(score: float) -> float:
+    # NaN comparisons are always False in Python, so a NaN passes both
+    # the ``< 0.0`` and ``> 1.0`` guards and leaks through as NaN — which
+    # would poison the aggregate. Reject any non-finite value (NaN or
+    # inf) by mapping it to 0.0 so a misbehaving custom check cannot
+    # corrupt the weighted average.
+    if not math.isfinite(score):
+        return 0.0
     if score < 0.0:
         return 0.0
     if score > 1.0:

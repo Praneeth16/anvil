@@ -32,6 +32,7 @@ from mlflow.types.responses import ResponsesAgentRequest
 from openai import OpenAI
 
 from anvil.data import load_golden_set, select_subset
+from anvil.eval.cache import compute_scorer_fingerprint
 from anvil.eval.scorers import build_scorers
 from anvil.observability import SOURCE_EVAL, enable_runtime_tracing
 from anvil.runtime.agent import AnvilAgent
@@ -56,6 +57,13 @@ class EvalReport:
     scorers: list[str]
     evaluated_at: str
     trace_ids: list[str] = field(default_factory=list)
+    # JSON fingerprint of the aggregate scorer configs (name, type,
+    # weight, check_function) that produced this report's aggregate.
+    # Carried into ``CachedBaseline`` so the frontier gate can detect a
+    # weight/check_function change that invalidates a cross-run
+    # comparison even when scorer names are unchanged. Empty when the
+    # report is built by code that predates this field.
+    scorer_fingerprint: str = ""
 
 
 def _extract_final_text(response: Any) -> str:
@@ -98,22 +106,34 @@ def _build_dataset(examples: list[dict]) -> list[dict]:
     # ``expected_facts`` and ignores the alias.
     rows: list[dict] = []
     for ex in examples:
+        expectations: dict[str, Any] = {
+            "expected_facts": ex["must_include"],
+            "must_include": ex["must_include"],
+            "should_refuse": ex["should_refuse"],
+            "expected_doc_ids": ex["expected_doc_ids"],
+            "expected_citations": ex["expected_citations"],
+            "must_not_include": ex["must_not_include"],
+            "notes_for_judge": ex["notes_for_judge"],
+            "reference_answer": ex["reference_answer"],
+        }
+        # Pass through json_schema, expected_fields, and any other
+        # extension fields prefixed with ``json_`` or ``expected_`` so
+        # programmatic check functions (json_schema_validity,
+        # field_exact_match) receive their documented primary inputs
+        # through the real runner. This is additive — existing scorers
+        # ignore unknown keys in the expectations dict.
+        for key, val in ex.items():
+            if key not in expectations and (
+                key.startswith("json_") or key.startswith("expected_")
+            ):
+                expectations[key] = val
         rows.append(
             {
                 "inputs": {
                     "query": ex["query"],
                     "category": ex["category"],
                 },
-                "expectations": {
-                    "expected_facts": ex["must_include"],
-                    "must_include": ex["must_include"],
-                    "should_refuse": ex["should_refuse"],
-                    "expected_doc_ids": ex["expected_doc_ids"],
-                    "expected_citations": ex["expected_citations"],
-                    "must_not_include": ex["must_not_include"],
-                    "notes_for_judge": ex["notes_for_judge"],
-                    "reference_answer": ex["reference_answer"],
-                },
+                "expectations": expectations,
                 "tags": {"example_id": ex["example_id"]},
             }
         )
@@ -187,6 +207,7 @@ def _aggregate_report(
     run_id: str,
     experiment_id: str,
     mode: str,
+    scorer_fingerprint: str = "",
 ) -> EvalReport:
     n_rows = len(result_df)
 
@@ -267,6 +288,7 @@ def _aggregate_report(
         scorers=list(scorer_names),
         evaluated_at=datetime.now(UTC).isoformat(timespec="seconds"),
         trace_ids=trace_ids,
+        scorer_fingerprint=scorer_fingerprint,
     )
 
 
@@ -340,6 +362,7 @@ def evaluate_branch(
     aggregate_scorer_configs = list(cfg.scorers)
     aggregate_scorer_names = [c.name for c in aggregate_scorer_configs]
     weights = {c.name: c.weight for c in aggregate_scorer_configs}
+    scorer_fingerprint = compute_scorer_fingerprint(aggregate_scorer_configs)
     active_scorer_configs = list(aggregate_scorer_configs)
     active_scorer_names = list(aggregate_scorer_names)
     if include_safety and "safety" not in active_scorer_names:
@@ -371,4 +394,5 @@ def evaluate_branch(
         run_id=result.run_id,
         experiment_id=experiment.experiment_id if experiment else "",
         mode=selected_mode,
+        scorer_fingerprint=scorer_fingerprint,
     )

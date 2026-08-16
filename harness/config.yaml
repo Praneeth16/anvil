@@ -86,9 +86,12 @@ eval:
     - correctness
     - retrieval_groundedness
     - refusal_appropriateness
-    # Mixed llm + programmatic example (uncomment to enable). The
-    # programmatic scorers below are deterministic — no LLM call — and
-    # load their check functions from data/evaluator.py.
+    # Mixed llm + programmatic example (uncomment to enable). This
+    # REPLACES the three bare-string scorers above — do not uncomment
+    # both forms; the mixed form re-declares the three llm scorers with
+    # explicit weights. The programmatic scorers below are deterministic
+    # — no LLM call — and load their check functions from
+    # data/evaluator.py.
     # - name: correctness
     #   type: llm
     #   weight: 0.4

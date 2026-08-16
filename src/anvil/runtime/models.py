@@ -225,6 +225,26 @@ class EvalConfig(BaseModel):
                 out.append(item)
         return out
 
+    @model_validator(mode="after")
+    def _scorer_names_must_be_unique(self) -> EvalConfig:
+        """Reject duplicate scorer names.
+
+        The aggregate stores weights by name (``weights = {c.name:
+        c.weight ...}``), so a duplicate name silently overwrites the
+        earlier weight while both entries remain in the
+        numerator/denominator. This produces incorrect weighting and
+        ambiguous MLflow columns (``{name}/value``, ``{name}/mean``).
+        """
+        seen: set[str] = set()
+        for s in self.scorers:
+            if s.name in seen:
+                raise ValueError(
+                    f"duplicate scorer name {s.name!r} — "
+                    "each scorer must have a unique name"
+                )
+            seen.add(s.name)
+        return self
+
 
 class ScaffoldYAML(BaseModel):
     """Schema of ``scaffold/harness.yaml`` — the optimizer-mutable file."""

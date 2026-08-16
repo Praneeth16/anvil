@@ -741,3 +741,200 @@ def test_evaluate_branch_backward_compat_string_scorers(
     # Uniform weights → unweighted mean = (0.5 + 0.8) / 2 = 0.65.
     assert report.aggregate == pytest.approx(0.65)
     assert set(report.scorers) == {"correctness", "retrieval_groundedness"}
+
+
+# ---------------------------------------------------------------------------
+# 8. Cross-review fixes — duplicate names, NaN clamping, field projection.
+# ---------------------------------------------------------------------------
+
+
+def test_eval_config_rejects_duplicate_scorer_names() -> None:
+    """Duplicate scorer names overwrite weights in the aggregate dict
+    while remaining duplicated in the numerator/denominator — reject at
+    config validation time."""
+    from pydantic import ValidationError
+
+    from anvil.runtime.models import EvalConfig
+
+    with pytest.raises(ValidationError, match="duplicate scorer name"):
+        EvalConfig(
+            scorers=[
+                {"name": "correctness", "type": "llm", "weight": 0.4},
+                {"name": "correctness", "type": "llm", "weight": 0.6},
+            ]
+        )
+
+
+def test_eval_config_rejects_duplicate_scorer_names_three_wide() -> None:
+    """A three-way duplicate is also rejected — the validator finds the
+    second occurrence."""
+    from pydantic import ValidationError
+
+    from anvil.runtime.models import EvalConfig
+
+    with pytest.raises(ValidationError, match="duplicate scorer name"):
+        EvalConfig(scorers=["correctness", "correctness", "correctness"])
+
+
+def test_eval_config_allows_unique_scorer_names() -> None:
+    """Distinct names parse without error (sanity check — the validator
+    does not false-positive on valid configs)."""
+    from anvil.runtime.models import EvalConfig
+
+    cfg = EvalConfig(
+        scorers=[
+            {"name": "correctness", "type": "llm", "weight": 0.4},
+            {"name": "exact_match", "type": "programmatic", "check_function": "exact_match", "weight": 0.6},
+        ]
+    )
+    assert len(cfg.scorers) == 2
+
+
+def test_clamp_score_nan_returns_zero() -> None:
+    """``_clamp_score(float('nan'))`` must return 0.0, not NaN — NaN
+    comparisons are always False in Python, so without an ``isfinite``
+    guard the NaN passes both the ``< 0.0`` and ``> 1.0`` checks and
+    leaks into the aggregate."""
+    from anvil.eval.scorers import _clamp_score
+
+    assert _clamp_score(float("nan")) == 0.0
+
+
+def test_clamp_score_positive_inf_returns_zero() -> None:
+    """``_clamp_score(float('inf'))`` must not return inf — a non-finite
+    value must be mapped to 0.0 so it cannot poison the aggregate."""
+    from anvil.eval.scorers import _clamp_score
+
+    assert _clamp_score(float("inf")) == 0.0
+
+
+def test_clamp_score_negative_inf_returns_zero() -> None:
+    from anvil.eval.scorers import _clamp_score
+
+    assert _clamp_score(float("-inf")) == 0.0
+
+
+def test_build_programmatic_scorer_clamps_nan_to_zero() -> None:
+    """A check function returning NaN must produce a Feedback value of
+    0.0, not NaN — this is the end-to-end contract that _clamp_score
+    enforces inside _run_programmatic_check."""
+    from anvil.eval.scorers import build_programmatic_scorer
+
+    def nan_check(prediction: str, ground_truth: dict) -> float:
+        return float("nan")
+
+    fn = build_programmatic_scorer(name="nan", check_fn=nan_check)
+    result = fn(inputs={}, outputs="x", expectations={})
+    assert result.value == 0.0
+
+
+def test_build_programmatic_scorer_clamps_inf_to_zero() -> None:
+    from anvil.eval.scorers import build_programmatic_scorer
+
+    def inf_check(prediction: str, ground_truth: dict) -> float:
+        return float("inf")
+
+    fn = build_programmatic_scorer(name="inf", check_fn=inf_check)
+    result = fn(inputs={}, outputs="x", expectations={})
+    assert result.value == 0.0
+
+
+def test_build_dataset_projects_json_schema() -> None:
+    """``json_schema`` in a golden-set example must flow through to the
+    row's ``expectations`` dict so ``json_schema_validity`` receives its
+    documented primary input."""
+    from anvil.eval.runner import _build_dataset
+
+    examples = [
+        {
+            "example_id": "g1",
+            "query": "q1",
+            "category": "direct",
+            "expected_doc_ids": [],
+            "reference_answer": "x",
+            "should_refuse": False,
+            "expected_citations": [],
+            "must_include": ["x"],
+            "must_not_include": [],
+            "notes_for_judge": "",
+            "json_schema": {"type": "object", "required": ["rate"]},
+        }
+    ]
+    rows = _build_dataset(examples)
+    assert rows[0]["expectations"]["json_schema"] == {"type": "object", "required": ["rate"]}
+
+
+def test_build_dataset_projects_expected_fields() -> None:
+    """``expected_fields`` in a golden-set example must flow through to
+    the row's ``expectations`` dict so ``field_exact_match`` receives
+    its documented primary input."""
+    from anvil.eval.runner import _build_dataset
+
+    examples = [
+        {
+            "example_id": "g1",
+            "query": "q1",
+            "category": "direct",
+            "expected_doc_ids": [],
+            "reference_answer": '{"rate": "0.142"}',
+            "should_refuse": False,
+            "expected_citations": [],
+            "must_include": ["0.142"],
+            "must_not_include": [],
+            "notes_for_judge": "",
+            "expected_fields": {"rate": "0.142", "unit": "kWh"},
+        }
+    ]
+    rows = _build_dataset(examples)
+    assert rows[0]["expectations"]["expected_fields"] == {"rate": "0.142", "unit": "kWh"}
+
+
+def test_build_dataset_projects_arbitrary_json_prefixed_extension_fields() -> None:
+    """Any key prefixed with ``json_`` or ``expected_`` that is not
+    already in the expectations dict is passed through as an extension
+    field."""
+    from anvil.eval.runner import _build_dataset
+
+    examples = [
+        {
+            "example_id": "g1",
+            "query": "q1",
+            "category": "direct",
+            "expected_doc_ids": [],
+            "reference_answer": "x",
+            "should_refuse": False,
+            "expected_citations": [],
+            "must_include": ["x"],
+            "must_not_include": [],
+            "notes_for_judge": "",
+            "json_custom_validator": "my_rules",
+            "expected_confidence": 0.95,
+        }
+    ]
+    rows = _build_dataset(examples)
+    assert rows[0]["expectations"]["json_custom_validator"] == "my_rules"
+    assert rows[0]["expectations"]["expected_confidence"] == 0.95
+
+
+def test_build_dataset_without_extension_fields_omits_them() -> None:
+    """When the golden-set example has no json_schema / expected_fields /
+    extension fields, the expectations dict is unchanged (additive contract)."""
+    from anvil.eval.runner import _build_dataset
+
+    examples = [
+        {
+            "example_id": "g1",
+            "query": "q1",
+            "category": "direct",
+            "expected_doc_ids": [],
+            "reference_answer": "x",
+            "should_refuse": False,
+            "expected_citations": [],
+            "must_include": ["x"],
+            "must_not_include": [],
+            "notes_for_judge": "",
+        }
+    ]
+    rows = _build_dataset(examples)
+    assert "json_schema" not in rows[0]["expectations"]
+    assert "expected_fields" not in rows[0]["expectations"]

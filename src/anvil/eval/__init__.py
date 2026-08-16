@@ -12,6 +12,7 @@ the optimizer or git.
 
 from anvil.eval.cache import (
     CachedBaseline,
+    compute_scorer_fingerprint,
     is_compatible,
     load_baseline,
     report_to_baseline,
@@ -24,6 +25,7 @@ __all__ = [
     "CachedBaseline",
     "EvalReport",
     "build_scorers",
+    "compute_scorer_fingerprint",
     "evaluate_branch",
     "is_compatible",
     "load_baseline",

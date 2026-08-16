@@ -44,6 +44,7 @@ REQUIRED_FIELDS = [
     "per_bucket",
     "n_examples",
     "mlflow_run_id",
+    "scorer_fingerprint",
 ]
 
 _SHA = "a" * 40
@@ -80,6 +81,10 @@ def _fake_report() -> EvalReport:
         scorers=["correctness", "retrieval_groundedness", "refusal_appropriateness"],
         evaluated_at="2026-08-16T12:00:00+00:00",
         trace_ids=["t0", "t1"],
+        scorer_fingerprint=(
+            '[{"check_function": null, "name": "correctness", '
+            '"type": "llm", "weight": 1.0}]'
+        ),
     )
 
 
@@ -113,6 +118,7 @@ def test_report_to_baseline_maps_all_fields() -> None:
     assert baseline.aggregate == report.aggregate
     assert baseline.per_judge == report.per_judge
     assert baseline.per_bucket == report.per_bucket
+    assert baseline.scorer_fingerprint == report.scorer_fingerprint
 
     # Fields sourced from the caller (git + config), not the report.
     assert baseline.scaffold_commit_sha == _SHA
@@ -213,6 +219,7 @@ def test_generated_baseline_has_all_required_fields() -> None:
     assert dumped["per_bucket"]
     assert dumped["n_examples"] == 8
     assert dumped["mlflow_run_id"]
+    assert dumped["scorer_fingerprint"]
 
 
 def test_generated_baseline_json_round_trips(tmp_path: Path) -> None:
@@ -364,3 +371,208 @@ def test_build_baseline_forwards_explicit_runtime_config_path(
     # the cache header and the forwarded eval config are consistent.
     assert baseline.runtime_endpoint == custom_runtime
     assert baseline.judge_endpoint == custom_judge
+
+
+# ---------------------------------------------------------------------------
+# 6. Scorer-config fingerprint — baseline invalidation on config change.
+# ---------------------------------------------------------------------------
+
+
+def test_compute_scorer_fingerprint_is_stable() -> None:
+    """The same scorer configs always produce the same fingerprint
+    (sorted by name, deterministic JSON)."""
+    from anvil.eval.cache import compute_scorer_fingerprint
+    from anvil.runtime.models import ScorerConfig
+
+    configs = [
+        ScorerConfig(name="retrieval_groundedness"),
+        ScorerConfig(name="correctness"),
+        ScorerConfig(name="refusal_appropriateness"),
+    ]
+    fp1 = compute_scorer_fingerprint(configs)
+    fp2 = compute_scorer_fingerprint(list(reversed(configs)))
+    # Order-independent — the list is sorted by name internally.
+    assert fp1 == fp2
+
+
+def test_compute_scorer_fingerprint_changes_with_weight() -> None:
+    """A weight change must invalidate the fingerprint — this is the
+    core fix for the comparability hole."""
+    from anvil.eval.cache import compute_scorer_fingerprint
+    from anvil.runtime.models import ScorerConfig
+
+    uniform = [ScorerConfig(name="correctness", weight=1.0)]
+    weighted = [ScorerConfig(name="correctness", weight=0.5)]
+    assert compute_scorer_fingerprint(uniform) != compute_scorer_fingerprint(weighted)
+
+
+def test_compute_scorer_fingerprint_changes_with_check_function() -> None:
+    """A check_function swap must invalidate the fingerprint."""
+    from anvil.eval.cache import compute_scorer_fingerprint
+    from anvil.runtime.models import ScorerConfig
+
+    a = [ScorerConfig(name="exact_match", type="programmatic", check_function="exact_match")]
+    b = [ScorerConfig(name="exact_match", type="programmatic", check_function="must_include_check")]
+    assert compute_scorer_fingerprint(a) != compute_scorer_fingerprint(b)
+
+
+def test_compute_scorer_fingerprint_changes_with_type() -> None:
+    """A type change (llm → programmatic) must invalidate the fingerprint."""
+    from anvil.eval.cache import compute_scorer_fingerprint
+    from anvil.runtime.models import ScorerConfig
+
+    llm = [ScorerConfig(name="x", type="llm")]
+    prog = [ScorerConfig(name="x", type="programmatic", check_function="exact_match")]
+    assert compute_scorer_fingerprint(llm) != compute_scorer_fingerprint(prog)
+
+
+def test_compute_scorer_fingerprint_same_for_identical_configs() -> None:
+    """Two configs with identical specs produce the same fingerprint."""
+    from anvil.eval.cache import compute_scorer_fingerprint
+    from anvil.runtime.models import ScorerConfig
+
+    a = [ScorerConfig(name="correctness", weight=0.4)]
+    b = [ScorerConfig(name="correctness", weight=0.4)]
+    assert compute_scorer_fingerprint(a) == compute_scorer_fingerprint(b)
+
+
+def test_is_compatible_rejects_fingerprint_mismatch() -> None:
+    """A baseline cached with uniform weights must NOT be compatible
+    with a run using weighted scorers, even if the names match."""
+    from anvil.eval.cache import CachedBaseline, is_compatible
+
+    baseline = CachedBaseline(
+        scaffold_commit_sha=_SHA,
+        evaluated_at="2026-01-01T00:00:00+00:00",
+        mode="quick",
+        scorers=["correctness"],
+        runtime_endpoint=_RUNTIME,
+        judge_endpoint=_JUDGE,
+        aggregate=0.8,
+        scorer_fingerprint='[{"name": "correctness", "type": "llm", "weight": 1.0, "check_function": null}]',
+    )
+    assert not is_compatible(
+        baseline,
+        mode="quick",
+        scorers=["correctness"],
+        runtime_endpoint=_RUNTIME,
+        judge_endpoint=_JUDGE,
+        scorer_fingerprint='[{"name": "correctness", "type": "llm", "weight": 0.5, "check_function": null}]',
+    )
+
+
+def test_is_compatible_accepts_matching_fingerprint() -> None:
+    from anvil.eval.cache import CachedBaseline, is_compatible
+
+    fp = '[{"name": "correctness", "type": "llm", "weight": 1.0, "check_function": null}]'
+    baseline = CachedBaseline(
+        scaffold_commit_sha=_SHA,
+        evaluated_at="2026-01-01T00:00:00+00:00",
+        mode="quick",
+        scorers=["correctness"],
+        runtime_endpoint=_RUNTIME,
+        judge_endpoint=_JUDGE,
+        aggregate=0.8,
+        scorer_fingerprint=fp,
+    )
+    assert is_compatible(
+        baseline,
+        mode="quick",
+        scorers=["correctness"],
+        runtime_endpoint=_RUNTIME,
+        judge_endpoint=_JUDGE,
+        scorer_fingerprint=fp,
+    )
+
+
+def test_is_compatible_skips_fingerprint_when_cached_empty() -> None:
+    """A baseline with an empty fingerprint (written before the field
+    existed) skips the fingerprint check for backward compat."""
+    from anvil.eval.cache import CachedBaseline, is_compatible
+
+    baseline = CachedBaseline(
+        scaffold_commit_sha=_SHA,
+        evaluated_at="2026-01-01T00:00:00+00:00",
+        mode="quick",
+        scorers=["correctness"],
+        runtime_endpoint=_RUNTIME,
+        judge_endpoint=_JUDGE,
+        aggregate=0.8,
+        scorer_fingerprint="",
+    )
+    assert is_compatible(
+        baseline,
+        mode="quick",
+        scorers=["correctness"],
+        runtime_endpoint=_RUNTIME,
+        judge_endpoint=_JUDGE,
+        scorer_fingerprint='[{"name": "correctness", "type": "llm", "weight": 0.5, "check_function": null}]',
+    )
+
+
+def test_is_compatible_skips_fingerprint_when_current_empty() -> None:
+    """An empty current fingerprint also skips the check."""
+    from anvil.eval.cache import CachedBaseline, is_compatible
+
+    baseline = CachedBaseline(
+        scaffold_commit_sha=_SHA,
+        evaluated_at="2026-01-01T00:00:00+00:00",
+        mode="quick",
+        scorers=["correctness"],
+        runtime_endpoint=_RUNTIME,
+        judge_endpoint=_JUDGE,
+        aggregate=0.8,
+        scorer_fingerprint='[{"name": "correctness", "type": "llm", "weight": 1.0, "check_function": null}]',
+    )
+    assert is_compatible(
+        baseline,
+        mode="quick",
+        scorers=["correctness"],
+        runtime_endpoint=_RUNTIME,
+        judge_endpoint=_JUDGE,
+        scorer_fingerprint="",
+    )
+
+
+def test_cached_baseline_fingerprint_round_trips(tmp_path: Path) -> None:
+    """The fingerprint survives a save → load cycle."""
+    from anvil.eval.cache import save_baseline, load_baseline
+
+    fp = '[{"name": "correctness", "type": "llm", "weight": 1.0, "check_function": null}]'
+    baseline = _baseline_from_fake()
+    baseline = CachedBaseline(
+        scaffold_commit_sha=baseline.scaffold_commit_sha,
+        evaluated_at=baseline.evaluated_at,
+        mode=baseline.mode,
+        scorers=baseline.scorers,
+        runtime_endpoint=baseline.runtime_endpoint,
+        judge_endpoint=baseline.judge_endpoint,
+        aggregate=baseline.aggregate,
+        per_judge=baseline.per_judge,
+        per_bucket=baseline.per_bucket,
+        n_examples=baseline.n_examples,
+        mlflow_run_id=baseline.mlflow_run_id,
+        scorer_fingerprint=fp,
+    )
+    save_baseline(tmp_path, baseline)
+    loaded = load_baseline(tmp_path)
+    assert loaded is not None
+    assert loaded.scorer_fingerprint == fp
+
+
+def test_cached_baseline_from_dict_handles_missing_fingerprint() -> None:
+    """A baseline JSON written before the fingerprint field existed
+    loads with an empty fingerprint (backward compat)."""
+    from anvil.eval.cache import CachedBaseline
+
+    raw = {
+        "scaffold_commit_sha": _SHA,
+        "evaluated_at": "2026-01-01T00:00:00+00:00",
+        "mode": "quick",
+        "scorers": ["correctness"],
+        "runtime_endpoint": _RUNTIME,
+        "judge_endpoint": _JUDGE,
+        "aggregate": 0.8,
+    }
+    baseline = CachedBaseline.from_dict(raw)
+    assert baseline.scorer_fingerprint == ""
