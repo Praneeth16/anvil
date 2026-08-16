@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,29 @@ def test_import_failure_raises_validation_error(tmp_path: Path) -> None:
     path = _candidate(tmp_path, "raise RuntimeError('broken candidate')\n")
 
     with pytest.raises(CodeValidationError, match="failed to import.*broken candidate"):
+        validate_imports(path)
+
+
+@pytest.mark.parametrize("exception", [KeyboardInterrupt, SystemExit])
+def test_validate_imports_propagates_process_control_exceptions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exception: type[BaseException]
+) -> None:
+    path = _candidate(tmp_path, "VALUE = 42\n")
+
+    class FakeLoader:
+        def create_module(self, spec: ModuleSpec) -> None:
+            return None
+
+        def exec_module(self, module: object) -> None:
+            raise exception
+
+    spec = ModuleSpec("candidate", FakeLoader())
+    monkeypatch.setattr(
+        "anvil.optimizer.code_validation.importlib.util.spec_from_file_location",
+        lambda *_args: spec,
+    )
+
+    with pytest.raises(exception):
         validate_imports(path)
 
 
@@ -70,12 +94,22 @@ def test_ast_denylist_rejects_forbidden_string_literals(
     [
         "import test_helpers\n",
         "from eval_runner import score\n",
-        "import private_solution\n",
+        "import solution\n",
     ],
 )
 def test_ast_denylist_rejects_forbidden_imports(tmp_path: Path, source: str) -> None:
     with pytest.raises(CodeValidationError, match="forbidden import"):
         check_ast_denylist(_candidate(tmp_path, source))
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["import resolution\n", "from absolution import x\n", "import dissolution\n"],
+)
+def test_ast_denylist_import_terms_use_word_boundaries(
+    tmp_path: Path, source: str
+) -> None:
+    check_ast_denylist(_candidate(tmp_path, source))
 
 
 @pytest.mark.parametrize(

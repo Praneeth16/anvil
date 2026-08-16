@@ -40,8 +40,11 @@ def _forbidden_string(value: str) -> str | None:
 
 def _forbidden_import(module_name: str) -> bool:
     name = module_name.lower()
-    return name.startswith(FORBIDDEN_IMPORT_PREFIXES) or any(
-        term in name for term in FORBIDDEN_IMPORT_TERMS
+    if name.startswith(FORBIDDEN_IMPORT_PREFIXES):
+        return True
+    return any(
+        re.search(rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])", name)
+        for term in FORBIDDEN_IMPORT_TERMS
     )
 
 
@@ -95,7 +98,9 @@ def validate_imports(file_path: Path | str) -> None:
             spec.loader.exec_module(module)
     except CodeValidationError:
         raise
-    except BaseException as exc:
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
         raise CodeValidationError(
             f"code candidate {path} failed to import: {exc.__class__.__name__}: {exc}"
         ) from exc
