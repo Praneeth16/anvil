@@ -131,9 +131,27 @@ def run_round(
     # 3. Apply the action (writes scaffold files, edits harness.yaml).
     apply_result = apply_action(action, scaffold_root, mode=mode, repo_root=repo_root)
 
-    # 4. Commit (no-op if nothing changed, e.g. noop action).
-    commit_message = f"round {round_id:03d}: {apply_result.action_summary or 'noop'}"
-    commit_sha = commit_all(repo_root, message=commit_message)
+    # 4. Commit the mutation — but only when the applier actually wrote
+    # something. A parse-failure noop (parse_status=no_block) collapses
+    # to a NoopAction whose applier writes no files; committing on the
+    # resulting empty index exits non-zero ("no changes added to commit")
+    # and aborts the whole multi-round run. Detect no-change explicitly
+    # from the applier's file lists (the robust signal) rather than
+    # relying on the commit failing, and record the parent SHA instead.
+    # ``commit_all`` is itself hardened against an empty index, so a
+    # real mutation whose written content is byte-identical to HEAD
+    # (files_changed populated but nothing staged) still returns the
+    # current SHA instead of raising.
+    applied_change = bool(
+        apply_result.files_added
+        or apply_result.files_changed
+        or apply_result.files_removed
+    )
+    if applied_change:
+        commit_message = f"round {round_id:03d}: {apply_result.action_summary or 'noop'}"
+        commit_sha = commit_all(repo_root, message=commit_message)
+    else:
+        commit_sha = current_sha(repo_root)
 
     # 5. Persist transcript (debug aid; not the critique md yet).
     transcript_path = repo_root / "scaffold" / "memory" / f"round_{round_id:03d}_transcript.md"
