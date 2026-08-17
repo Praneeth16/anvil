@@ -21,6 +21,7 @@ class GitError(RuntimeError):
 class GitResult:
     stdout: str
     stderr: str
+    returncode: int
 
 
 def _run(repo_root: Path | str, args: list[str], *, check: bool = True) -> GitResult:
@@ -37,7 +38,11 @@ def _run(repo_root: Path | str, args: list[str], *, check: bool = True) -> GitRe
             f"  stdout: {proc.stdout.strip()}\n"
             f"  stderr: {proc.stderr.strip()}"
         )
-    return GitResult(stdout=proc.stdout.strip(), stderr=proc.stderr.strip())
+    return GitResult(
+        stdout=proc.stdout.strip(),
+        stderr=proc.stderr.strip(),
+        returncode=proc.returncode,
+    )
 
 
 def current_branch(repo_root: Path | str) -> str:
@@ -64,9 +69,24 @@ def has_staged_changes(repo_root: Path | str) -> bool:
     so :func:`commit_all` can decide whether ``git commit`` has anything
     to commit without risking a non-zero exit on an empty index
     (``"no changes added to commit"``).
+
+    Uses ``git diff --cached --quiet``, whose exit code distinguishes
+    the three outcomes: ``0`` = no staged changes (index matches HEAD),
+    ``1`` = staged changes present, ``>1`` = a real git error. Only the
+    legitimate empty-index case (exit ``0`` / ``1``) is mapped to a bool;
+    any higher exit is raised as :class:`GitError` so a real git failure
+    is not silently masked as "no staged changes" (the risk of the
+    previous ``check=False`` + ``bool(stdout)`` form).
     """
-    res = _run(repo_root, ["diff", "--cached", "--name-only"], check=False)
-    return bool(res.stdout)
+    res = _run(repo_root, ["diff", "--cached", "--quiet"], check=False)
+    if res.returncode == 0:
+        return False  # index matches HEAD — nothing staged
+    if res.returncode == 1:
+        return True  # staged differences present
+    raise GitError(
+        f"git diff --cached --quiet failed (exit {res.returncode}):\n"
+        f"  stdout: {res.stdout}\n  stderr: {res.stderr}"
+    )
 
 
 def check_clean_worktree() -> None:
