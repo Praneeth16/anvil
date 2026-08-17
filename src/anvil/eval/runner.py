@@ -488,9 +488,10 @@ def _load_memory_system(
 _MLFLOW_MAX_WORKERS_ENV = "MLFLOW_GENAI_EVAL_MAX_WORKERS"
 
 # Name of the per-row root span ``evaluate_branch`` wraps every
-# ``predict_fn`` invocation in. See ``evaluate_branch`` for why this is
-# required (mlflow.genai.evaluate crashes reading ``eval_item.trace.info``
-# when a row yields no trace).
+# ``predict_fn`` invocation in. The span yields a real per-row trace
+# carrying the ``RETRIEVER`` span that ``RetrievalGroundedness`` scores;
+# ``_resilient_eval_harness`` (PR #21) is the safety net that prevents a
+# crash if a row's trace is still None. See ``evaluate_branch``.
 _PREDICT_SPAN_NAME = "anvil.predict"
 
 
@@ -747,33 +748,30 @@ def evaluate_branch(
         )
 
         def predict_fn(query: str, **_kwargs: Any) -> str:
-            # Guarantee a per-row trace so ``mlflow.genai.evaluate``'s
-            # harness never sees ``eval_item.trace`` is None. The harness
-            # retrieves each row's trace via ``mlflow.get_trace(request_id)``
-            # and, when ``predict_fn`` is supplied, has NO fallback to a
-            # minimal trace — so a row that yields no span leaves
-            # ``eval_item.trace`` None and crashes in
-            # ``_get_new_expectations`` reading ``trace.info.assessments``
-            # (``AttributeError: 'NoneType' object has no attribute 'info'``).
+            # Wrap each row in an explicit root CHAIN span so the row
+            # yields a real per-row trace carrying the ``RETRIEVER`` span
+            # that ``RetrievalGroundedness`` scores. The harness retrieves
+            # each row's trace via ``mlflow.get_trace(request_id)``; without
+            # this span a row can leave ``eval_item.trace`` None.
             #
-            # The runtime agent previously relied on
-            # ``mlflow.openai.autolog`` (``enable_runtime_tracing``) to
-            # produce that trace from ``chat.completions.create``. That is
-            # fragile: ``AnvilAgent.predict`` calls ``tag_current_trace``
-            # (``mlflow.update_current_trace``) before any chat call, when
-            # no span is active — the "No active trace found" warning — and
-            # on the live backend the autolog trace was not retrievable by
-            # the row's request id, so rows had no trace and the eval
-            # crashed partway through.
+            # ``_resilient_eval_harness`` (PR #21) is the safety net: it
+            # makes ``_get_new_expectations`` None-safe and falls back to a
+            # minimal trace, so a None-trace row no longer crashes the run.
+            # But the minimal trace lacks the ``RETRIEVER`` span, so
+            # ``RetrievalGroundedness`` is degraded for those rows — this
+            # span remains the primary guarantee.
             #
-            # This root CHAIN span fixes all three: it always yields a
-            # per-row trace (found by ``get_trace`` regardless of autolog);
-            # it gives ``tag_current_trace`` an active trace to tag (the
-            # warning disappears); and it nests autolog's CHAT_MODEL spans
-            # and the ``search_knowledge_base`` RETRIEVER span under one
-            # coherent per-row trace, which ``RetrievalGroundedness`` reads.
-            # The span ends (and the trace exports) when the ``with`` block
-            # exits — async logging is disabled during eval
+            # It also supersedes the fragile ``mlflow.openai.autolog`` path
+            # (``enable_runtime_tracing``): ``AnvilAgent.predict`` calls
+            # ``tag_current_trace`` (``mlflow.update_current_trace``) before
+            # any chat call, when no span is active — the "No active trace
+            # found" warning — and on the live backend the autolog trace was
+            # not retrievable by the row's request id. This root span gives
+            # ``tag_current_trace`` an active trace to tag (the warning
+            # disappears) and nests autolog's CHAT_MODEL spans and the
+            # ``search_knowledge_base`` RETRIEVER span under one coherent
+            # per-row trace. The span ends (and the trace exports) when the
+            # ``with`` block exits — async logging is disabled during eval
             # (``is_evaluate=True``), so the trace is available immediately.
             with mlflow.start_span(name=_PREDICT_SPAN_NAME, span_type=SpanType.CHAIN) as span:
                 span.set_inputs({"query": query})

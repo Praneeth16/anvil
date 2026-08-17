@@ -190,13 +190,16 @@ def build_databricks_client(
     profile: str | None = None,
     **kwargs: Any,
 ) -> GatewayClient:
-    """Backward-compatible wrapper — delegates to the AI Gateway client.
+    """Backward-compatible wrapper — delegates to :func:`build_gateway_client`.
 
-    When ``profile`` is set, it is written to
-    ``DATABRICKS_CONFIG_PROFILE`` so the SDK reads the profile's host
-    and credentials from ~/.databrickscfg. This preserves the behavioral
-    contract of the legacy ``build_databricks_client(profile=...)``
-    call.
+    The gateway client resolves host and token from the environment /
+    Databricks SDK config (``DATABRICKS_HOST``, ``~/.databrickscfg``,
+    ``DATABRICKS_CONFIG_PROFILE``), so production callers use
+    :func:`build_gateway_client` directly. This wrapper is retained for
+    callers (and tests) that select a profile positionally: when
+    ``profile`` is set it writes it to ``DATABRICKS_CONFIG_PROFILE``
+    before delegating, so the SDK reads that profile's host and
+    credentials from ~/.databrickscfg.
     """
     if profile:
         os.environ["DATABRICKS_CONFIG_PROFILE"] = profile

@@ -20,8 +20,10 @@ The runner expects:
 * The repo's parent branch (default ``anvil/exp``) to exist.
 * ``eval/runs/baseline.json`` to be cached (run
   ``scripts/evaluate.py --mode full`` first if missing).
-* ``ANTHROPIC_AUTH_TOKEN`` either in env or as a Databricks secret
-  ``anvil/anthropic_auth_token`` on the configured profile.
+* Optimizer auth is handled automatically by Claude Code via the
+  Databricks CLI (``CLAUDE_CODE_USE_GATEWAY=1``), using the active
+  profile / ``DATABRICKS_HOST`` — no secret is required. An operator
+  may set ``ANTHROPIC_AUTH_TOKEN`` in the env as an optional override.
 """
 
 from __future__ import annotations
