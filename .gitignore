@@ -36,6 +36,12 @@ Thumbs.db
 traces/
 # local MLflow store (when running detached)
 mlruns/
+# sqlite tracking backend created by the offline test suite
+mlflow.db
+# coverage artifacts
+.coverage
+coverage.xml
+htmlcov/
 
 # Eval artifacts: round_NNN.json + .md are checked in deliberately;
 # any *.tmp.json or scratch/ output stays out.

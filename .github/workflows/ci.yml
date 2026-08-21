@@ -1,0 +1,45 @@
+name: CI
+
+# Offline by design: no credentials, no network calls to Databricks, no LLM
+# calls. The whole suite must pass on a laptop with the wifi off. Live tests
+# are marked `live`, deselected by default, and run from live.yml instead.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # --locked fails if uv.lock has drifted from pyproject.toml, which is
+      # how the lock stays meaningful rather than decorative.
+      - name: Install dependencies
+        run: uv sync --locked --extra dev --extra optimizer
+
+      - name: Lint
+        run: uv run ruff check --output-format=github .
+
+      - name: Type-check
+        run: uv run mypy
+
+      # Floor is the measured value at the time this gate landed (79%), minus a
+      # point of slack. Ratchet it up; never down.
+      - name: Test
+        run: uv run pytest --cov --cov-report=term-missing --cov-fail-under=78
