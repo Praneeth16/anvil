@@ -77,7 +77,15 @@ eval:
   # Permit the one-time held-out evaluation performed by scripts/finalize.py.
   held_out_test: true
   # Default mode for `evaluate_branch`. One of: quick, standard, full.
-  default_mode: quick
+  #
+  # `standard` (12 rows), not `quick` (8), because two healthy 8-row runs of the
+  # SAME scaffold differed by ~0.15 of aggregate from judge noise alone (see
+  # docs/design/failure-vs-error.md) while `gate.epsilon` is 0.0 — so at 8 rows
+  # the gate reads noise of that size as signal. This must also match the mode
+  # `eval/runs/baseline.json` was generated at: the round path compares against
+  # the cached aggregate without checking the modes agree, so a mismatch would
+  # silently compare a 12-row mean against an 8-row one.
+  default_mode: standard
   # Anti-overfit data split. When enabled, the golden set is partitioned
   # into train (reserved for optimizer-visible use; currently not scored),
   # dev (round-by-round eval), and test (held-out finalization only). Split is

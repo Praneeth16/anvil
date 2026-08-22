@@ -566,6 +566,15 @@ def _aggregate_report(
         nums = [v for v in values if v is not None]
         return sum(nums) / len(nums) if nums else 0.0
 
+    def _optional_mean(values: list[float | None]) -> float | None:
+        """``_mean``, but ``None`` rather than ``0.0`` when nothing contributed.
+
+        Where a caller can represent "no measurement", 0.0 is the wrong sentinel:
+        it is a real score, and a low one.
+        """
+        nums = [v for v in values if v is not None]
+        return sum(nums) / len(nums) if nums else None
+
     per_judge: dict[str, float] = {}
     for name in scorer_names:
         metric_key = f"{name}/mean"
@@ -620,9 +629,25 @@ def _aggregate_report(
             bucket_rows[category].append(i)
     per_bucket: dict[str, dict[str, float]] = {}
     for bucket, idxs in bucket_rows.items():
-        per_bucket[bucket] = {
-            name: _mean([per_judge_rows[name][i] for i in idxs]) for name in scorer_names
+        # A scorer with no scored row in this bucket is OMITTED, not reported as
+        # 0.0. ``_mean([])`` returns 0.0, and the same argument that keeps an
+        # all-errored bucket out of the table applies to a scorer that does not
+        # apply within one: ``out_of_scope`` rows have no ``expected_doc_ids``, so
+        # groundedness has no verdict there -- and it was being published as
+        # ``out_of_scope: {retrieval_groundedness: 0.0}``, indistinguishable from
+        # "the agent is completely ungrounded on refusals".
+        #
+        # This is not cosmetic. ``prompts/anvil-round.md`` tells the optimizer to
+        # "target a failure cluster you can read in the parent baseline's
+        # per_bucket", so a fabricated 0.0 aims the next mutation at making the
+        # agent retrieve on questions it is supposed to refuse -- against the
+        # refusal scorer, which is also in the aggregate.
+        scored = {
+            name: value
+            for name in scorer_names
+            if (value := _optional_mean([per_judge_rows[name][i] for i in idxs])) is not None
         }
+        per_bucket[bucket] = scored
 
     failures: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []

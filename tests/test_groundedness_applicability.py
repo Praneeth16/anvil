@@ -450,6 +450,55 @@ def test_per_judge_counts_separate_scored_errored_and_abstained_rows() -> None:
     assert report.per_judge["retrieval_groundedness"] == pytest.approx(0.5)
 
 
+def test_a_bucket_omits_a_scorer_that_does_not_apply_within_it() -> None:
+    """Found in the regenerated baseline, and the same bug in the output the
+    optimizer steers by.
+
+    ``_mean([])`` returns 0.0, so the ``out_of_scope`` bucket published
+    ``retrieval_groundedness: 0.0`` — indistinguishable from "completely
+    ungrounded on refusals" — for rows that have no groundedness verdict at all.
+    ``prompts/anvil-round.md`` tells the optimizer to target a failure cluster it
+    reads in ``per_bucket``, so that fabricated zero aims the next mutation at
+    making the agent retrieve on questions it is supposed to refuse.
+    """
+    from anvil.eval.runner import _aggregate_report
+
+    df = pd.DataFrame(
+        {
+            "trace_id": ["t0", "t1"],
+            "correctness/value": [1.0, 0.0],
+            "retrieval_groundedness/value": ["yes", None],
+            "assessments": [
+                [
+                    _value_assessment("correctness", 1.0),
+                    _value_assessment("retrieval_groundedness", "yes"),
+                ],
+                [_value_assessment("correctness", 0.0)],
+            ],
+        }
+    )
+    examples = [
+        _gold("g0", expected_doc_ids=["d"]),
+        _gold("g1", expected_doc_ids=[], should_refuse=True),
+    ]
+    report = _aggregate_report(
+        result_df=df,
+        metrics={},
+        scorer_names=["correctness", "retrieval_groundedness"],
+        aggregate_scorer_names=["correctness", "retrieval_groundedness"],
+        weights={"correctness": 1.0, "retrieval_groundedness": 1.0},
+        examples=examples,
+        run_id="run-1",
+        experiment_id="exp-1",
+        mode="quick",
+    )
+    assert "retrieval_groundedness" not in report.per_bucket["out_of_scope"], (
+        "a scorer with no verdict in a bucket must be absent, not 0.0"
+    )
+    assert report.per_bucket["out_of_scope"]["correctness"] == pytest.approx(0.0)
+    assert report.per_bucket["direct"]["retrieval_groundedness"] == pytest.approx(1.0)
+
+
 def test_scorer_errors_are_recorded_with_the_case_they_broke_on() -> None:
     """A count alone does not survive contact with debugging six rounds later."""
     report = _report_with_groundedness(
