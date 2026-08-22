@@ -10,10 +10,11 @@ Usage::
 Persists the report to ``eval/runs/round_NNN.json`` (or to the path
 given by ``--out``).
 
-Exit status (see :mod:`anvil.cli`): ``0`` every case assessed and met its
-expectations, ``1`` cases assessed and some did not, ``2`` the error rate was
-above ``eval.max_error_rate`` so the run did not measure the agent, ``130``
-interrupted.
+Exit status (see :mod:`anvil.cli`): ``0`` the run measured the agent, ``1``
+cases were assessed and some did not meet expectations (opt-in, via
+``--gate-on-failures``), ``2`` the run did not measure the agent -- too many
+cases errored, too few were assessed, or an error could not be excluded --
+``130`` interrupted.
 """
 
 from __future__ import annotations
@@ -27,7 +28,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from anvil.cli import exit_code_for_report, run_cli  # noqa: E402
+from anvil.cli import ExitCode, exit_code_for_report, run_cli  # noqa: E402
+from anvil.eval.judgeability import unjudgeable_reason_for  # noqa: E402
 from anvil.eval.runner import evaluate_branch  # noqa: E402
 from anvil.runtime.loader import load_eval_config  # noqa: E402
 
@@ -60,6 +62,16 @@ def _arg_parser() -> argparse.ArgumentParser:
         "--label",
         default="",
         help="free-form label to embed in the output JSON",
+    )
+    p.add_argument(
+        "--gate-on-failures",
+        action="store_true",
+        help=(
+            "exit 1 when any case did not meet its expectations. Off by default: "
+            "almost every real eval has some case below 1.0, so gating on it "
+            "would abort any set -e wrapper around the documented invocation. "
+            "Exit 2 for an unjudgeable run is always on."
+        ),
     )
     return p
 
@@ -110,10 +122,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"== written to: {out_path}")
     print(f"== mlflow run: {report.run_id}")
 
-    max_error_rate = load_eval_config(args.scaffold).max_error_rate
-    code = exit_code_for_report(report, max_error_rate=max_error_rate)
-    if code:
-        print(f"== exit {int(code)}: {len(report.failures)} failed, {report.n_errors} errored")
+    eval_config = load_eval_config(args.scaffold)
+    code = exit_code_for_report(
+        report, eval_config=eval_config, gate_on_failures=args.gate_on_failures
+    )
+    if code == ExitCode.ERROR:
+        print(f"== exit 2: {unjudgeable_reason_for(report, eval_config)}")
+    elif code:
+        print(f"== exit {int(code)}: {len(report.failures)} case(s) below expectation")
     return int(code)
 
 

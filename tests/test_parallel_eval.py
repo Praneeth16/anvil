@@ -423,6 +423,82 @@ def test_run_predictions_interrupt_accounts_for_every_row(n_workers: int) -> Non
     assert not isinstance(exc.value, Exception)
 
 
+def test_run_predictions_survives_a_main_thread_interrupt() -> None:
+    """The real Ctrl-C path, which the worker-raises tests do not reach.
+
+    A SIGINT is delivered to the *main* thread while it is blocked in
+    ``as_completed``, not to a worker. That is the path that then cancels
+    unstarted rows, waits for the in-flight ones, and rebuilds the slots — so
+    without this test the drain logic is exercised only via ``future.result()``
+    re-raising, which enters it from a different direction.
+    """
+    from concurrent import futures as _futures
+
+    from anvil.eval import runner
+    from anvil.eval.outcome import RunInterrupted
+    from anvil.eval.runner import _run_predictions_parallel
+
+    real_as_completed = _futures.as_completed
+
+    def _interrupting_as_completed(fs, timeout=None):
+        # Yield the first completed future, then interrupt the main thread
+        # exactly as a SIGINT would.
+        for i, future in enumerate(real_as_completed(fs, timeout=timeout)):
+            yield future
+            if i == 0:
+                raise KeyboardInterrupt
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(runner, "as_completed", _interrupting_as_completed)
+        with pytest.raises(RunInterrupted) as exc:
+            _run_predictions_parallel(
+                lambda q: f"ok-{q}", [f"q{i}" for i in range(12)], n_workers=2
+            )
+
+    records = exc.value.records
+    assert len(records) == 12, "every row is accounted for after a main-thread SIGINT"
+    assert {str(r.outcome) for r in records} <= {"ok", "interrupted"}
+    assert any(r.outcome == "ok" for r in records), "finished work is kept, not discarded"
+
+
+def test_run_predictions_second_interrupt_still_returns_records() -> None:
+    """A second Ctrl-C abandons the wait but keeps the records.
+
+    The in-flight wait is unbounded — there is no per-case timeout and the HTTP
+    client's default deadline is 600s — so an operator facing an apparent hang
+    will press Ctrl-C again. If that raised out of ``shutdown`` the collected
+    records would be thrown away, breaking the one guarantee ``RunInterrupted``
+    makes. Simulated by making ``shutdown`` itself raise, which is what a SIGINT
+    arriving during the join does.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from anvil.eval import runner
+    from anvil.eval.outcome import RunInterrupted
+    from anvil.eval.runner import _run_predictions_parallel
+
+    real_shutdown = ThreadPoolExecutor.shutdown
+    raised = {"count": 0}
+
+    def _shutdown(self, wait=True, **kwargs):
+        if wait and not raised["count"]:
+            raised["count"] += 1
+            raise KeyboardInterrupt
+        return real_shutdown(self, wait=wait, **kwargs)
+
+    def _interrupting_as_completed(fs, timeout=None):
+        raise KeyboardInterrupt
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(runner, "as_completed", _interrupting_as_completed)
+        mp.setattr(ThreadPoolExecutor, "shutdown", _shutdown)
+        with pytest.raises(RunInterrupted) as exc:
+            _run_predictions_parallel(lambda q: q, ["a", "b", "c"], n_workers=2)
+
+    assert raised["count"] == 1, "the second interrupt was actually simulated"
+    assert len(exc.value.records) == 3
+
+
 def test_run_predictions_interrupt_marks_the_unreached_rows_sequentially() -> None:
     """The sequential path pins down the exact marking the parallel path
     can only be asserted loosely about: rows before the interrupt keep

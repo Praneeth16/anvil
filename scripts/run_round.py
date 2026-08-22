@@ -124,7 +124,8 @@ def main(argv: list[str] | None = None) -> int:
 
     next_id = args.round_id if args.round_id is not None else _next_round_id(REPO_ROOT)
 
-    unjudged = 0
+    unjudged: list[str] = []
+    escaped: list[str] = []
     for i in range(args.rounds):
         rid = next_id + i
         print(f"\n=== round {rid} ===")
@@ -137,17 +138,42 @@ def main(argv: list[str] | None = None) -> int:
             max_turns=args.max_turns,
         )
         if report.decision == Decision.INFRA_FAIL:
-            unjudged += 1
+            # Both a throttled gateway and an optimizer writing outside its
+            # writable scope land as INFRA_FAIL, and they are not remotely the
+            # same event: one is a bad afternoon, the other is the session
+            # reaching for its own grader, which this repo treats as a security
+            # property. A caller reading only the exit status cannot tell them
+            # apart, so at minimum they are separated on stderr.
+            if report.notes.startswith("scope violation"):
+                escaped.append(f"round {rid}: {report.notes}")
+            else:
+                unjudged.append(f"round {rid}: {report.notes or 'eval failed'}")
         print(
             f"=== round {rid} done · {report.decision} · "
             f"action={report.action_kind} · Δ={report.score_delta}\n"
         )
 
+    if escaped:
+        print(
+            f"\nSCOPE VIOLATION in {len(escaped)}/{args.rounds} round(s) — the optimizer "
+            "wrote outside its writable scope. This is not a flaky endpoint; treat it as "
+            "a containment failure and read the round records before running more rounds:",
+            file=sys.stderr,
+        )
+        for line in escaped:
+            print(f"  {line}", file=sys.stderr)
     if unjudged:
         # A round that could not be measured is a malfunction worth surfacing to
         # whatever launched this, even though the loop kept going: it means a
         # round was spent without producing evidence about the agent.
-        print(f"WARNING: {unjudged}/{args.rounds} round(s) could not be judged (infra_fail).")
+        print(
+            f"\nUNJUDGEABLE: {len(unjudged)}/{args.rounds} round(s) produced no usable "
+            "measurement:",
+            file=sys.stderr,
+        )
+        for line in unjudged:
+            print(f"  {line}", file=sys.stderr)
+    if escaped or unjudged:
         return ExitCode.ERROR
     return ExitCode.OK
 

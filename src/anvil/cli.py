@@ -15,9 +15,16 @@ agent scored badly" from "the eval never ran" cannot automate anything on top of
 this harness. Every one of these scripts used to return ``0`` unless it hit an
 argument error, which is why none of them could be used as a CI gate.
 
-Where 1 becomes 2 is deliberately the round's own ``eval.max_error_rate``
-ceiling rather than a second threshold invented here, so a red CI run and a
-reverted round mean the same thing.
+What makes a run unusable is deliberately the round gate's own definition
+(:func:`anvil.eval.judgeability.unjudgeable_reason`) rather than a second one
+invented here, so a red CI run and a reverted round mean the same thing.
+
+``1`` is **opt-in** for an eval, via ``--gate-on-failures``. Almost every real
+eval has some case scoring below 1.0, so returning ``1`` by default would make
+the documented ``scripts/evaluate.py --mode quick`` invocation abort any
+``set -e`` wrapper and read as broken to an operator running it by hand. A status
+that fires on correct usage gets ignored, or worse, worked around. ``2`` is not
+opt-in: a run that could not measure the agent is always an error.
 """
 
 from __future__ import annotations
@@ -32,6 +39,7 @@ from anvil.eval.outcome import RunInterrupted, summarize
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle avoidance, typing only
     from anvil.eval.runner import EvalReport
+    from anvil.runtime.models import EvalConfig
 
 
 class ExitCode(IntEnum):
@@ -43,19 +51,34 @@ class ExitCode(IntEnum):
     INTERRUPTED = 130
 
 
-def exit_code_for_report(report: EvalReport, *, max_error_rate: float = 0.2) -> ExitCode:
+def exit_code_for_report(
+    report: EvalReport,
+    *,
+    eval_config: EvalConfig | None = None,
+    gate_on_failures: bool = False,
+) -> ExitCode:
     """Map an :class:`~anvil.eval.runner.EvalReport` to an exit status.
 
-    Errors outrank failures: a run that could not assess most of its cases has
+    Errors outrank failures: a run that could not assess enough of its cases has
     not measured the agent, so the failures it did record are not worth gating
-    on. Below the ceiling an errored case is excluded from the score and the run
-    is still a measurement -- reporting :attr:`ExitCode.ERROR` for every stray
-    timeout would make a flaky afternoon indistinguishable from a broken
-    harness, and a status that cries wolf gets ignored.
+    on. A run that stays inside the judgeability thresholds is still a
+    measurement even if a case errored -- reporting :attr:`ExitCode.ERROR` for
+    every stray timeout would make a flaky afternoon indistinguishable from a
+    broken harness, and a status that cries wolf gets ignored.
+
+    ``gate_on_failures`` is off by default; see the module docstring for why
+    ``1`` is opt-in and ``2`` is not.
     """
-    if report.error_rate > max_error_rate:
+    from anvil.eval.judgeability import unjudgeable_reason, unjudgeable_reason_for
+
+    reason = (
+        unjudgeable_reason_for(report, eval_config)
+        if eval_config is not None
+        else unjudgeable_reason(report)
+    )
+    if reason:
         return ExitCode.ERROR
-    if report.failures:
+    if gate_on_failures and report.failures:
         return ExitCode.FAILURES
     return ExitCode.OK
 

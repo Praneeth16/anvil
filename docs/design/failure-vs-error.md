@@ -100,12 +100,16 @@ All six steps have landed.
    whenever anything errored, since it is computed over every row including
    those. An error that cannot be joined back to a result row still counts
    toward `n_errors` (so the guard fires) and is logged as unattributable.
-5. **`eval.max_error_rate` (default `0.2`)** — above it `loop/round.py` marks
-   the round `eval_failed`, which short-circuits `gate_decision` to
-   `INFRA_FAIL` *before any frontier I/O*. So a degraded gateway can neither
-   revert a good mutation nor advance the frontier with a number that was never
-   trustworthy. `mutated_score` is still recorded: "0.41, but half the cases
-   never ran" is more useful six rounds later than a null.
+5. **`eval/judgeability.py`** — one definition of "may this report be compared
+   to anything", consumed by the round gate, the CLI exit status, baseline
+   generation, and held-out finalization. It refuses on three grounds, and the
+   second and third were found by review *after* the first shipped (see
+   "Exclusion is not enough" below). `loop/round.py` marks a refused round
+   `eval_failed`, which short-circuits `gate_decision` to `INFRA_FAIL` *before
+   any frontier I/O*. So a degraded gateway can neither revert a good mutation
+   nor advance the frontier with a number that was never trustworthy.
+   `mutated_score` is still recorded: "0.41, but half the cases never ran" is
+   more useful six rounds later than a null.
 6. **Exit codes in `anvil/cli.py`** — `0` clean, `1` assessed failures, `2`
    unusable run, `130` interrupted. `run_cli` maps `KeyboardInterrupt` and
    `RunInterrupted`, and lets `SystemExit` through so `--help` still works. The
@@ -114,6 +118,41 @@ All six steps have landed.
 
 Step 3 is the only part that touches mlflow internals, and it extends an
 interception this codebase already owns and documents.
+
+### Exclusion is not enough, and on one path it made things worse
+
+Excluding errored cases fixes the *direction* of the bias. It does not fix the
+*sample*, and code review found three consequences that the first pass missed —
+two of them regressions introduced by the exclusion itself.
+
+**An error that cannot be excluded.** The capture is keyed by `trace_id`; an
+error whose row is absent from `result_df` has no row to exclude, so its
+infrastructure zero stays in the mean. One such error in eight rows sits at an
+error rate of 0.125 — under the 0.2 ceiling — so the round would have been judged
+normally on a contaminated aggregate: the original bug, quietly reintroduced.
+`n_unattributed_errors` now makes the report unjudgeable outright, because a
+report that cannot honour its own contract must not be compared.
+
+**No floor on surviving cases.** A rate is relative, so raising
+`max_error_rate` to ride out a flaky endpoint also permits the aggregate to
+become the score of one surviving row. Seven errors in eight rows used to score
+~0.12 and be REVERTED; excluded, the same run can read 1.0 and *extend the
+frontier*, becoming the bar every later round must beat. `max_error_rate: 1.0`
+therefore reads as "restore the old behaviour" while doing something strictly
+more dangerous. `eval.min_scorable_rows` (default 4, capped at the run's own row
+count so a small smoke mode stays runnable) is the only instrument that catches
+this — no rate can express "at least N cases actually ran".
+
+**The baseline and the finalization were unguarded.** Both are worse than an
+unguarded round, and the exclusion is what made them dangerous. A baseline run
+that 429'd on six of eight rows used to produce a visibly broken ~0.25 that an
+operator would rerun; excluded, it reads the mean of the two survivors —
+*higher* than a healthy baseline and indistinguishable from one — and it is the
+frontier's seed and the bar for the whole run. Held-out finalization is worse
+still: the highest-stakes number the harness produces, run once, and write-once,
+so a degraded run locks in until someone deletes the file by hand. Both now
+refuse before writing. `CachedBaseline` also records `n_errors`, additively, so a
+cached bar can be re-read later to tell a good one from a lucky one.
 
 ### Retry on error only
 
@@ -139,3 +178,24 @@ The layer that can actually abandon the socket is the HTTP client —
 of 600s with 2 built-in retries. That is where a per-request deadline belongs.
 It changes live behaviour for the runtime agent and the judge, so it is left for
 the live lane rather than smuggled in behind an offline test.
+
+That absence has a visible consequence on the interrupt path, which review
+caught: after a Ctrl-C the in-flight rows are waited for, and that wait is
+bounded only by the 600s client default. An operator facing an apparent hang
+will press Ctrl-C again, and a second interrupt raising out of `shutdown` would
+discard every record collected — breaking the one guarantee `RunInterrupted`
+makes. So the wait is announced on stderr and a second interrupt abandons it and
+still returns the records. The abandoned threads run on until their own sockets
+time out; Python cannot cancel them, but they no longer hold the evidence
+hostage.
+
+### What is *not* on the live path
+
+`_run_predictions_parallel` has no production caller: the live eval delegates
+predict parallelism to mlflow's own pool so that each row gets a trace carrying
+the `RETRIEVER` span `RetrievalGroundedness` needs. So the retry-on-error-only
+policy and `RunInterrupted` are real but currently exercised by tests and
+offline paths only, and `run_cli`'s `RunInterrupted` branch is dead on the live
+path. The live protections are the ones in steps 3-5: mlflow's own retries
+(`call_with_retry`, currently `max_retries=0`), the error capture, and the
+judgeability guards.

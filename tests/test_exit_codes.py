@@ -20,7 +20,13 @@ from __future__ import annotations
 import pytest
 
 
-def _report(*, n_rows: int = 8, n_errors: int = 0, n_failures: int = 0):
+def _report(
+    *,
+    n_rows: int = 8,
+    n_errors: int = 0,
+    n_failures: int = 0,
+    n_unattributed_errors: int = 0,
+):
     from anvil.eval.runner import EvalReport
 
     return EvalReport(
@@ -35,6 +41,7 @@ def _report(*, n_rows: int = 8, n_errors: int = 0, n_failures: int = 0):
         scorers=["correctness"],
         evaluated_at="2026-08-22T12:00:00+00:00",
         n_errors=n_errors,
+        n_unattributed_errors=n_unattributed_errors,
     )
 
 
@@ -49,12 +56,21 @@ def test_a_clean_run_exits_zero() -> None:
     assert exit_code_for_report(_report()) is ExitCode.OK
 
 
-def test_assessed_failures_exit_one() -> None:
+def test_assessed_failures_exit_one_only_when_asked() -> None:
     """Failures are a result about the agent, so the run itself succeeded.
-    Exit 1 lets CI gate on quality without conflating it with breakage."""
+
+    Exit 1 is opt-in. ``failures`` is populated for any scorer below 1.0 on any
+    row, which is nearly every real eval, so returning 1 by default would abort
+    any ``set -e`` wrapper around the invocation the README documents — and a
+    status that fires on correct usage gets worked around rather than heeded.
+    """
     from anvil.cli import ExitCode, exit_code_for_report
 
-    assert exit_code_for_report(_report(n_failures=3)) is ExitCode.FAILURES
+    assert exit_code_for_report(_report(n_failures=3)) is ExitCode.OK
+    assert (
+        exit_code_for_report(_report(n_failures=3), gate_on_failures=True)
+        is ExitCode.FAILURES
+    )
 
 
 def test_a_stray_error_under_the_ceiling_does_not_make_the_run_an_error() -> None:
@@ -63,17 +79,17 @@ def test_a_stray_error_under_the_ceiling_does_not_make_the_run_an_error() -> Non
     like a broken harness."""
     from anvil.cli import ExitCode, exit_code_for_report
 
-    assert exit_code_for_report(_report(n_errors=1), max_error_rate=0.2) is ExitCode.OK
+    assert exit_code_for_report(_report(n_errors=1)) is ExitCode.OK
 
 
 def test_an_error_rate_above_the_ceiling_exits_two() -> None:
     """Past the ceiling the run did not measure the agent. That is a
-    malfunction, and it is deliberately the *same* threshold the round's gate
-    uses — one concept, one number, so a CI failure and a reverted round mean
-    the same thing."""
+    malfunction, and it is deliberately the *same* judgement the round's gate
+    makes — one definition, so a CI failure and a reverted round mean the same
+    thing."""
     from anvil.cli import ExitCode, exit_code_for_report
 
-    assert exit_code_for_report(_report(n_errors=4), max_error_rate=0.2) is ExitCode.ERROR
+    assert exit_code_for_report(_report(n_errors=4)) is ExitCode.ERROR
 
 
 def test_errors_outrank_failures() -> None:
@@ -82,7 +98,30 @@ def test_errors_outrank_failures() -> None:
     from anvil.cli import ExitCode, exit_code_for_report
 
     report = _report(n_errors=6, n_failures=2)
-    assert exit_code_for_report(report, max_error_rate=0.2) is ExitCode.ERROR
+    assert exit_code_for_report(report, gate_on_failures=True) is ExitCode.ERROR
+
+
+def test_too_few_assessed_cases_exits_two_even_under_the_rate_ceiling() -> None:
+    """The case a rate ceiling cannot express. An operator who raises
+    max_error_rate to ride out a flaky endpoint would otherwise let the run be
+    reported clean on the strength of one surviving row."""
+    from anvil.cli import ExitCode, exit_code_for_report
+
+    generous = _eval_cfg(1.0)  # rate guard fully disabled
+    assert (
+        exit_code_for_report(_report(n_rows=8, n_errors=7), eval_config=generous)
+        is ExitCode.ERROR
+    )
+
+
+def test_an_unexcludable_error_exits_two() -> None:
+    """An error that could not be joined to a row still has its zero in the
+    mean, so the run did not do what it claims. Under the rate ceiling it would
+    otherwise be reported as a clean measurement."""
+    from anvil.cli import ExitCode, exit_code_for_report
+
+    report = _report(n_rows=8, n_errors=1, n_unattributed_errors=1)
+    assert exit_code_for_report(report) is ExitCode.ERROR
 
 
 # ---------------------------------------------------------------------------
@@ -186,15 +225,27 @@ def _eval_cfg(max_error_rate: float):
 
 
 @pytest.mark.parametrize(
-    ("n_errors", "n_failures", "expected"),
-    [(0, 0, 0), (0, 2, 1), (4, 0, 2)],
+    ("n_errors", "n_failures", "extra_args", "expected"),
+    [
+        (0, 0, [], 0),
+        (0, 2, [], 0),  # failures alone are not a nonzero exit by default
+        (0, 2, ["--gate-on-failures"], 1),
+        (4, 0, [], 2),  # unjudgeable is nonzero whether asked or not
+        (4, 0, ["--gate-on-failures"], 2),
+    ],
 )
 def test_evaluate_script_reports_the_right_code(
-    monkeypatch: pytest.MonkeyPatch, tmp_path, n_errors: int, n_failures: int, expected: int
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    n_errors: int,
+    n_failures: int,
+    extra_args: list[str],
+    expected: int,
 ) -> None:
-    """End to end through the real CLI: a clean run exits 0, a run with
-    assessed failures exits 1, and a run whose error rate is above the ceiling
-    exits 2 even though its aggregate looks fine."""
+    """End to end through the real CLI, including the argparse wiring: a clean
+    run exits 0, assessed failures exit 1 only under ``--gate-on-failures``, and
+    a run that could not measure the agent exits 2 regardless — even though its
+    aggregate looks fine."""
     script = _load_script("evaluate")
 
     monkeypatch.setattr(
@@ -204,4 +255,5 @@ def test_evaluate_script_reports_the_right_code(
     )
     monkeypatch.setattr(script, "load_eval_config", lambda *_a, **_kw: _eval_cfg(0.2))
 
-    assert script.main(["--out", str(tmp_path / "out.json")]) == expected
+    argv = ["--out", str(tmp_path / "out.json"), *extra_args]
+    assert script.main(argv) == expected
