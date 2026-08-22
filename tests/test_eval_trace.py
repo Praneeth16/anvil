@@ -427,4 +427,16 @@ def test_get_new_expectations_shim_none_safe_and_passthrough(
             shim_result = harness._get_new_expectations(item_with_trace)
 
         # Delegates to the original — same expectations, unaffected.
-        assert shim_result == baseline
+        #
+        # Compared by identity rather than by ``==``: ``Expectation`` carries
+        # ``create_time_ms``/``last_update_time_ms`` stamped at construction, and
+        # the two calls above are separate constructions. Whole-object equality
+        # therefore asserts that both ran within the same millisecond, which is
+        # true on a fast laptop and false often enough on a CI runner to make
+        # this test flaky (it failed on exactly a 1 ms difference). What the test
+        # means to check is that the shim returns the same expectations, not that
+        # it returns them at the same instant.
+        def _identity(expectations):
+            return [(e.name, e.trace_id, e.expectation.value) for e in expectations]
+
+        assert _identity(shim_result) == _identity(baseline)

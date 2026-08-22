@@ -35,8 +35,8 @@ import sys
 import warnings
 from collections import defaultdict
 from collections.abc import Callable
-from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path

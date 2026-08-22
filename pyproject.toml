@@ -16,7 +16,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "pytest-cov>=6.0",
     "ruff>=0.8.0",
+    "mypy>=1.14",
 ]
 # Streamlit dashboard for round exploration. Kept separate from `dev`
 # so test runs stay light.
@@ -38,6 +40,28 @@ optimizer = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# Pin the package index to public PyPI at the *project* level, so the lockfile
+# stays portable no matter what index the machine running `uv lock` defaults to.
+#
+# This is not hypothetical: a Databricks laptop typically has
+# `~/.config/uv/uv.toml` pointing at an internal pypi proxy, and a lock
+# regenerated there records that host in every wheel URL. The result is a
+# lockfile only reachable from inside the corporate network -- CI fails on
+# `uv sync --locked` with a connection timeout, external contributors cannot
+# install at all, and internal infrastructure hostnames end up committed to a
+# public repository. User-level config is silent about all of this; project-level
+# config overrides it.
+#
+# Anyone who genuinely needs the proxy can still set `UV_INDEX` for a single run
+# without touching the lock. The corollary is that regenerating the lock needs
+# real access to pypi.org: on a machine where only the proxy resolves, `uv lock`
+# will fail here rather than silently producing an unportable lockfile, which is
+# the intended behaviour. Re-lock from CI, or from a network that can reach PyPI.
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/anvil"]
 
@@ -52,4 +76,93 @@ ignore = ["E501"]  # handled by formatter
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = "test_*.py"
-addopts = "-q"
+# `live` is deselected by default: the whole suite must pass with no
+# credentials and no network. Opt in with `-m live`.
+addopts = "-q --strict-markers -m 'not live'"
+markers = [
+    "unit: pure, in-process, no I/O beyond tmp_path",
+    "contract: exercises a boundary contract against a mock or local file store",
+    "live: requires a real Databricks workspace; never runs in default CI",
+]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src/anvil"]
+# The dashboard's deps (streamlit/plotly/pandas) live in the optional
+# `dashboard` extra and are absent from CI, so type-checking it would fail on
+# missing imports rather than on anything real.
+exclude = "^src/anvil/dashboard/"
+# Strict-by-default for new code. Existing modules are exempted below and
+# the exemption list only ever shrinks -- do not add to it.
+strict = true
+warn_unused_configs = true
+warn_unreachable = true
+
+# Legacy debt: these 15 modules predate strict typing (89 errors at the time
+# this gate landed). 20 of 35 modules are already clean, including the gate
+# (`loop/frontier.py`, `loop/decision.py`). Each hardening phase that rewrites
+# a module below must delete its line. This list is a ratchet -- append never.
+[[tool.mypy.overrides]]
+module = [
+    "anvil.data.golden_set",
+    "anvil.eval.cache",
+    "anvil.eval.runner",
+    "anvil.eval.scorers",
+    "anvil.loop.builder",
+    "anvil.loop.round",
+    "anvil.optimizer.applier",
+    "anvil.optimizer.session",
+    "anvil.runtime.agent",
+    "anvil.runtime.client",
+    "anvil.runtime.composer",
+    "anvil.runtime.models",
+    "anvil.tools.search_knowledge_base",
+]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_calls = false
+disallow_any_generics = false
+warn_return_any = false
+
+# Pre-existing type mismatches, not style debt. Each is a real signal and each
+# is itemised with its consequence in `docs/type-debt.md` -- read that before
+# touching this block. Silenced only so the gate can land green; the phase that
+# rewrites each module fixes its errors and deletes its entry.
+[[tool.mypy.overrides]]
+module = [
+    "anvil.eval.cache",
+    "anvil.eval.runner",
+    "anvil.optimizer.session",
+    "anvil.runtime.agent",
+    "anvil.runtime.client",
+    "anvil.tools.search_knowledge_base",
+]
+disable_error_code = [
+    "arg-type",
+    "assignment",
+    "attr-defined",
+    "call-arg",
+    "list-item",
+    "no-redef",
+    "override",
+    "return-value",
+]
+# Third-party packages without stubs. Narrow, per-module, never blanket.
+[[tool.mypy.overrides]]
+module = [
+    "claude_agent_sdk.*",
+    "databricks.*",
+    "mlflow.*",
+    "yaml",
+]
+ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["anvil"]
+branch = true
+
+[tool.coverage.report]
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]

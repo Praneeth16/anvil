@@ -39,7 +39,6 @@ from anvil.loop.round import run_round
 from anvil.optimizer.actions import NoopAction
 from anvil.optimizer.parser import ParseResult
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

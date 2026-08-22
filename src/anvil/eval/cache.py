@@ -181,10 +181,11 @@ def is_compatible(
         or cached.judge_endpoint != judge_endpoint
     ):
         return False
-    if cached.scorer_fingerprint and scorer_fingerprint:
-        if cached.scorer_fingerprint != scorer_fingerprint:
-            return False
-    return True
+    return (
+        not cached.scorer_fingerprint
+        or not scorer_fingerprint
+        or cached.scorer_fingerprint == scorer_fingerprint
+    )
 
 
 def report_to_baseline(

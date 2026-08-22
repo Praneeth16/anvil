@@ -12,7 +12,6 @@ from anvil.eval import runner
 from anvil.runtime.loader import load_harness
 from anvil.runtime.models import EvalConfig, EvalModeConfig, SplitConfig
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
