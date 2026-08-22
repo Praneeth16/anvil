@@ -32,6 +32,7 @@ import inspect
 import logging
 import os
 import sys
+import time
 import warnings
 from collections import defaultdict
 from collections.abc import Callable
@@ -59,6 +60,12 @@ except ImportError:
 from anvil.agents.memory_system import MemorySystem
 from anvil.data import load_golden_set, select_subset
 from anvil.eval.cache import compute_scorer_fingerprint
+from anvil.eval.outcome import (
+    Attempt,
+    CaseOutcome,
+    CaseRecord,
+    RunInterrupted,
+)
 from anvil.eval.scorers import build_scorers
 from anvil.observability import SOURCE_EVAL, enable_runtime_tracing
 from anvil.runtime.agent import AnvilAgent
@@ -85,6 +92,14 @@ class EvalReport:
     scorers: list[str]
     evaluated_at: str
     trace_ids: list[str] = field(default_factory=list)
+    # Rows that were never assessed: the prediction raised, so mlflow left
+    # ``outputs`` None and recorded an ``error_message``. These are EXCLUDED
+    # from ``aggregate``, ``per_judge``, and ``per_bucket`` rather than scored
+    # as the near-zero an absent answer earns. ``n_errors`` counts every
+    # captured error, including any that could not be joined back to a row.
+    # See ``docs/design/failure-vs-error.md``.
+    n_errors: int = 0
+    errors: list[dict[str, Any]] = field(default_factory=list)
     # Always-available eval cost proxies. Token usage may be added when
     # supplied by MLflow traces; context characters and row count do not
     # require another service call.
@@ -96,6 +111,22 @@ class EvalReport:
     # comparison even when scorer names are unchanged. Empty when the
     # report is built by code that predates this field.
     scorer_fingerprint: str = ""
+
+    @property
+    def error_rate(self) -> float:
+        """Errored cases as a fraction of all cases. ``0.0`` for an empty run.
+
+        The round guard reads this instead of the score: a round with a high
+        error rate has not measured the agent at all, so comparing its
+        aggregate to the frontier would record a degraded gateway as a bad
+        mutation and revert good work.
+
+        Clamped to ``1.0`` because ``n_errors`` counts captured errors, which
+        can in principle exceed the rows that made it into ``result_df``.
+        """
+        if not self.n_rows:
+            return 0.0
+        return min(1.0, self.n_errors / self.n_rows)
 
 
 def partition_dataset(
@@ -279,6 +310,14 @@ def _row_score(row: Any, scorer_name: str) -> float | None:
     return None
 
 
+def _row_trace_id(row: Any) -> str:
+    """The row's ``trace_id`` as a string, or ``""`` when absent."""
+    if not hasattr(row, "get"):
+        return ""
+    trace_id = row.get("trace_id")
+    return str(trace_id) if trace_id else ""
+
+
 def _category_for_row(row: Any, examples: list[dict], idx: int) -> str:
     if hasattr(row, "get"):
         request = row.get("request")
@@ -305,11 +344,36 @@ def _aggregate_report(
     experiment_id: str,
     mode: str,
     scorer_fingerprint: str = "",
+    errored: dict[str, str] | None = None,
 ) -> EvalReport:
     n_rows = len(result_df)
 
+    # Rows whose prediction raised. ``errored`` maps trace_id -> message, as
+    # captured from mlflow's own ``eval_item.error_message`` by
+    # ``_resilient_eval_harness``. trace_id is the join key because it is the
+    # only row identifier that appears in both places.
+    errored = errored or {}
+    row_trace_ids = [_row_trace_id(result_df.iloc[i]) for i in range(n_rows)]
+    errored_rows = {i for i, tid in enumerate(row_trace_ids) if tid and tid in errored}
+    unattributed = sorted(set(errored) - {tid for tid in row_trace_ids if tid})
+    if unattributed:
+        # The row is not in result_df (or carries no trace_id), so its score
+        # cannot be excluded -- there is nothing to exclude. Count it anyway so
+        # the round guard still sees the degradation, and say so out loud
+        # rather than dropping it because it would not join.
+        logger.warning(
+            "%s eval error(s) could not be attributed to a result row and so "
+            "cannot be excluded from the scores: %s",
+            len(unattributed),
+            ", ".join(unattributed),
+        )
+
     per_judge_rows: dict[str, list[float | None]] = {
-        name: [_row_score(result_df.iloc[i], name) for i in range(n_rows)] for name in scorer_names
+        name: [
+            None if i in errored_rows else _row_score(result_df.iloc[i], name)
+            for i in range(n_rows)
+        ]
+        for name in scorer_names
     }
 
     def _mean(values: list[float | None]) -> float:
@@ -319,7 +383,11 @@ def _aggregate_report(
     per_judge: dict[str, float] = {}
     for name in scorer_names:
         metric_key = f"{name}/mean"
-        if metric_key in metrics:
+        # mlflow's own mean is computed over every row, errored ones included,
+        # so the moment anything errored it is exactly the number this
+        # exclusion exists to stop trusting. Fall back to anvil's mean, which
+        # sees the Nones written above.
+        if metric_key in metrics and not errored:
             per_judge[name] = float(metrics[metric_key])
         else:
             per_judge[name] = _mean(per_judge_rows[name])
@@ -339,6 +407,12 @@ def _aggregate_report(
 
     bucket_rows: dict[str, list[int]] = defaultdict(list)
     for i in range(n_rows):
+        if i in errored_rows:
+            # A bucket whose only rows errored disappears rather than reading
+            # 0.0. The per-bucket means steer where the next mutation aims, and
+            # 0.0 would assert the agent is weak at a category the round has no
+            # evidence about.
+            continue
         category = _category_for_row(result_df.iloc[i], examples, i)
         if category:
             bucket_rows[category].append(i)
@@ -349,27 +423,51 @@ def _aggregate_report(
         }
 
     failures: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
     trace_ids: list[str] = []
     for i in range(n_rows):
         row = result_df.iloc[i]
         trace_id = row.get("trace_id") if hasattr(row, "get") else None
         if trace_id:
             trace_ids.append(str(trace_id))
+        example_id = examples[i]["example_id"] if i < len(examples) else ""
+        query = examples[i]["query"] if i < len(examples) else ""
+        if i in errored_rows:
+            # Reported as an error, never as a failure. A failure list that
+            # includes never-assessed rows sends the optimizer chasing a bad
+            # answer that was never given.
+            errors.append(
+                {
+                    "example_id": example_id,
+                    "query": query,
+                    "category": _category_for_row(row, examples, i),
+                    "trace_id": trace_id,
+                    "error_message": errored[str(trace_id)],
+                }
+            )
+            continue
         judge_failures = [
             name for name in scorer_names if (s := per_judge_rows[name][i]) is not None and s < 1.0
         ]
         if not judge_failures:
             continue
-        category = _category_for_row(row, examples, i)
-        example_id = examples[i]["example_id"] if i < len(examples) else ""
-        query = examples[i]["query"] if i < len(examples) else ""
         failures.append(
             {
                 "example_id": example_id,
                 "query": query,
-                "category": category,
+                "category": _category_for_row(row, examples, i),
                 "judge_failures": judge_failures,
                 "trace_id": trace_id,
+            }
+        )
+    for trace_id_str in unattributed:
+        errors.append(
+            {
+                "example_id": "",
+                "query": "",
+                "category": "",
+                "trace_id": trace_id_str,
+                "error_message": errored[trace_id_str],
             }
         )
 
@@ -385,6 +483,8 @@ def _aggregate_report(
         scorers=list(scorer_names),
         evaluated_at=datetime.now(UTC).isoformat(timespec="seconds"),
         trace_ids=trace_ids,
+        n_errors=len(errored),
+        errors=errors,
         cost_metrics={
             "total_context_chars": float(
                 sum(len(str(ex.get("query", ""))) for ex in examples[:n_rows])
@@ -510,8 +610,25 @@ def _synchronous_trace_logging():
 
 
 @contextmanager
-def _resilient_eval_harness():
+def _resilient_eval_harness(*, error_sink: dict[str, str] | None = None):
     """Scope a defensive shim around ``mlflow.genai.evaluate``'s harness.
+
+    Also the interception point for per-row prediction errors. When
+    ``error_sink`` is given it is filled with ``trace_id -> error_message`` for
+    every row whose ``predict_fn`` raised. mlflow already records that message
+    (``_run_predict``'s ``except`` sets ``eval_item.error_message`` and leaves
+    ``outputs`` None) and then reads it nowhere: the row proceeds to scoring
+    and the judges score the absence of an answer as a wrong answer, at or near
+    0.0. Capturing it here is what lets ``_aggregate_report`` exclude the row
+    instead — a failure is a fact about the agent, an error is a fact about the
+    infrastructure, and only the first belongs in the score. This costs no new
+    interception point because the shim already wraps ``_run_predict``.
+
+    The sink is keyed by ``trace_id`` rather than mlflow's internal
+    ``request_id`` because ``trace_id`` is the only row identifier that also
+    appears in ``result_df``, which is what the aggregate reads. The key is
+    read *after* the minimal-trace fallback below, so an errored row -- which
+    creates no span and therefore has no trace of its own -- still has one.
 
     Workaround for a known mlflow 3.11.x bug (verified against 3.11.1, the
     newest in-range release on the internal proxy — no patch bump is
@@ -593,6 +710,14 @@ def _resilient_eval_harness():
         # fetches by the just-created trace_id (reliable, sync), not request_id.
         if predict_fn is not None and eval_item.trace is None:
             eval_item.trace = create_minimal_trace(eval_item)
+        # The row never produced an answer. Record it so the aggregate can
+        # exclude it rather than scoring the absence as a wrong answer.
+        if error_sink is not None and eval_item.error_message:
+            trace = eval_item.trace
+            key = str(trace.info.trace_id) if trace is not None else str(eval_item.request_id)
+            # One assignment per row from mlflow's predict thread pool; dict
+            # __setitem__ is atomic, so no lock is needed.
+            error_sink[key] = str(eval_item.error_message)
 
     _harness._get_new_expectations = _get_new_expectations_none_safe
     _harness._run_predict = _run_predict_with_minimal_trace_fallback
@@ -603,12 +728,77 @@ def _resilient_eval_harness():
         _harness._run_predict = _orig_run_predict
 
 
+def _predict_one(
+    predict_fn: Callable[[str], str],
+    query: str,
+    *,
+    case_id: str,
+    row: int,
+    max_retries: int,
+) -> CaseRecord:
+    """Predict one case, retrying **errors only**, and record the outcome.
+
+    Retrying an error is buying another sample of the infrastructure.
+    Retrying a *failure* would be buying another sample of the agent, which
+    is a different thing entirely: it turns the score into a function of how
+    many attempts were paid for, and a self-optimizing loop that can spend
+    its way to a better number will. So a returned answer is final however
+    bad it is -- including an empty one -- and only a raised exception is
+    tried again.
+    """
+    attempts: list[Attempt] = []
+    started = time.monotonic()
+    for attempt_no in range(max_retries + 1):
+        attempt_started = time.monotonic()
+        try:
+            output = predict_fn(query)
+        except Exception as exc:  # noqa: BLE001 — isolate per-row failures
+            attempts.append(
+                Attempt(
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                    duration_ms=_elapsed_ms(attempt_started),
+                )
+            )
+            if attempt_no < max_retries:
+                logger.warning(
+                    "prediction failed for row %s (attempt %s/%s), retrying: %s",
+                    row,
+                    attempt_no + 1,
+                    max_retries + 1,
+                    exc,
+                )
+                continue
+            logger.warning("prediction failed for row %s: %s", row, exc)
+            return CaseRecord.errored(
+                case_id,
+                exc,
+                attempts=tuple(attempts),
+                duration_ms=_elapsed_ms(started),
+            )
+        return CaseRecord(
+            case_id=case_id,
+            outcome=CaseOutcome.OK,
+            output=output,
+            attempts=tuple(attempts),
+            duration_ms=_elapsed_ms(started),
+        )
+    raise AssertionError("unreachable: the loop returns on success and on exhaustion")
+
+
+def _elapsed_ms(since: float) -> int:
+    return int((time.monotonic() - since) * 1000)
+
+
 def _run_predictions_parallel(
     predict_fn: Callable[[str], str],
     queries: list[str],
     n_workers: int = 1,
-) -> list[str]:
-    """Run ``predict_fn`` across ``queries`` in parallel.
+    *,
+    case_ids: list[str] | None = None,
+    max_retries: int = 0,
+) -> list[CaseRecord]:
+    """Run ``predict_fn`` across ``queries`` and return one record per row.
 
     Uses :class:`concurrent.futures.ThreadPoolExecutor` — the runtime
     agent's work is I/O-bound (LLM / tool HTTP calls), so threads are
@@ -616,17 +806,39 @@ def _run_predictions_parallel(
     ``n_workers <= 1`` the function runs sequentially (backward compatible
     with the pre-parallel eval path).
 
-    Results preserve input order regardless of completion order: each
+    Records preserve input order regardless of completion order: each
     future is keyed by its input index, so the slot it writes is fixed. A
-    prediction that raises is recorded as an empty string and logged, so
-    one bad row does not abort the whole eval — mirroring mlflow's own
-    per-row error isolation in ``_run_predict``.
+    prediction that raises is recorded as a
+    :attr:`~anvil.eval.outcome.CaseOutcome.ERROR` record and logged, so one
+    bad row does not abort the whole eval — mirroring mlflow's own per-row
+    error isolation in ``_run_predict``.
+
+    This used to record a raised prediction as ``""``. That was the defect
+    :mod:`anvil.eval.outcome` exists to correct: an empty string is not a
+    neutral value but a very bad answer, so the judges scored it near 0.0
+    and a throttled gateway moved the promotion gate exactly as a bad
+    mutation would. An error record is excluded from the aggregate instead.
+
+    ``Ctrl-C`` raises :class:`~anvil.eval.outcome.RunInterrupted` carrying a
+    record for every row — the rows already done keep their results, the
+    rest are :attr:`~anvil.eval.outcome.CaseOutcome.INTERRUPTED` — so a
+    killed run is readable rather than lost.
 
     Thread-safety: ``predict_fn`` must be safe to invoke from multiple
     threads concurrently. For prompt mode ``AnvilAgent.predict`` issues
     stateless HTTP calls against the runtime endpoint (thread-safe); for
     code mode a ``MemorySystem.predict`` subclass is thread-safe as long
     as it does not mutate shared state inside ``predict``.
+
+    Note:
+        There is deliberately **no per-case timeout here**. A thread cannot
+        be cancelled in Python, so a deadline in this pool would bound only
+        how long we *wait*: the hung request would keep running, and the
+        pool's shutdown would join it anyway. A per-request deadline belongs
+        on the HTTP client (``openai.OpenAI(timeout=...)`` in
+        ``runtime/client.py``, currently the SDK default of 600s), which is
+        the layer that can actually abandon the socket. Adding a fake one
+        here would be worse than none, because it would read as a guarantee.
 
     Note:
         The live ``evaluate_branch`` flow delegates predict parallelism to
@@ -638,34 +850,82 @@ def _run_predictions_parallel(
         this primitive is exercised directly by the unit tests and is
         available for offline/pre-compute paths that do not need traces.
     """
+    if case_ids is None:
+        ids = [str(i) for i in range(len(queries))]
+    elif len(case_ids) != len(queries):
+        raise ValueError(
+            f"case_ids has {len(case_ids)} entries for {len(queries)} queries — "
+            "a mismatch would attribute records to the wrong cases"
+        )
+    else:
+        ids = list(case_ids)
+
+    def _interrupted(idx: int) -> CaseRecord:
+        return CaseRecord(case_id=ids[idx], outcome=CaseOutcome.INTERRUPTED)
+
     if n_workers <= 1:
         # Sequential path — same per-row error isolation as the parallel
-        # path so the acceptance contract ("a prediction that raises is
-        # recorded as an empty string and does not abort the whole eval")
-        # holds uniformly for both paths, not just the parallel one.
-        results = []
+        # path, so the contract holds uniformly for both.
+        records: list[CaseRecord] = []
         for i, q in enumerate(queries):
             try:
-                results.append(predict_fn(q))
-            except Exception as exc:  # noqa: BLE001 — isolate per-row failures
-                logger.warning("prediction failed for row %s: %s", i, exc)
-                results.append("")
-        return results
+                records.append(
+                    _predict_one(
+                        predict_fn, q, case_id=ids[i], row=i, max_retries=max_retries
+                    )
+                )
+            except KeyboardInterrupt:
+                # This row and every row after it were never assessed. They
+                # are interrupted, not errored: nothing is wrong with the
+                # infrastructure, so they must not feed the error-rate guard.
+                records.extend(_interrupted(j) for j in range(i, len(queries)))
+                raise RunInterrupted(records) from None
+        return records
 
-    results: list[str | None] = [None] * len(queries)
-    with ThreadPoolExecutor(max_workers=n_workers) as executor:
-        future_to_idx = {executor.submit(predict_fn, q): i for i, q in enumerate(queries)}
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                results[idx] = future.result()
-            except Exception as exc:  # noqa: BLE001 — isolate per-row failures
-                logger.warning("prediction failed for row %s: %s", idx, exc)
-                results[idx] = ""
-    # as_completed yields every submitted future, so every slot is filled
-    # — with a result on success or "" on failure — before we reach here.
-    assert all(r is not None for r in results)
-    return results
+    slots: list[CaseRecord | None] = [None] * len(queries)
+    executor = ThreadPoolExecutor(max_workers=n_workers)
+    try:
+        future_to_idx = {
+            executor.submit(
+                _predict_one,
+                predict_fn,
+                q,
+                case_id=ids[i],
+                row=i,
+                max_retries=max_retries,
+            ): i
+            for i, q in enumerate(queries)
+        }
+        try:
+            for future in as_completed(future_to_idx):
+                slots[future_to_idx[future]] = future.result()
+        except KeyboardInterrupt:
+            # Stop handing out new work, then let the in-flight rows finish
+            # so their results are not thrown away. cancel() succeeds only
+            # for rows that never started, which is exactly the set that
+            # should be marked interrupted.
+            for future in future_to_idx:
+                future.cancel()
+            executor.shutdown(wait=True)
+            for future, idx in future_to_idx.items():
+                if slots[idx] is not None:
+                    continue
+                if future.cancelled() or not future.done():
+                    slots[idx] = _interrupted(idx)
+                    continue
+                try:
+                    slots[idx] = future.result()
+                except KeyboardInterrupt:
+                    slots[idx] = _interrupted(idx)
+            raise RunInterrupted([r or _interrupted(i) for i, r in enumerate(slots)]) from None
+    finally:
+        executor.shutdown(wait=True)
+
+    # _predict_one never raises for a row (it converts an exception into an
+    # error record), and as_completed yields every submitted future, so every
+    # slot is filled by the time we get here.
+    assert all(r is not None for r in slots)
+    return [r for r in slots if r is not None]
 
 
 def evaluate_branch(
@@ -814,6 +1074,9 @@ def evaluate_branch(
     # concurrent ``evaluate_branch`` calls in one process; the optimizer
     # runs rounds/evals synchronously, so this is not a live issue today.
     n_workers = max(1, cfg.n_workers)
+    # Filled by the harness shim with trace_id -> error_message for any row
+    # whose prediction raised. Those rows are excluded from the scores.
+    errored: dict[str, str] = {}
     _prev_workers = os.environ.get(_MLFLOW_MAX_WORKERS_ENV)
     os.environ[_MLFLOW_MAX_WORKERS_ENV] = str(n_workers)
     try:
@@ -829,7 +1092,7 @@ def evaluate_branch(
         # synthesizes a minimal trace so the run completes with a real
         # result DataFrame. See its docstring for the exact harness.py
         # symbols and lines patched.
-        with _resilient_eval_harness(), _synchronous_trace_logging():
+        with _resilient_eval_harness(error_sink=errored), _synchronous_trace_logging():
             result = mlflow.genai.evaluate(
                 data=dataset,
                 scorers=scorers,
@@ -853,4 +1116,5 @@ def evaluate_branch(
         experiment_id=experiment.experiment_id if experiment else "",
         mode=selected_mode,
         scorer_fingerprint=scorer_fingerprint,
+        errored=errored,
     )

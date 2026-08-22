@@ -18,12 +18,25 @@ from anvil.eval.cache import (
     report_to_baseline,
     save_baseline,
 )
+from anvil.eval.outcome import (
+    Attempt,
+    CaseOutcome,
+    CaseRecord,
+    OutcomeSummary,
+    RunInterrupted,
+    summarize,
+)
 from anvil.eval.runner import EvalReport, evaluate_branch
 from anvil.eval.scorers import build_scorers
 
 __all__ = [
+    "Attempt",
     "CachedBaseline",
+    "CaseOutcome",
+    "CaseRecord",
     "EvalReport",
+    "OutcomeSummary",
+    "RunInterrupted",
     "build_scorers",
     "compute_scorer_fingerprint",
     "evaluate_branch",
@@ -31,4 +44,5 @@ __all__ = [
     "load_baseline",
     "report_to_baseline",
     "save_baseline",
+    "summarize",
 ]
