@@ -5,9 +5,12 @@ aggregate:
 
 * :class:`mlflow.genai.scorers.Correctness` — reads
   ``expected_facts`` from the row's ``expectations`` dict.
-* :class:`mlflow.genai.scorers.RetrievalGroundedness` — extracts
+* :func:`retrieval_groundedness` — wraps
+  :class:`mlflow.genai.scorers.RetrievalGroundedness`, which extracts
   retrieved chunks from the trace's ``RETRIEVER`` span (the
-  ``_KbToolExecutor`` emits one) and judges grounding.
+  ``_KbToolExecutor`` emits one) and judges grounding. The wrapper
+  supplies the *applicability* rule the bare scorer has no way to
+  express — see :func:`_build_groundedness_scorer`.
 * :func:`refusal_appropriateness` — custom binary verdict via a
   Databricks-served LLM judge. Asks the judge whether the agent
   refused iff ``should_refuse=True`` and whether the refusal was
@@ -19,31 +22,77 @@ all 11 measured rounds it has been a flat 1.000 — it provides no
 gradient. Treat it as a guard-rail that aborts a round if it ever
 drops below ``safety_guard_threshold``.
 
-The judge call is wrapped in :func:`mlflow.tracing.disable` so that
-the judge's own ``chat.completions.create`` does not spawn an orphan
-``CHAT_MODEL`` trace per row in the eval experiment.
+**Nothing here suppresses tracing, and that is deliberate.** The custom
+judge's ``chat.completions.create`` used to run inside
+``mlflow.tracing.disable()`` to stop ``mlflow.openai.autolog`` spawning an
+orphan ``CHAT_MODEL`` trace per row. The intent was local; the mechanism was
+not. ``mlflow.tracing.provider.disable()`` installs a **process-global**
+``NoOpTracerProvider`` — there is no thread-local form of it in mlflow 3.11.1
+(``trace_disabled``, ``disable_autologging`` and
+``disable_discrete_autologging`` are all global too, all three checked) — and
+``mlflow.genai.evaluate`` runs scoring **concurrently with predictions**: two
+pools, ``MlflowGenAIEvalPredict`` and ``MlflowGenAIEvalScore``, with a score
+task submitted the moment one row's prediction returns
+(``genai/evaluation/harness.py``). So a judge call on a scorer thread blinded
+the tracer for every prediction thread running at that moment, and the damage
+landed two ways:
+
+* A prediction wholly inside the window registers no trace under the
+  ``eval_request_id`` that ``_run_predict`` resolves by, so
+  ``mlflow.get_trace`` returns ``None`` and the row loses its trace — the
+  failure ``_resilient_eval_harness`` was built to survive.
+* A prediction only *partly* inside it keeps its trace but loses whichever
+  spans were emitted while the provider was a no-op. Lose the
+  ``search_knowledge_base`` ``RETRIEVER`` span and
+  ``RetrievalGroundedness`` raises "No retrieval context found in the trace"
+  while ``Correctness`` and the refusal judge — which read inputs and outputs,
+  not the trace — score the same row perfectly happily.
+
+The orphan traces the suppression existed to prevent are worth avoiding, but
+not with a global switch: the eval runner asks mlflow to trace scorers
+instead (``MLFLOW_GENAI_EVAL_ENABLE_SCORER_TRACING``), which nests the judge's
+autolog span under a named ``EVALUATOR`` span rather than orphaning it.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import math
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
-import mlflow
 from mlflow.entities import AssessmentSource, Feedback
 from mlflow.genai.scorers import Correctness, RetrievalGroundedness, Safety, scorer
+from mlflow.genai.utils.trace_utils import extract_retrieval_context_from_trace
 from openai import OpenAI
 
 from anvil.runtime.models import ScorerConfig
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_JUDGE_MODEL = "databricks-claude-sonnet-4-6"
 
 REFUSAL_SCORER_NAME = "refusal_appropriateness"
+
+GROUNDEDNESS_SCORER_NAME = "retrieval_groundedness"
+
+# Bumped when a scorer's *semantics* change without its config changing.
+# ``compute_scorer_fingerprint`` folds this in, so a cached baseline measured
+# under the old meaning is correctly reported as incomparable instead of
+# silently becoming the bar a 50-round run chases. Config-level changes
+# (weight, check_function) are already covered by the config itself; this
+# covers the case the config cannot see.
+#
+# retrieval_groundedness v2: applicability rule added (see
+# ``_build_groundedness_scorer``). v1 scored whichever rows happened to reach
+# the judge.
+SCORER_SEMANTICS_VERSIONS: dict[str, int] = {
+    GROUNDEDNESS_SCORER_NAME: 2,
+}
 
 # Default location of the programmatic check-function module, relative
 # to the harness working directory (matches the ``data/golden_set.jsonl``
@@ -51,9 +100,11 @@ REFUSAL_SCORER_NAME = "refusal_appropriateness"
 DEFAULT_EVALUATOR_PATH = Path("data/evaluator.py")
 
 # Maps the YAML scorer-name strings to the actual scorer factories.
+# ``retrieval_groundedness`` is deliberately absent: it is built by
+# :func:`_build_groundedness_scorer`, which wraps the mlflow scorer rather than
+# handing it over bare.
 _BUILTIN_SCORERS = {
     "correctness": Correctness,
-    "retrieval_groundedness": RetrievalGroundedness,
     "safety": Safety,
 }
 
@@ -100,21 +151,6 @@ Output JSON ONLY (no prose, no code fences) with these keys:
 """
 
 
-@contextmanager
-def _tracing_paused():
-    """Disable MLflow tracing for the duration of the context.
-
-    Used to silence the judge's own ``chat.completions.create``
-    autolog so it does not spawn an orphan ``CHAT_MODEL`` trace per
-    row in the eval experiment.
-    """
-    mlflow.tracing.disable()
-    try:
-        yield
-    finally:
-        mlflow.tracing.enable()
-
-
 @dataclass(frozen=True)
 class _JudgeContext:
     client: OpenAI
@@ -157,13 +193,15 @@ def _build_refusal_scorer(ctx: _JudgeContext):
         notes = expectations.get("notes_for_judge", "")
         prompt = _judge_prompt(query, str(outputs), should_refuse, notes)
         try:
-            with _tracing_paused():
-                response = ctx.client.chat.completions.create(
-                    model=ctx.model,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=400,
-                    temperature=0,
-                )
+            # No tracing suppression here on purpose. See the module docstring:
+            # this call used to run inside ``mlflow.tracing.disable()``, which
+            # is process-global and corrupted concurrent predictions.
+            response = ctx.client.chat.completions.create(
+                model=ctx.model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=400,
+                temperature=0,
+            )
             raw = response.choices[0].message.content or ""
             parsed = _parse_judge_json(raw)
         except Exception as exc:
@@ -179,6 +217,108 @@ def _build_refusal_scorer(ctx: _JudgeContext):
         )
 
     return refusal_appropriateness
+
+
+# ---------------------------------------------------------------------------
+# Retrieval groundedness — applicability, not just grounding.
+# ---------------------------------------------------------------------------
+
+
+def _expects_retrieval(expectations: Any) -> bool:
+    """Whether this row's ground truth says the agent had to retrieve.
+
+    Read off ``expected_doc_ids`` rather than ``should_refuse`` because
+    ``expected_doc_ids`` is what groundedness is *about*. In the shipped golden
+    set the two agree exactly (empty iff ``should_refuse``, 4 of 20 rows, all
+    ``out_of_scope``), but they are separate columns and a future row could
+    legitimately expect a refusal to cite policy.
+    """
+    if not isinstance(expectations, dict):
+        return False
+    return bool(expectations.get("expected_doc_ids"))
+
+
+def _has_retrieval_context(trace: Any) -> bool:
+    """Whether mlflow can extract retrieved chunks from ``trace``.
+
+    Calls mlflow's own extractor — the same one
+    :meth:`RetrievalGroundedness.__call__` uses — so "the judge will find
+    context" and "we predicted it would" cannot drift apart. Hand-rolling a
+    ``span_type == RETRIEVER`` scan would be a second, silently diverging
+    definition.
+    """
+    try:
+        return bool(extract_retrieval_context_from_trace(trace))
+    except Exception:
+        # Extraction failing is not evidence the agent retrieved.
+        return False
+
+
+def _build_groundedness_scorer(*, name: str = GROUNDEDNESS_SCORER_NAME):
+    """Return a ``@scorer`` wrapping ``RetrievalGroundedness`` with an
+    applicability rule.
+
+    :class:`mlflow.genai.scorers.RetrievalGroundedness` has exactly one
+    behaviour when a trace carries no ``RETRIEVER`` span: it raises. mlflow
+    turns that into a ``SCORER_ERROR`` feedback with no value, and anvil's
+    aggregation drops valueless rows from the mean. Two very different
+    situations therefore reached the gate as the same silent exclusion:
+
+    * The row was **never meant to retrieve.** Every ``out_of_scope`` row in
+      the golden set has ``expected_doc_ids == []``; the agent correctly
+      refuses, never calls ``search_knowledge_base``, and there is no
+      ``RETRIEVER`` span to ground against. Grounding is *not applicable*, and
+      quick mode contains exactly 2 such rows out of 8 — so a healthy run
+      always logged 2 scorer errors and nobody could tell them from real ones.
+    * The row **was** meant to retrieve and the agent did not. That is a
+      finding about the agent, and excluding it inverts the incentive: the
+      optimizer is graded on its own output, so any route from "change
+      behaviour" to "score goes up" gets taken. Groundedness is binary, so
+      withholding retrieval on rows it was losing moved this judge from
+      ``1/8 = 0.125`` to ``1/1 = 1.0`` — an **0.875 swing available purely by
+      searching less**, and the largest single lever in the scoring system.
+      ``pareto.enabled`` is currently ``false``, so only ``aggregate`` gates a
+      round, but the aggregate is the weighted mean of the per-judge values, so
+      the lever reaches it either way.
+
+    Hence: ``None`` (mlflow reads that as "no assessment", see
+    ``standardize_scorer_value``) when nothing was expected, ``"no"`` when
+    documents were expected and no retrieval happened, and the real judge
+    otherwise. Abstaining now costs what a wrong answer costs, which is the
+    only arrangement under which "the agent stopped retrieving" cannot look
+    like an improvement.
+
+    ``prompts/anvil-round.md`` has told the optimizer since round one that this
+    scorer is "only computed for in-scope rows with ``expected_doc_ids``". This
+    makes that true.
+    """
+    delegate = RetrievalGroundedness(name=name)
+    source = AssessmentSource(source_type="CODE", source_id=f"applicability:{name}")
+
+    @scorer(name=name)
+    def retrieval_groundedness(expectations: dict, trace: Any):
+        if not _expects_retrieval(expectations):
+            # Not applicable. Returning None yields zero feedbacks, so the row
+            # contributes nothing to this judge's mean and — unlike raising —
+            # is not counted as a scorer error either.
+            return None
+        if not _has_retrieval_context(trace):
+            return Feedback(
+                # "no" and not False: the value type of the scorer being wrapped
+                # is Literal["yes", "no"], and mixing a bool into the same
+                # column mlflow averages is asking for trouble.
+                value="no",
+                rationale=(
+                    "expected_doc_ids were specified but the trace has no retrieval "
+                    "context, so the agent answered without consulting the knowledge "
+                    "base. Scored as ungrounded rather than skipped: skipping would "
+                    "reward not retrieving."
+                ),
+                source=source,
+            )
+        return delegate(trace=trace)
+
+    return retrieval_groundedness
 
 
 # ---------------------------------------------------------------------------
@@ -310,8 +450,10 @@ def build_scorers(
             check_fn = load_check_function(cfg.check_function, evaluator_path)
             out.append(build_programmatic_scorer(name=cfg.name, check_fn=check_fn))
         else:  # llm
-            if cfg.name == "refusal_appropriateness":
+            if cfg.name == REFUSAL_SCORER_NAME:
                 out.append(_build_refusal_scorer(ctx))
+            elif cfg.name == GROUNDEDNESS_SCORER_NAME:
+                out.append(_build_groundedness_scorer())
             elif cfg.name in _BUILTIN_SCORERS:
                 out.append(_BUILTIN_SCORERS[cfg.name]())
             else:

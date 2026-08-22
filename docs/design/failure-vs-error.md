@@ -286,3 +286,9 @@ The second run also logged `retrieval_groundedness: 4/8` scorer invocations
 failing. Scorer errors are already excluded rather than scored 0.0, so the
 aggregate is not corrupted by them — but half the groundedness judges failing is
 a separate defect, not noise, and is not addressed here.
+
+**Chased in `scorer-applicability.md`.** It was three defects, and the first run's
+`groundedness 1.000` in the table above is the evidence: that 1.000 was a mean
+over 4 rows. Excluding scorer errors turns out to reopen this document's own hole
+one level down — the per-judge means had no sample floor — and the exclusion was
+also paying the agent not to retrieve.

@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from anvil.eval.scorers import SCORER_SEMANTICS_VERSIONS
 from anvil.runtime.models import ScorerConfig
 
 if TYPE_CHECKING:
@@ -55,24 +56,34 @@ def compute_scorer_fingerprint(scorer_configs: list[ScorerConfig]) -> str:
     a cached baseline even when the scorer names are unchanged. The list
     is sorted by name for deterministic output.
 
+    Also folds in :data:`anvil.eval.scorers.SCORER_SEMANTICS_VERSIONS`, because
+    the config cannot see a change in what a scorer *means*. When
+    ``retrieval_groundedness`` gained its applicability rule, every field above
+    stayed byte-identical while the number it produced stopped being the same
+    measurement — so a baseline from before the change would have remained
+    "compatible" and gone on being the bar the loop chased. Only scorers whose
+    semantics have been versioned carry the key, so bumping one does not
+    invalidate baselines for configs that do not use it.
+
     Storing the fingerprint in :class:`CachedBaseline` closes the
     comparability hole where a cached uniform-weight baseline stayed
     "compatible" after weights changed — the loop would then compare a
     new weighted aggregate against an old uniform-weight aggregate and
     make an invalid frontier decision.
     """
-    specs = sorted(
-        [
-            {
-                "name": c.name,
-                "type": c.type,
-                "weight": c.weight,
-                "check_function": c.check_function,
-            }
-            for c in scorer_configs
-        ],
-        key=lambda s: s["name"],
-    )
+    specs: list[dict[str, Any]] = []
+    for c in scorer_configs:
+        spec: dict[str, Any] = {
+            "name": c.name,
+            "type": c.type,
+            "weight": c.weight,
+            "check_function": c.check_function,
+        }
+        semantics = SCORER_SEMANTICS_VERSIONS.get(c.name)
+        if semantics is not None:
+            spec["semantics"] = semantics
+        specs.append(spec)
+    specs.sort(key=lambda s: str(s["name"]))
     return json.dumps(specs, sort_keys=True)
 
 

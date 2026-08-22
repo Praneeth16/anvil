@@ -596,6 +596,13 @@ def _build_round_json(
                 "error_rate": eval_report.error_rate,
                 "errors": list(eval_report.errors),
                 "per_judge": dict(eval_report.per_judge),
+                # The denominators behind ``per_judge``. Each per-judge value is a
+                # mean over only the rows that produced a score, so the value
+                # alone cannot distinguish "1.0 across eight cases" from "1.0 on
+                # the one case this judge did not break on".
+                "per_judge_assessed": dict(eval_report.per_judge_assessed),
+                "per_judge_errors": dict(eval_report.per_judge_errors),
+                "scorer_errors": list(eval_report.scorer_errors),
                 "per_bucket": {k: dict(v) for k, v in eval_report.per_bucket.items()},
                 "cost_metrics": dict(getattr(eval_report, "cost_metrics", {})),
                 "failures": list(eval_report.failures),

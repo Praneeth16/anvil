@@ -1,0 +1,543 @@
+"""Groundedness applicability, scorer-error visibility, and the tracing race.
+
+Three defects that presented as one symptom: ``retrieval_groundedness`` failing
+3-4 of 8 invocations on every healthy live run, with a single message —
+``SCORER_ERROR: No retrieval context found in the trace.`` — while the aggregate
+read fine and every guard stayed quiet.
+
+* **Applicability** (:func:`anvil.eval.scorers._build_groundedness_scorer`).
+  2 of the 8 quick-mode rows are ``out_of_scope`` with ``expected_doc_ids == []``:
+  the agent correctly refuses, never retrieves, and grounding does not apply.
+  mlflow's scorer has no way to say "not applicable" — it raises — so those 2
+  were indistinguishable from a broken judge. And the same exclusion applied to
+  a row that *was* meant to retrieve, which is a reward-hacking hole: not
+  retrieving became free.
+* **Scorer-error visibility** (``_row_scorer_error``, per-judge counts).
+  ``construct_eval_result_df`` flattens only a feedback's *value*, so a scorer
+  error and a scorer abstention are both ``None`` in the ``{name}/value`` column.
+  Every guard was blind to it.
+* **The tracing race** (``anvil.eval.scorers`` module docstring). The refusal
+  judge's call used to run inside a process-global ``mlflow.tracing.disable()``
+  while mlflow ran predictions concurrently on another pool.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pandas as pd
+import pytest
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _gold(example_id: str, *, expected_doc_ids: list[str], should_refuse: bool = False) -> dict:
+    return {
+        "example_id": example_id,
+        "query": f"q-{example_id}",
+        "category": "out_of_scope" if should_refuse else "direct",
+        "expected_doc_ids": expected_doc_ids,
+        "reference_answer": "a",
+        "should_refuse": should_refuse,
+        "expected_citations": [],
+        "must_include": [],
+        "must_not_include": [],
+        "notes_for_judge": "",
+    }
+
+
+def _scorer_error_assessment(name: str, message: str) -> dict:
+    """The shape mlflow records for a scorer that raised.
+
+    Verified against ``Feedback(error=AssessmentError(...)).to_dictionary()`` on
+    mlflow 3.11.1 — a scorer exception never aborts the run, it becomes a
+    valueless feedback carrying the error.
+    """
+    return {
+        "assessment_name": name,
+        "feedback": {
+            "value": None,
+            "error": {"error_code": "SCORER_ERROR", "error_message": message},
+        },
+    }
+
+
+def _value_assessment(name: str, value: Any) -> dict:
+    return {"assessment_name": name, "feedback": {"value": value}}
+
+
+# ---------------------------------------------------------------------------
+# The applicability rule
+# ---------------------------------------------------------------------------
+
+
+def test_groundedness_is_not_applicable_when_no_documents_are_expected() -> None:
+    """A row the golden set never asked to retrieve yields no assessment.
+
+    ``None`` and not ``0.0``: mlflow reads None as "no feedback"
+    (``standardize_scorer_value``), so the row drops out of this judge's mean
+    instead of asserting the agent was ungrounded on a question it was right to
+    refuse.
+    """
+    from anvil.eval.scorers import _build_groundedness_scorer
+
+    scorer = _build_groundedness_scorer()
+    result = scorer.run(
+        inputs={"query": "who won the world cup"},
+        outputs="I can only help with NeoVolt questions.",
+        expectations={"expected_doc_ids": [], "should_refuse": True},
+        trace=object(),
+    )
+    assert result is None
+
+
+def test_groundedness_scores_zero_when_retrieval_was_expected_but_skipped() -> None:
+    """The reward-hacking guard, and the whole reason this wrapper exists.
+
+    Groundedness is binary, so excluding the rows where the agent skipped
+    retrieval moved this judge from 1/8 = 0.125 to 1/1 = 1.0 — an 0.875 swing
+    available purely by searching less, and the largest single lever in the
+    scoring system. Scoring it "no" makes abstention cost exactly what a wrong
+    answer costs.
+    """
+    from anvil.eval.scorers import _build_groundedness_scorer
+
+    scorer = _build_groundedness_scorer()
+    result = scorer.run(
+        inputs={"query": "what is the residential rate"},
+        outputs="It is about fourteen cents, I think.",
+        expectations={"expected_doc_ids": ["tariff_standard_residential"]},
+        trace=object(),  # no retrieval context extractable
+    )
+    assert result is not None, "an expected-retrieval row must never be skipped"
+    assert result.value == "no"
+    assert "expected_doc_ids" in (result.rationale or "")
+
+
+def test_groundedness_delegates_to_mlflow_when_retrieval_happened(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With retrieval context present, the real judge decides. The wrapper adds
+    an applicability rule and nothing else — it must not become a second opinion
+    on grounding."""
+    from mlflow.entities import Feedback
+
+    import anvil.eval.scorers as scorers_mod
+
+    sentinel = Feedback(name="retrieval_groundedness", value="yes", rationale="from mlflow")
+    monkeypatch.setattr(
+        scorers_mod, "extract_retrieval_context_from_trace", lambda trace: {"span-1": ["chunk"]}
+    )
+    monkeypatch.setattr(
+        scorers_mod.RetrievalGroundedness, "__call__", lambda self, *, trace: [sentinel]
+    )
+
+    scorer = scorers_mod._build_groundedness_scorer()
+    result = scorer.run(
+        inputs={"query": "q"},
+        outputs="a",
+        expectations={"expected_doc_ids": ["doc-1"]},
+        trace=object(),
+    )
+    assert result == [sentinel]
+
+
+def test_groundedness_reads_expected_doc_ids_not_should_refuse() -> None:
+    """``expected_doc_ids`` is what groundedness is about.
+
+    In the shipped golden set the two columns agree exactly, but they are
+    separate columns, and a future row could legitimately expect a refusal to
+    cite policy. Keying off ``should_refuse`` would silently stop grading such a
+    row.
+    """
+    from anvil.eval.scorers import _build_groundedness_scorer
+
+    scorer = _build_groundedness_scorer()
+    result = scorer.run(
+        inputs={"query": "q"},
+        outputs="a",
+        expectations={"expected_doc_ids": ["policy_doc"], "should_refuse": True},
+        trace=object(),
+    )
+    assert result is not None
+    assert result.value == "no"
+
+
+def test_extraction_failure_is_not_evidence_of_retrieval() -> None:
+    """If mlflow's extractor raises, the wrapper must not read that as "the
+    agent retrieved" — that would hand back the free pass this fix removes."""
+    import anvil.eval.scorers as scorers_mod
+
+    def _boom(trace: Any) -> dict:
+        raise RuntimeError("malformed span")
+
+    original = scorers_mod.extract_retrieval_context_from_trace
+    try:
+        scorers_mod.extract_retrieval_context_from_trace = _boom  # type: ignore[assignment]
+        assert scorers_mod._has_retrieval_context(object()) is False
+    finally:
+        scorers_mod.extract_retrieval_context_from_trace = original  # type: ignore[assignment]
+
+
+def test_build_scorers_wires_the_wrapper_not_the_bare_mlflow_scorer() -> None:
+    """The bare ``RetrievalGroundedness`` must not reach ``mlflow.genai.evaluate``.
+
+    Same scorer name, so the config, the aggregate weights and every consumer are
+    unchanged — but the object is anvil's.
+    """
+    from mlflow.genai.scorers import RetrievalGroundedness
+
+    from anvil.eval.scorers import GROUNDEDNESS_SCORER_NAME, build_scorers
+
+    built = build_scorers(judge_client=object(), judge_model="m")  # type: ignore[arg-type]
+    by_name = {s.name: s for s in built}
+    assert GROUNDEDNESS_SCORER_NAME in by_name
+    assert not isinstance(by_name[GROUNDEDNESS_SCORER_NAME], RetrievalGroundedness)
+
+
+# ---------------------------------------------------------------------------
+# The tracing race
+# ---------------------------------------------------------------------------
+
+
+def test_refusal_judge_does_not_disable_tracing_while_it_runs() -> None:
+    """The judge call must leave the global tracer alone.
+
+    ``mlflow.tracing.disable()`` installs a process-global NoOpTracerProvider,
+    and mlflow scores row N while still predicting row N+1 on a separate pool. So
+    the old suppression blinded concurrent predictions: a prediction wholly
+    inside the window registered no trace under its ``eval_request_id`` and lost
+    its trace entirely, and one partly inside it kept the trace but lost whatever
+    spans were emitted meanwhile — including the ``RETRIEVER`` span groundedness
+    needs.
+
+    Asserted from *inside* the judge call, which is the only place the window was
+    ever open.
+    """
+    import mlflow
+    from mlflow.tracing.provider import is_tracing_enabled
+
+    from anvil.eval.scorers import _build_refusal_scorer, _JudgeContext
+
+    observed: dict[str, Any] = {}
+
+    class _Completions:
+        def create(self, **kwargs: Any) -> Any:
+            observed["tracing_enabled"] = is_tracing_enabled()
+            with mlflow.start_span(name="concurrent-prediction") as span:
+                observed["span_is_real"] = span.trace_id is not None
+            raise RuntimeError("stop here — the judge's verdict is not what we test")
+
+    class _Chat:
+        completions = _Completions()
+
+    class _Client:
+        chat = _Chat()
+
+    scorer = _build_refusal_scorer(_JudgeContext(client=_Client(), model="m"))  # type: ignore[arg-type]
+    scorer.run(inputs={"query": "q"}, outputs="a", expectations={"should_refuse": False})
+
+    assert observed["tracing_enabled"] is True
+    assert observed["span_is_real"] is True
+
+
+# ---------------------------------------------------------------------------
+# Scorer errors reach the report
+# ---------------------------------------------------------------------------
+
+
+def test_row_scorer_error_reads_the_error_mlflow_recorded() -> None:
+    from anvil.eval.runner import _row_scorer_error
+
+    row = {
+        "retrieval_groundedness/value": None,
+        "assessments": [
+            _value_assessment("correctness", 1.0),
+            _scorer_error_assessment("retrieval_groundedness", "No retrieval context found."),
+        ],
+    }
+    assert _row_scorer_error(row, "correctness") is None
+    message = _row_scorer_error(row, "retrieval_groundedness")
+    assert message is not None
+    assert "SCORER_ERROR" in message
+    assert "No retrieval context found." in message
+
+
+def test_a_scored_row_and_an_abstention_are_not_reported_as_errors() -> None:
+    """Absence of a value is not an error. Only a recorded ``error`` is."""
+    from anvil.eval.runner import _row_scorer_error
+
+    abstained = {"assessments": [{"assessment_name": "retrieval_groundedness", "feedback": {}}]}
+    assert _row_scorer_error(abstained, "retrieval_groundedness") is None
+    assert _row_scorer_error({"assessments": []}, "retrieval_groundedness") is None
+    assert _row_scorer_error({}, "retrieval_groundedness") is None
+
+
+def test_a_missing_value_in_a_numeric_column_is_unscored_not_nan() -> None:
+    """Found by the test below, and worse than what it was testing.
+
+    pandas stores a missing entry in an otherwise-numeric column as NaN, not
+    None, so a scorer error on such a column came back from ``_coerce_score`` as
+    a *number*. The row counted as assessed and its NaN entered the mean — where
+    NaN propagates, so one scorer error turned the judge's mean and the entire
+    weighted aggregate into NaN. Every NaN comparison being False, the frontier
+    then silently fails its ``>`` check and reverts, or writes NaN to a baseline
+    as the bar for every later round.
+
+    Hidden live only because the shipped judges return "yes"/"no", which keeps
+    the column ``object`` dtype and the missing value ``None``.
+    """
+    from anvil.eval.runner import _coerce_score, _row_score
+
+    assert _coerce_score(float("nan")) is None
+    assert _coerce_score(float("inf")) is None
+    assert _coerce_score("nan") is None
+
+    df = pd.DataFrame({"programmatic_check/value": [1.0, None, 0.5]})
+    assert _row_score(df.iloc[1], "programmatic_check") is None, (
+        "a NaN cell must read as unscored, or it poisons the aggregate"
+    )
+
+
+def _report_with_groundedness(rows: list[dict[str, Any]]):
+    """Build a report over ``rows``, each ``{"correctness": v, "groundedness": ...}``.
+
+    ``groundedness`` may be a float (scored), ``"error"`` (mlflow recorded a
+    SCORER_ERROR) or ``None`` (the scorer abstained).
+    """
+    from anvil.eval.runner import _aggregate_report
+
+    assessments = []
+    ground_values: list[Any] = []
+    for row in rows:
+        row_assessments = [_value_assessment("correctness", row["correctness"])]
+        if row["groundedness"] == "error":
+            row_assessments.append(
+                _scorer_error_assessment("retrieval_groundedness", "No retrieval context found.")
+            )
+            ground_values.append(None)
+        elif row["groundedness"] is None:
+            ground_values.append(None)
+        else:
+            row_assessments.append(
+                _value_assessment("retrieval_groundedness", row["groundedness"])
+            )
+            ground_values.append(row["groundedness"])
+        assessments.append(row_assessments)
+
+    df = pd.DataFrame(
+        {
+            "trace_id": [f"t{i}" for i in range(len(rows))],
+            "correctness/value": [r["correctness"] for r in rows],
+            "retrieval_groundedness/value": ground_values,
+            "assessments": assessments,
+        }
+    )
+    return _aggregate_report(
+        result_df=df,
+        metrics={},
+        scorer_names=["correctness", "retrieval_groundedness"],
+        aggregate_scorer_names=["correctness", "retrieval_groundedness"],
+        weights={"correctness": 1.0, "retrieval_groundedness": 1.0},
+        examples=[_gold(f"g{i}", expected_doc_ids=["d"]) for i in range(len(rows))],
+        run_id="run-1",
+        experiment_id="exp-1",
+        mode="quick",
+    )
+
+
+def test_per_judge_counts_separate_scored_errored_and_abstained_rows() -> None:
+    report = _report_with_groundedness(
+        [
+            {"correctness": 1.0, "groundedness": 1.0},
+            {"correctness": 1.0, "groundedness": "error"},
+            {"correctness": 0.0, "groundedness": None},
+            {"correctness": 1.0, "groundedness": 0.0},
+        ]
+    )
+    assert report.per_judge_assessed["retrieval_groundedness"] == 2
+    assert report.per_judge_errors["retrieval_groundedness"] == 1
+    assert report.per_judge_assessed["correctness"] == 4
+    assert report.per_judge_errors["correctness"] == 0
+    # The abstained row is in neither count — not applicable is not broken.
+    assert (
+        report.per_judge_assessed["retrieval_groundedness"]
+        + report.per_judge_errors["retrieval_groundedness"]
+        == 3
+    )
+    # And the judge's mean is over the two rows that produced a score.
+    assert report.per_judge["retrieval_groundedness"] == pytest.approx(0.5)
+
+
+def test_scorer_errors_are_recorded_with_the_case_they_broke_on() -> None:
+    """A count alone does not survive contact with debugging six rounds later."""
+    report = _report_with_groundedness(
+        [
+            {"correctness": 1.0, "groundedness": 1.0},
+            {"correctness": 1.0, "groundedness": "error"},
+        ]
+    )
+    assert len(report.scorer_errors) == 1
+    entry = report.scorer_errors[0]
+    assert entry["scorer"] == "retrieval_groundedness"
+    assert entry["example_id"] == "g1"
+    assert entry["trace_id"] == "t1"
+    assert "SCORER_ERROR" in entry["error_message"]
+
+
+def test_a_prediction_error_is_not_also_counted_as_a_scorer_error() -> None:
+    """A row whose prediction failed was never offered to the scorers, so
+    counting it against a judge would blame the judge for the gateway."""
+    from anvil.eval.runner import _aggregate_report
+
+    df = pd.DataFrame(
+        {
+            "trace_id": ["t0", "t1"],
+            "correctness/value": [1.0, None],
+            "assessments": [[_value_assessment("correctness", 1.0)], []],
+        }
+    )
+    report = _aggregate_report(
+        result_df=df,
+        metrics={},
+        scorer_names=["correctness"],
+        aggregate_scorer_names=["correctness"],
+        weights={"correctness": 1.0},
+        examples=[_gold("g0", expected_doc_ids=["d"]), _gold("g1", expected_doc_ids=["d"])],
+        run_id="run-1",
+        experiment_id="exp-1",
+        mode="quick",
+        errored={"t1": "gateway 429"},
+    )
+    assert report.n_errors == 1
+    assert report.per_judge_errors["correctness"] == 0
+    assert report.per_judge_assessed["correctness"] == 1
+    assert report.scorer_errors == []
+
+
+# ---------------------------------------------------------------------------
+# The per-judge floor
+# ---------------------------------------------------------------------------
+
+
+def _report(**overrides: Any):
+    from anvil.eval.runner import EvalReport
+
+    kwargs: dict[str, Any] = {
+        "aggregate": 0.9,
+        "per_judge": {"correctness": 0.9, "retrieval_groundedness": 1.0},
+        "per_bucket": {},
+        "failures": [],
+        "run_id": "run-x",
+        "experiment_id": "exp-x",
+        "n_rows": 8,
+        "mode": "quick",
+        "scorers": ["correctness", "retrieval_groundedness"],
+        "evaluated_at": "2026-08-22T12:00:00+00:00",
+    }
+    kwargs.update(overrides)
+    return EvalReport(**kwargs)
+
+
+def test_a_judge_that_broke_on_most_of_its_attempts_is_unjudgeable() -> None:
+    """The hole this closes: every prediction succeeded, every row is in the
+    frame, the run-level guards see nothing — and one judge's contribution to
+    the aggregate is a single row's score."""
+    from anvil.eval.judgeability import unjudgeable_reason
+
+    report = _report(
+        per_judge_assessed={"correctness": 8, "retrieval_groundedness": 1},
+        per_judge_errors={"correctness": 0, "retrieval_groundedness": 5},
+    )
+    reason = unjudgeable_reason(report, min_scorable_rows=4)
+    assert "retrieval_groundedness" in reason
+    assert "1 of the 6" in reason
+
+
+def test_a_judge_that_merely_applies_to_few_rows_is_fine() -> None:
+    """The floor must not fire on correct usage.
+
+    Groundedness applies only where the golden set names ``expected_doc_ids``, so
+    it legitimately scores 6 of 8 quick-mode rows and abstains on 2. Measuring
+    the floor against the run's row count would make a correct eval unjudgeable —
+    and a guard that fires on correct usage gets switched off.
+    """
+    from anvil.eval.judgeability import unjudgeable_reason
+
+    report = _report(
+        per_judge_assessed={"correctness": 8, "retrieval_groundedness": 2},
+        per_judge_errors={"correctness": 0, "retrieval_groundedness": 0},
+    )
+    assert unjudgeable_reason(report, min_scorable_rows=4) == ""
+
+
+def test_a_judge_with_errors_that_still_clears_the_floor_is_judgeable() -> None:
+    """Errors are not automatically disqualifying; too small a surviving sample
+    is. Two errors out of eight leaves six assessed, well clear of four."""
+    from anvil.eval.judgeability import unjudgeable_reason
+
+    report = _report(
+        per_judge_assessed={"correctness": 8, "retrieval_groundedness": 6},
+        per_judge_errors={"correctness": 0, "retrieval_groundedness": 2},
+    )
+    assert unjudgeable_reason(report, min_scorable_rows=4) == ""
+
+
+def test_the_per_judge_floor_is_capped_at_what_the_judge_attempted() -> None:
+    """A judge that attempted 3 rows and scored all 3 is fine even though 3 is
+    below the floor of 4 — same reasoning as the run-level cap against
+    ``n_attempted``."""
+    from anvil.eval.judgeability import unjudgeable_reason
+
+    report = _report(
+        per_judge_assessed={"retrieval_groundedness": 3},
+        per_judge_errors={"retrieval_groundedness": 0},
+    )
+    assert unjudgeable_reason(report, min_scorable_rows=4) == ""
+
+
+def test_run_level_checks_still_take_precedence() -> None:
+    """Ordering matters for legibility: "the gateway was down" is a more useful
+    thing to be told than "one judge is short of cases"."""
+    from anvil.eval.judgeability import unjudgeable_reason
+
+    report = _report(
+        n_errors=6,
+        per_judge_assessed={"retrieval_groundedness": 1},
+        per_judge_errors={"retrieval_groundedness": 5},
+    )
+    reason = unjudgeable_reason(report, max_error_rate=0.2, min_scorable_rows=4)
+    assert "unmeasured rate" in reason
+
+
+# ---------------------------------------------------------------------------
+# Fingerprint: semantics changed without the config changing
+# ---------------------------------------------------------------------------
+
+
+def test_semantics_version_is_in_the_groundedness_fingerprint() -> None:
+    """A cached baseline measured before the applicability rule is not
+    comparable to one measured after it, and every config field is identical
+    across the change — so only a semantics version can say so."""
+    import json
+
+    from anvil.eval.cache import compute_scorer_fingerprint
+    from anvil.eval.scorers import GROUNDEDNESS_SCORER_NAME, SCORER_SEMANTICS_VERSIONS
+    from anvil.runtime.models import ScorerConfig
+
+    fp = json.loads(compute_scorer_fingerprint([ScorerConfig(name=GROUNDEDNESS_SCORER_NAME)]))
+    assert fp[0]["semantics"] == SCORER_SEMANTICS_VERSIONS[GROUNDEDNESS_SCORER_NAME]
+
+
+def test_unversioned_scorers_keep_their_old_fingerprint() -> None:
+    """Bumping one scorer's semantics must not invalidate baselines for configs
+    that do not use it."""
+    import json
+
+    from anvil.eval.cache import compute_scorer_fingerprint
+    from anvil.runtime.models import ScorerConfig
+
+    fp = json.loads(compute_scorer_fingerprint([ScorerConfig(name="correctness")]))
+    assert "semantics" not in fp[0]
