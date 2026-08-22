@@ -258,10 +258,31 @@ Against `fe-vm-lakebase-praneeth`, runtime and judge on
 
 | Case | Result |
 |---|---|
-| Healthy, `--mode quick` | exit **0**, 8/8 rows, aggregate 0.875 (correctness 0.625, groundedness 1.0, refusal 1.0), `n_errors=0`, `n_dropped_rows=0` |
-| Runtime endpoint set to a nonexistent model | exit **2**, `n_errors=8`, `error_rate=1.00`, refused with `error rate 1.00 exceeds ceiling 0.20 (8/8 cases never assessed)`; each `error_message` carries the real `404 RESOURCE_DOES_NOT_EXIST` |
+| Healthy, `--mode quick` | exit **0**, 8/8 rows, `n_errors=0`, `n_dropped_rows=0`, `n_unattributed_errors=0` |
+| Runtime endpoint set to a nonexistent model | exit **2**, `n_errors=8`, refused with `unmeasured rate 1.00 exceeds ceiling 0.20 (8/8 cases never scored: 8 errored)`; each `error_message` carries the real `404 RESOURCE_DOES_NOT_EXIST` |
 
 The load-bearing number in the fault case is **`n_unattributed_errors=0`**: the
 `trace_id` join between the shim's capture and `result_df` held for all eight
 errored rows against the real tracing server. That was the one assumption the
 offline tests could only check against a local file store.
+
+### The healthy aggregate is not stable, and that is the Phase 3 argument
+
+Two healthy runs of the **same 8 rows**, same scaffold, same model, no change
+affecting scoring:
+
+| Run | aggregate | correctness | groundedness | refusal |
+|---|---|---|---|---|
+| first | 0.875 | 0.625 | 1.000 | 1.000 |
+| later | 0.722 | 0.500 | 0.667 | 1.000 |
+
+**~0.15 of aggregate swing from judge noise alone**, on the row count the loop
+actually uses per round. The gate promotes on any positive delta
+(`gate.epsilon: 0.0`), so it would read that swing as a real improvement or a
+real regression about as often as not. This is the empirical case for the paired,
+noise-aware gate in Phase 3 — measured here rather than assumed.
+
+The second run also logged `retrieval_groundedness: 4/8` scorer invocations
+failing. Scorer errors are already excluded rather than scored 0.0, so the
+aggregate is not corrupted by them — but half the groundedness judges failing is
+a separate defect, not noise, and is not addressed here.

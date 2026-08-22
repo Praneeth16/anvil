@@ -1465,12 +1465,19 @@ def evaluate_branch(
     # filtered frame otherwise attributes every failure to the wrong golden case.
     # ``kept_rows`` indexes the eval_results list, whose order the frame follows.
     aligned = [selected[i] for i in kept_rows if i < len(selected)] if kept_rows else selected
-    if n_dropped and len(aligned) != len(result.result_df):
-        # Cannot trust the join; better to say so than to mislabel every failure.
+    if len(aligned) != len(result.result_df):
+        # Checked unconditionally, not only when n_dropped is nonzero. An empty
+        # ``kept_rows`` means either "the shim never ran" (fall back to selected,
+        # correct) or "the shim filtered every row" (selected is longer than the
+        # frame, and the positional join would mislabel every case). Those two are
+        # indistinguishable from the sink alone, and relying on mlflow returning a
+        # None frame to rule the second one out makes this correctness depend on
+        # someone else's early return. Comparing lengths keeps the invariant here.
         logger.warning(
-            "could not realign %s example(s) with a %s-row frame; per-case "
-            "attribution in failures/errors may be unreliable",
-            len(selected),
+            "could not realign examples with the result frame (%s example(s), %s "
+            "row(s)); per-case attribution in failures/errors is unreliable for "
+            "this run",
+            len(aligned),
             len(result.result_df),
         )
 
