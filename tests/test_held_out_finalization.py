@@ -115,7 +115,12 @@ def test_run_round_lock_and_force(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     finalized.write_text("{}\n", encoding="utf-8")
     monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
 
-    assert module.main([]) == 1
+    # 2, not 1. Under the exit-status contract in ``anvil.cli`` exit 1 means
+    # "cases were assessed and some did not meet expectations" — a result about
+    # the agent. Refusing to start because the optimization is finalized is a
+    # malfunction of the invocation, which is exit 2. Nothing can rely on the
+    # 1/2 split unless every script honours it.
+    assert module.main([]) == 2
 
     checked = False
 

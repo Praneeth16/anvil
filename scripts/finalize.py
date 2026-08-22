@@ -21,6 +21,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import yaml  # noqa: E402
 
+from anvil.cli import ExitCode, run_cli  # noqa: E402
 from anvil.eval.runner import EvalReport, evaluate_branch  # noqa: E402
 from anvil.loop.frontier import Frontier, load_frontier  # noqa: E402
 from anvil.runtime.models import RuntimeYAML  # noqa: E402
@@ -93,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
     out_path = Path(args.out) if args.out else REPO_ROOT / DEFAULT_OUT_REL
     if out_path.is_file():
         print(f"ERROR: finalization already exists at {out_path}")
-        return 1
+        return ExitCode.ERROR
 
     try:
         payload = finalize(
@@ -105,7 +106,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     except RuntimeError as exc:
         print(f"ERROR: {exc}")
-        return 1
+        return ExitCode.ERROR
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -116,8 +117,8 @@ def main(argv: list[str] | None = None) -> int:
     for name, score in payload["per_judge"].items():
         print(f"  {name}: {score:.4f}")
     print(f"Written to {out_path}")
-    return 0
+    return ExitCode.OK
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_cli(main))

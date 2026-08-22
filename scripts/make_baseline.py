@@ -36,6 +36,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import yaml  # noqa: E402
 
+from anvil.cli import ExitCode, run_cli  # noqa: E402
 from anvil.eval.cache import CachedBaseline, report_to_baseline  # noqa: E402
 from anvil.eval.runner import evaluate_branch  # noqa: E402
 from anvil.runtime.loader import default_runtime_config_path  # noqa: E402
@@ -170,8 +171,8 @@ def main(argv: list[str] | None = None) -> int:
         f"Baseline written to {out_path}. Aggregate: {baseline.aggregate:.4f}. "
         f"{baseline.n_examples} examples, {baseline.mode} mode."
     )
-    return 0
+    return ExitCode.OK
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_cli(main))
