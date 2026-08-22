@@ -29,12 +29,14 @@ from anvil.loop.frontier import (
     scores_from_eval,
 )
 from anvil.loop.git_ops import (
+    changed_paths,
     commit_all,
     create_round_branch,
     current_branch,
     current_sha,
     delete_branch,
     ff_merge,
+    restore_paths,
 )
 from anvil.loop.mutations_log import MutationRecord, append_mutation
 from anvil.optimizer import (
@@ -42,6 +44,7 @@ from anvil.optimizer import (
     apply_action,
     run_optimizer_session,
 )
+from anvil.optimizer.policy import ToolPolicy
 from anvil.runtime.loader import default_runtime_config_path
 
 
@@ -93,11 +96,20 @@ def run_round(
 
     mode = _read_optimization_mode(scaffold_root)
     optimizer_endpoint = _read_optimizer_endpoint(scaffold_root)
+    cost_budget_usd = _read_cost_budget_usd(scaffold_root)
+    policy = ToolPolicy(root=repo_root)
     print(f"[round {round_id}] mode={mode}")
 
     _starting_branch = current_branch(repo_root)
     parent_sha = current_sha(repo_root)
     baseline = load_baseline(repo_root)
+
+    # Snapshot the tree's existing dirt so the scope check in step 3b can
+    # attribute writes to *this round* rather than to whatever was already
+    # lying around. Runs are normally started on a clean tree, but
+    # `--allow-dirty` exists and leftover round artifacts are common; blaming
+    # the optimizer for a file it never touched would fail rounds at random.
+    pre_session_dirt = set(changed_paths(repo_root))
 
     # 1. Branch off the parent.
     branch = create_round_branch(repo_root, round_id, parent_branch=parent_branch)
@@ -125,11 +137,31 @@ def run_round(
             max_turns=max_turns,
             profile=profile,
             optimizer_endpoint=optimizer_endpoint,
+            policy=policy,
+            max_budget_usd=cost_budget_usd,
         )
     )
 
     # 3. Apply the action (writes scaffold files, edits harness.yaml).
     apply_result = apply_action(action, scaffold_root, mode=mode, repo_root=repo_root)
+
+    # 3b. Verify the session stayed inside its writable scope.
+    #
+    # The permission callback in optimizer/policy.py denies out-of-scope writes
+    # as they are attempted, but it runs inside the Claude Agent SDK and is
+    # therefore only as reliable as the SDK's willingness to call it. This check
+    # depends on nothing but git: whatever mechanism produced a write, the write
+    # shows up here. A violation means the round is unjudgeable -- the mutation
+    # may have altered the very thing about to grade it -- so it is failed rather
+    # than scored, and the offending edits are reverted so they cannot ride the
+    # branch deletion onto the parent.
+    touched_this_round = [p for p in changed_paths(repo_root) if p not in pre_session_dirt]
+    scope_violations = policy.verify_changed_paths(touched_this_round)
+    if scope_violations:
+        restore_paths(repo_root, scope_violations)
+        print(
+            f"[round {round_id}] scope violation, reverted: {', '.join(scope_violations)}"
+        )
 
     # 4. Commit the mutation — but only when the applier actually wrote
     # something. A parse-failure noop (parse_status=no_block) collapses
@@ -163,7 +195,12 @@ def run_round(
     eval_run_id: str | None = None
     eval_failed = False
     eval_report = None
-    if isinstance(action, NoopAction):
+    notes = ""
+    if scope_violations:
+        # Do not spend an eval on a round whose grader integrity is in doubt.
+        eval_failed = True
+        notes = "scope violation: " + ", ".join(scope_violations)
+    elif isinstance(action, NoopAction):
         # No need to evaluate for a noop; the score is the parent's.
         if baseline:
             mutated_score = float(baseline.aggregate)
@@ -226,29 +263,45 @@ def run_round(
             "regenerate the baseline with scripts/make_baseline.py"
         )
 
-    gate_cfg = load_gate_config(scaffold_root)
-    configured_objectives = gate_cfg.pareto.objectives if gate_cfg.pareto.enabled else None
-    if gate_cfg.pareto.enabled and not configured_objectives:
-        configured_objectives = None
-    baseline_scores = (
-        scores_from_baseline(baseline, configured_objectives) if baseline else None
-    )
-    mutated_scores = (
-        scores_from_eval(eval_report, configured_objectives) if eval_report is not None else None
-    )
-    decision, frontier = gate_decision(
-        repo_root=repo_root,
-        gate_type=gate_cfg.type,
-        epsilon=gate_cfg.epsilon,
-        pareto=gate_cfg.pareto,
-        baseline_scores=baseline_scores,
-        baseline_aggregate=baseline_aggregate,
-        mutated_scores=mutated_scores,
-        mutated_aggregate=mutated_score,
-        action_kind=action.action,
-        eval_failed=eval_failed,
-        parse_status=parse_result.parse_status,
-    )
+    # A round that wrote outside its scope does not reach the gate at all.
+    # Routing it through `gate_decision` would be wrong twice over: `decide()`
+    # returns NOOP for a noop action before it ever looks at `eval_failed`, so a
+    # violation on a noop round would be recorded as a clean noop; and a round
+    # that may have edited the frontier, the baseline, or the evaluator must not
+    # be allowed to advance the frontier it just touched.
+    decision: Decision
+    frontier = None
+    if scope_violations:
+        # Note this also avoids *parsing* a config the round may have rewritten:
+        # `load_gate_config` validates strictly and would raise on a tampered
+        # epsilon, turning a handled failure into a crashed loop.
+        decision = Decision.INFRA_FAIL
+    else:
+        gate_cfg = load_gate_config(scaffold_root)
+        configured_objectives = gate_cfg.pareto.objectives if gate_cfg.pareto.enabled else None
+        if gate_cfg.pareto.enabled and not configured_objectives:
+            configured_objectives = None
+        baseline_scores = (
+            scores_from_baseline(baseline, configured_objectives) if baseline else None
+        )
+        mutated_scores = (
+            scores_from_eval(eval_report, configured_objectives)
+            if eval_report is not None
+            else None
+        )
+        decision, frontier = gate_decision(
+            repo_root=repo_root,
+            gate_type=gate_cfg.type,
+            epsilon=gate_cfg.epsilon,
+            pareto=gate_cfg.pareto,
+            baseline_scores=baseline_scores,
+            baseline_aggregate=baseline_aggregate,
+            mutated_scores=mutated_scores,
+            mutated_aggregate=mutated_score,
+            action_kind=action.action,
+            eval_failed=eval_failed,
+            parse_status=parse_result.parse_status,
+        )
 
     # 8. Write critique md.
     critique_path = repo_root / "scaffold" / "memory" / f"round_{round_id:03d}_critique.md"
@@ -284,7 +337,7 @@ def run_round(
                 baseline_score=baseline_aggregate,
                 score_delta=score_delta,
                 parse_status=parse_result.parse_status,
-                notes="",
+                notes=notes,
                 frontier_best=frontier.best if frontier else None,
             ),
             indent=2,
@@ -359,6 +412,7 @@ def run_round(
         score_delta=score_delta,
         eval_run_id=eval_run_id,
         git_commit_sha=commit_sha,
+        notes=notes,
     )
 
 
@@ -402,6 +456,21 @@ def _read_optimization_mode(scaffold_root: Path | str) -> str:
             f"unknown optimization mode {mode!r}; expected 'prompt' or 'code'"
         )
     return mode
+
+
+def _read_cost_budget_usd(scaffold_root: Path | str) -> float | None:
+    """Read ``loop.cost_budget_usd_per_round`` from harness/config.yaml.
+
+    The field has existed since the loop was written and was never enforced.
+    The Claude Agent SDK takes a ``max_budget_usd`` ceiling directly, so the
+    declared budget can now be the real one.
+    """
+    path = default_runtime_config_path(Path(scaffold_root))
+    if not path.is_file():
+        return None
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    budget = (raw.get("loop") or {}).get("cost_budget_usd_per_round")
+    return float(budget) if budget is not None else None
 
 
 def _read_optimizer_endpoint(scaffold_root: Path | str) -> str | None:

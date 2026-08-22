@@ -23,13 +23,25 @@ function loop-side-agnostic and trivially mockable in tests.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from typing import Any
 
 import mlflow
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+from claude_agent_sdk.types import (
+    PermissionResultAllow,
+    PermissionResultDeny,
+    SandboxSettings,
+)
 
 from anvil.optimizer.actions import OptimizerAction
 from anvil.optimizer.parser import ParseResult, parse_action
+from anvil.optimizer.policy import ToolPolicy
+
+logger = logging.getLogger(__name__)
 
 # AI Gateway host for Claude Agent SDK. Set ``ANVIL_AI_GATEWAY_URL``
 # to your workspace's gateway URL — typically
@@ -93,6 +105,8 @@ async def run_optimizer_session(
     optimizer_endpoint: str | None = None,
     experiment_name: str | None = None,
     round_id: int | None = None,
+    policy: ToolPolicy | None = None,
+    max_budget_usd: float | None = None,
 ) -> tuple[OptimizerAction, str, ParseResult]:
     """Open one ``ClaudeSDKClient`` session, drain it, parse the action.
 
@@ -100,6 +114,13 @@ async def run_optimizer_session(
         prompt: Fully-composed user prompt (built by ``loop.builder``).
         cwd: Working directory for the Claude Code subprocess (typically
             the repo root).
+        policy: Confinement policy. Defaults to :class:`ToolPolicy` rooted at
+            ``cwd``, which permits writes under ``scaffold/`` and ``agents/``
+            and denies reads of the evaluation answer key. See
+            :mod:`anvil.optimizer.policy` for why each rule exists.
+        max_budget_usd: Hard spend ceiling for the session, enforced by the
+            SDK. Wire this to ``harness/config.yaml >
+            loop.cost_budget_usd_per_round``.
         max_turns: Hard cap on optimizer CLI turns. The session aborts
             and returns whatever transcript it has if exceeded; the
             parser then falls back to ``NoopAction``.
@@ -138,12 +159,29 @@ async def run_optimizer_session(
         with contextlib.suppress(Exception):
             mlflow.anthropic.autolog()
 
+    policy = policy or ToolPolicy(root=Path(cwd))
     options = ClaudeAgentOptions(
         cwd=cwd,
+        # Allowlist, not denylist: a tool added by a future SDK release arrives
+        # denied. The previous `disallowed_tools=["AskUserQuestion",
+        # "ExitPlanMode"]` denied two tools and permitted everything else,
+        # including Bash and Write over the whole repo.
+        allowed_tools=list(policy.allowed_tools),
         disallowed_tools=["AskUserQuestion", "ExitPlanMode"],
         setting_sources=[],
         max_turns=max_turns,
-        can_use_tool=_allow_all_tool_calls,
+        # OS-level sandbox, independent of the permission callback below.
+        # `allowUnsandboxedCommands=False` is the part that matters: without it
+        # the CLI may escalate out of the sandbox to run a command.
+        sandbox=SandboxSettings(
+            enabled=True,
+            allowUnsandboxedCommands=False,
+            autoAllowBashIfSandboxed=False,
+        ),
+        # Enforces harness/config.yaml's `cost_budget_usd_per_round`, which the
+        # loop declared and never applied.
+        max_budget_usd=max_budget_usd,
+        can_use_tool=_permission_callback(policy),
     )
 
     async def _drain_session() -> str:
@@ -216,13 +254,26 @@ def extract_message_text(message) -> str:
     return "\n".join(parts)
 
 
-async def _allow_all_tool_calls(_tool_name: str, _tool_input: dict, _ctx) -> dict:
-    """Permission callback: blanket-allow every tool call.
+def _permission_callback(
+    policy: ToolPolicy,
+) -> Callable[[str, dict[str, Any], Any], Awaitable[PermissionResultAllow | PermissionResultDeny]]:
+    """Build the SDK permission callback from ``policy``.
 
-    The CLI's filesystem sandbox blocks Write/Edit/Bash redirections
-    under ``cwd`` even with ``permission_mode="bypassPermissions"`` or
-    the ``--dangerously-skip-permissions`` extra arg. The Python
-    callback IS honored, however; this returns ``{"behavior": "allow",
-    "updatedInput": ...}`` for every call. Documented empirically.
+    Returns the SDK's typed results rather than the raw
+    ``{"behavior": "allow"}`` dict the previous implementation used -- that
+    worked by coercion and silently bypassed the declared contract.
+
+    A denial carries the policy's reason so the model learns the boundary
+    instead of retrying the same wall until it burns its turn budget.
     """
-    return {"behavior": "allow", "updatedInput": _tool_input}
+
+    async def _decide(
+        tool_name: str, tool_input: dict[str, Any], _ctx: Any
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        decision = policy.decide(tool_name, tool_input)
+        if decision.allowed:
+            return PermissionResultAllow(updated_input=tool_input)
+        logger.warning("optimizer tool call denied: %s -- %s", tool_name, decision.reason)
+        return PermissionResultDeny(message=decision.reason)
+
+    return _decide

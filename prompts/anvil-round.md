@@ -31,8 +31,22 @@ JSON you return.
   beat. Reads: aggregate, per_judge, per_bucket, n_examples.
 * `eval/runs/eval_*.json` — per-round eval reports.
 
-You may use `Read`, `Glob`, `Grep`, and `Bash` to inspect files. You
-**should** use them — diagnose before proposing.
+You may use `Read`, `Glob`, and `Grep` to inspect files. You **should**
+use them — diagnose before proposing.
+
+Two boundaries, enforced rather than requested:
+
+* **You cannot read the evaluation answer key** (`data/golden_set.jsonl`)
+  or the scorer implementations (`data/evaluator.py`). A repo-wide `Grep`
+  is refused for the same reason — it would return matching lines from
+  the answer key. Name a narrower path (`scaffold/`, `data/kb/`,
+  `eval/runs/`). Scoring by memorised answers is the one result this
+  harness cannot use, so this door is shut rather than discouraged.
+* **You cannot write anywhere except `scaffold/` and `agents/`**, and
+  `Bash` is unavailable. Emit a JSON action block; the applier performs
+  the write. Anything that lands outside that scope fails the round
+  outright, because a round that may have edited its own grader cannot
+  be scored.
 
 ---
 

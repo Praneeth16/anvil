@@ -9,6 +9,7 @@ modes explicit.
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -57,6 +58,51 @@ def has_changes(repo_root: Path | str) -> bool:
     """True if there are tracked or untracked changes in the working tree."""
     res = _run(repo_root, ["status", "--porcelain"], check=False)
     return bool(res.stdout)
+
+
+def changed_paths(repo_root: Path | str) -> tuple[str, ...]:
+    """Repo-relative paths that differ from HEAD, including untracked files.
+
+    Feeds the optimizer's post-session scope check
+    (:meth:`anvil.optimizer.policy.ToolPolicy.verify_changed_paths`). Untracked
+    files are included deliberately: a brand-new file written outside the
+    writable scope is exactly the case a ``git diff`` against HEAD would miss.
+
+    Renames are reported as ``orig -> new``; only the destination is returned,
+    since that is the path that got written.
+    """
+    res = _run(repo_root, ["status", "--porcelain"], check=False)
+    paths: list[str] = []
+    for line in res.stdout.splitlines():
+        # Porcelain v1 is ``XY<space>PATH``, but the status field's first
+        # character is a space for unstaged-only changes (`" M path"`) and
+        # :func:`_run` strips the output -- so a fixed offset silently loses a
+        # character from the first line's path. Split on whitespace instead.
+        parts = line.strip().split(maxsplit=1)
+        if len(parts) != 2:
+            continue
+        entry = parts[1].strip()
+        if " -> " in entry:
+            entry = entry.split(" -> ", 1)[1]
+        paths.append(entry.strip('"'))
+    return tuple(paths)
+
+
+def restore_paths(repo_root: Path | str, paths: Iterable[str]) -> None:
+    """Undo working-tree changes to ``paths``, tracked or not.
+
+    Used when the optimizer wrote outside its writable scope. The violating
+    edits must not survive: the round branch is deleted on ``INFRA_FAIL``, and a
+    checkout carries uncommitted changes with it, so a grader edit left in the
+    tree would land on the parent branch and be picked up by the next round.
+
+    Both commands are best-effort (``check=False``) because exactly one of them
+    applies to any given path -- ``checkout`` restores a tracked file, ``clean``
+    removes an untracked one -- and the other reports an error that is expected.
+    """
+    for path in paths:
+        _run(repo_root, ["checkout", "HEAD", "--", path], check=False)
+        _run(repo_root, ["clean", "-fdq", "--", path], check=False)
 
 
 def has_staged_changes(repo_root: Path | str) -> bool:
