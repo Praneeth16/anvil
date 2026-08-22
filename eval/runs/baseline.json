@@ -1,6 +1,6 @@
 {
-  "scaffold_commit_sha": "b5b2578ef7a646d5539d79ac34f620c67d1c572c",
-  "evaluated_at": "2026-08-22T20:50:03+00:00",
+  "scaffold_commit_sha": "bc0430add927ce6cb26c48d594f9df68e4b2a5c5",
+  "evaluated_at": "2026-08-22T21:11:51+00:00",
   "mode": "standard",
   "scorers": [
     "correctness",
@@ -9,10 +9,10 @@
   ],
   "runtime_endpoint": "databricks-claude-sonnet-4-6",
   "judge_endpoint": "databricks-claude-sonnet-4-6",
-  "aggregate": 0.7944444444444444,
+  "aggregate": 0.8277777777777778,
   "per_judge": {
     "correctness": 0.5833333333333334,
-    "retrieval_groundedness": 0.8,
+    "retrieval_groundedness": 0.9,
     "refusal_appropriateness": 1.0
   },
   "per_bucket": {
@@ -23,7 +23,7 @@
     },
     "multi_hop": {
       "correctness": 0.75,
-      "retrieval_groundedness": 0.75,
+      "retrieval_groundedness": 1.0,
       "refusal_appropriateness": 1.0
     },
     "distractor": {
@@ -37,8 +37,8 @@
     }
   },
   "n_examples": 12,
-  "mlflow_run_id": "d69046b8a2cb4449be3ec12c4584516c",
-  "scorer_fingerprint": "[{\"check_function\": null, \"name\": \"correctness\", \"type\": \"llm\", \"weight\": 1.0}, {\"check_function\": null, \"name\": \"refusal_appropriateness\", \"type\": \"llm\", \"weight\": 1.0}, {\"check_function\": null, \"name\": \"retrieval_groundedness\", \"semantics\": 3, \"type\": \"llm\", \"weight\": 1.0}]",
+  "mlflow_run_id": "aabbcb6a39674ef38e49f62c2ec3dc89",
+  "scorer_fingerprint": "[{\"check_function\": null, \"name\": \"correctness\", \"type\": \"llm\", \"weight\": 1.0}, {\"check_function\": null, \"name\": \"refusal_appropriateness\", \"type\": \"llm\", \"weight\": 1.0}, {\"check_function\": null, \"name\": \"retrieval_groundedness\", \"semantics\": 4, \"type\": \"llm\", \"weight\": 1.0}]",
   "cost_metrics": {
     "total_context_chars": 1042.0,
     "n_rows": 12.0

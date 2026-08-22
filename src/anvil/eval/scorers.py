@@ -117,8 +117,10 @@ SYNTHESIZED_TRACE_TAG = "anvil.synthesized_trace"
 #   v2 — applicability rule added (see ``_build_groundedness_scorer``).
 #   v3 — one verdict over the union of all retrieval spans instead of one
 #        verdict per span collapsed last-wins.
+#   v4 — a row whose trace was lost and replaced by a synthesized stand-in is
+#        not applicable rather than ungrounded.
 SCORER_SEMANTICS_VERSIONS: dict[str, int] = {
-    GROUNDEDNESS_SCORER_NAME: 3,
+    GROUNDEDNESS_SCORER_NAME: 4,
 }
 
 # Default location of the programmatic check-function module, relative
