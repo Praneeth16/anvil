@@ -199,3 +199,69 @@ offline paths only, and `run_cli`'s `RunInterrupted` branch is dead on the live
 path. The live protections are the ones in steps 3-5: mlflow's own retries
 (`call_with_retry`, currently `max_retries=0`), the error capture, and the
 judgeability guards.
+
+## What the first live run against a real workspace found
+
+Everything above passed 485 offline tests and then failed three times in a row
+against `fe-vm-lakebase-praneeth`. Recorded because the *reason* the offline
+suite was blind generalises.
+
+`_resilient_eval_harness`'s fallback for a missing per-row trace is
+`create_minimal_trace`, and that function ends in:
+
+```python
+return mlflow.get_trace(root_span.trace_id)
+```
+
+It depends on the very retrieval it exists to compensate for. Against a local
+file store that always succeeds, so the fallback always works and every offline
+test passes. Against the Databricks Tracing Server it returns `None` —
+persistently, not transiently: the live run logged *"no retrievable trace after 3
+fallback attempts"*. So nothing was fixed, and the crash relocated to the next
+unguarded dereference of `eval_item.trace`.
+
+It relocated to exactly the three places `_resilient_eval_harness`'s own
+docstring had named in advance, which is worth sitting with — the failure modes
+were documented and still unguarded:
+
+| Site | Symptom |
+|---|---|
+| `batch_link_traces_to_run` (`trace_utils.py`:1014) | unguarded list comprehension; killed the run *after* 8 predictions and 24 judge calls were paid for |
+| `construct_eval_result_df` (`trace_utils.py`:925) | swallows the error, returns `None`, which reaches `_aggregate_report` as `len(None)` |
+| `mlflow.start_span` + `@trace_disabled` | a prediction failure thrown *into* the span's context manager emerged as `RuntimeError: generator didn't stop after throw()`, replacing a real 404 |
+
+The third was a Phase 2 failure specifically: mlflow records `error_message` from
+whatever escapes `predict_fn`, so the evidence would have recorded generator
+plumbing instead of the endpoint failure. `_traced_predict` now catches the body's
+exception, closes the span normally, and re-raises after — so `predict_fn` still
+raises, and what it raises is real.
+
+**And the fix re-created the bug it was fixing.** A row dropped for want of a
+trace is not an *error* — the prediction succeeded — so `error_rate` never sees
+it, and it is absent from `n_rows`. With the sample-size floor capped at
+`n_rows`, losing six of eight rows leaves `error_rate` at `0.0` and a floor that
+shrank to 2 along with the sample: no guard fires. Exactly the silent sample loss
+that excluding errored rows introduced, one layer down. Hence `n_dropped_rows`
+and `n_attempted`, with the floor computed against the latter.
+
+mlflow's pre-flight `check_model_prediction` is now skipped (scoped and
+restored). It is what masks the failure above, and it then aborts the whole run —
+so the row never becomes an error record and none of the Phase 2 guards engage.
+Skipping it lets the failure land on row 1, where it is captured as evidence. Its
+other job, auto-wrapping an untraced `predict_fn`, is redundant against the root
+span `evaluate_branch` already opens.
+
+### Live verification
+
+Against `fe-vm-lakebase-praneeth`, runtime and judge on
+`databricks-claude-sonnet-4-6`:
+
+| Case | Result |
+|---|---|
+| Healthy, `--mode quick` | exit **0**, 8/8 rows, aggregate 0.875 (correctness 0.625, groundedness 1.0, refusal 1.0), `n_errors=0`, `n_dropped_rows=0` |
+| Runtime endpoint set to a nonexistent model | exit **2**, `n_errors=8`, `error_rate=1.00`, refused with `error rate 1.00 exceeds ceiling 0.20 (8/8 cases never assessed)`; each `error_message` carries the real `404 RESOURCE_DOES_NOT_EXIST` |
+
+The load-bearing number in the fault case is **`n_unattributed_errors=0`**: the
+`trace_id` join between the shim's capture and `result_df` held for all eight
+errored rows against the real tracing server. That was the one assumption the
+offline tests could only check against a local file store.

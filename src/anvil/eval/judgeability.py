@@ -63,12 +63,20 @@ def unjudgeable_reason(
             f"error rate {report.error_rate:.2f} exceeds ceiling {max_error_rate:.2f} "
             f"({report.n_errors}/{report.n_rows} cases never assessed)"
         )
-    floor = min(min_scorable_rows, report.n_rows)
+    # Capped at what the run ATTEMPTED, not at what survived into the frame.
+    # Rows dropped for want of a trace are absent from ``n_rows``, so capping
+    # against it would let row loss lower the very bar it should trip.
+    floor = min(min_scorable_rows, report.n_attempted)
     if report.n_scorable < floor:
+        dropped = (
+            f", {report.n_dropped_rows} dropped for want of a trace"
+            if report.n_dropped_rows
+            else ""
+        )
         return (
-            f"only {report.n_scorable} of {report.n_rows} cases were assessed, "
-            f"below the floor of {floor} — the aggregate is a mean over too few "
-            "cases to compare"
+            f"only {report.n_scorable} of {report.n_attempted} cases were assessed"
+            f"{dropped}, below the floor of {floor} — the aggregate is a mean over "
+            "too few cases to compare"
         )
     return ""
 

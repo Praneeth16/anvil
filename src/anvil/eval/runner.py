@@ -37,7 +37,7 @@ import warnings
 from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -106,6 +106,13 @@ class EvalReport:
     # is unjudgeable regardless of the error rate. See
     # :func:`anvil.eval.judgeability.unjudgeable_reason`.
     n_unattributed_errors: int = 0
+    # Rows that ran but never made it into ``result_df`` because their trace was
+    # not retrievable. NOT errors -- the prediction succeeded -- but not measured
+    # either, and invisible to ``error_rate`` because they are absent from
+    # ``n_rows``. Without counting them, losing six of eight rows this way leaves
+    # error_rate 0.0 and shrinks the floor along with the sample, so no guard
+    # fires. The judgeability floor is computed against ``n_attempted``.
+    n_dropped_rows: int = 0
     # Always-available eval cost proxies. Token usage may be added when
     # supplied by MLflow traces; context characters and row count do not
     # require another service call.
@@ -139,6 +146,16 @@ class EvalReport:
         if not self.n_rows:
             return 1.0 if self.n_errors else 0.0
         return min(1.0, self.n_errors / self.n_rows)
+
+    @property
+    def n_attempted(self) -> int:
+        """Rows the eval actually tried, including any dropped for want of a trace.
+
+        The denominator a sample-size floor has to use. ``n_rows`` counts what
+        survived into the frame, so comparing a floor against it lets row loss
+        lower the bar it was supposed to trip.
+        """
+        return self.n_rows + self.n_dropped_rows
 
     @property
     def n_scorable(self) -> int:
@@ -367,6 +384,7 @@ def _aggregate_report(
     mode: str,
     scorer_fingerprint: str = "",
     errored: dict[str, str] | None = None,
+    n_dropped_rows: int = 0,
 ) -> EvalReport:
     n_rows = len(result_df)
 
@@ -524,6 +542,7 @@ def _aggregate_report(
         n_errors=len(errored),
         errors=errors,
         n_unattributed_errors=len(unattributed),
+        n_dropped_rows=n_dropped_rows,
         cost_metrics={
             "total_context_chars": float(
                 sum(len(str(ex.get("query", ""))) for ex in examples[:n_rows])
@@ -626,12 +645,84 @@ def _load_memory_system(
 # rather than mlflow's default.
 _MLFLOW_MAX_WORKERS_ENV = "MLFLOW_GENAI_EVAL_MAX_WORKERS"
 
+# mlflow runs ``check_model_prediction`` before the eval, invoking predict_fn once
+# under ``@trace_disabled``. Two reasons anvil skips it, both observed live:
+#
+# 1. It converts a prediction failure into an opaque crash. The exception escapes
+#    predict_fn into mlflow's own pyfunc validation wrapper -- a generator-based
+#    context manager that mishandles ``throw()`` -- and emerges as
+#    ``RuntimeError: generator didn't stop after throw()``. A wrong endpoint name
+#    in harness/config.yaml surfaced as exactly that, with the underlying 404
+#    replaced. mlflow then aborts the whole run, so the row never becomes an
+#    error record and none of the Phase 2 guards engage: no error_rate, no
+#    exclusion, no legible refusal. Skipping the check lets the failure happen on
+#    the first real row instead, where it IS captured as evidence.
+# 2. Its other job -- auto-wrapping an untraced predict_fn -- is redundant here.
+#    ``evaluate_branch`` opens its own root CHAIN span per row, which is the
+#    stronger guarantee because it also nests the RETRIEVER span.
+#
+# A signature mismatch, the check's remaining value, would fail on row 1 and be
+# reported as an error rather than silently passing.
+_MLFLOW_SKIP_VALIDATION_ENV = "MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"
+
 # Name of the per-row root span ``evaluate_branch`` wraps every
 # ``predict_fn`` invocation in. The span yields a real per-row trace
 # carrying the ``RETRIEVER`` span that ``RetrievalGroundedness`` scores;
 # ``_resilient_eval_harness`` (PR #21) is the safety net that prevents a
 # crash if a row's trace is still None. See ``evaluate_branch``.
 _PREDICT_SPAN_NAME = "anvil.predict"
+
+# How hard to retry the minimal-trace fallback before giving up on a row. The
+# fallback itself calls ``mlflow.get_trace``, which is the unreliable step, so a
+# single attempt is not a fallback at all on the live tracing server.
+_TRACE_FALLBACK_ATTEMPTS = 3
+_TRACE_FALLBACK_BACKOFF_S = 0.25
+
+
+def _traced_predict(inputs: dict[str, Any], body: Callable[[], str]) -> str:
+    """Run ``body`` inside the per-row root span, re-raising *after* it closes.
+
+    The span is what guarantees a per-row trace (see the ``predict_fn``s in
+    :func:`evaluate_branch`). The subtlety is what happens when ``body`` fails.
+
+    Raising inside the ``with`` throws the exception *into*
+    ``mlflow.start_span``'s generator-based context manager. Live, that manager
+    is sometimes a no-op -- mlflow's own pre-flight ``check_model_prediction``
+    invokes ``predict_fn`` under ``@trace_disabled`` -- and throwing into it
+    produces ``RuntimeError: generator didn't stop after throw()``, which
+    *replaces* the real exception. Observed live: one wrong endpoint name in
+    ``harness/config.yaml`` surfaced as that RuntimeError and nothing else, with
+    the underlying 404 gone.
+
+    That is a Failure-vs-Error problem, not just a confusing message. mlflow
+    records ``eval_item.error_message`` from whatever escapes ``predict_fn``, and
+    :func:`_resilient_eval_harness` captures it so the row can be excluded and
+    the round guarded. If what escapes is a generator-plumbing RuntimeError, the
+    evidence records that instead of the endpoint failure, and an operator
+    debugging a degraded round is sent to the wrong place.
+
+    So the exception is caught, noted on the span, and re-raised once the span
+    has closed normally. ``predict_fn`` still raises, so nothing downstream
+    changes -- except that what it raises is the real error.
+    """
+    error: BaseException | None = None
+    text = ""
+    with mlflow.start_span(name=_PREDICT_SPAN_NAME, span_type=SpanType.CHAIN) as span:
+        span.set_inputs(inputs)
+        try:
+            text = body()
+        except BaseException as exc:  # noqa: BLE001 - re-raised below, unchanged
+            error = exc
+            # Best-effort annotation: a no-op span (trace_disabled) may not
+            # accept attributes, and losing the annotation must not lose the
+            # error itself.
+            with suppress(Exception):
+                span.set_attribute("anvil.predict_error", f"{type(exc).__name__}: {exc}")
+        else:
+            span.set_outputs({"response": text})
+    if error is not None:
+        raise error
+    return text
 
 
 @contextmanager
@@ -649,7 +740,11 @@ def _synchronous_trace_logging():
 
 
 @contextmanager
-def _resilient_eval_harness(*, error_sink: dict[str, str] | None = None):
+def _resilient_eval_harness(
+    *,
+    error_sink: dict[str, str] | None = None,
+    dropped_sink: set[str] | None = None,
+):
     """Scope a defensive shim around ``mlflow.genai.evaluate``'s harness.
 
     Also the interception point for per-row prediction errors. When
@@ -725,6 +820,8 @@ def _resilient_eval_harness(*, error_sink: dict[str, str] | None = None):
 
     _orig_get_new_expectations = _harness._get_new_expectations
     _orig_run_predict = _harness._run_predict
+    _orig_batch_link = _harness.batch_link_traces_to_run
+    _orig_construct_df = _harness.construct_eval_result_df
 
     def _get_new_expectations_none_safe(eval_item):
         # mlflow 3.11.x harness.py:936 derefs ``eval_item.trace.info.assessments``
@@ -748,7 +845,32 @@ def _resilient_eval_harness(*, error_sink: dict[str, str] | None = None):
         # the predict_fn path does not, so apply the same fallback here. This
         # fetches by the just-created trace_id (reliable, sync), not request_id.
         if predict_fn is not None and eval_item.trace is None:
-            eval_item.trace = create_minimal_trace(eval_item)
+            # ``create_minimal_trace`` ends in ``mlflow.get_trace(...)``, i.e. it
+            # depends on the very retrieval this fallback exists to work around.
+            # Against a local file store it always succeeds, so every offline
+            # test passes; against the Databricks Tracing Server it can return
+            # None, and then nothing has been fixed. Retry a couple of times --
+            # export is synchronous here, but the server can still lag the write.
+            for attempt in range(_TRACE_FALLBACK_ATTEMPTS):
+                eval_item.trace = create_minimal_trace(eval_item)
+                if eval_item.trace is not None:
+                    break
+                if attempt + 1 < _TRACE_FALLBACK_ATTEMPTS:
+                    time.sleep(_TRACE_FALLBACK_BACKOFF_S * (attempt + 1))
+            if eval_item.trace is None:
+                # Counted, not just logged. A dropped row shrinks the sample the
+                # aggregate rests on without being an *error*, so nothing else
+                # would notice -- the same shape of silent sample loss that
+                # excluding errored rows introduced. See EvalReport.n_dropped_rows.
+                if dropped_sink is not None:
+                    dropped_sink.add(str(eval_item.request_id))
+                logger.warning(
+                    "row %s has no retrievable trace after %s fallback attempts; "
+                    "it will be dropped from the result frame rather than crash "
+                    "the run",
+                    eval_item.request_id,
+                    _TRACE_FALLBACK_ATTEMPTS,
+                )
         # The row never produced an answer. Record it so the aggregate can
         # exclude it rather than scoring the absence as a wrong answer.
         if error_sink is not None and eval_item.error_message:
@@ -758,13 +880,48 @@ def _resilient_eval_harness(*, error_sink: dict[str, str] | None = None):
             # __setitem__ is atomic, so no lock is needed.
             error_sink[key] = str(eval_item.error_message)
 
+    def _batch_link_traces_to_run_none_safe(run_id, eval_results):
+        # trace_utils.py:1014 is an unguarded
+        # ``[r.eval_item.trace.info.trace_id for r in eval_results]``. A row whose
+        # trace is still None after the fallback above kills the whole run HERE,
+        # after every prediction and every judge call has already been paid for.
+        # Observed live on 2026-08-22: 8/8 rows predicted and scored, then the
+        # run died at this line. Link the rows that have a trace and drop the
+        # rest -- a run that loses one row from the frame is worth far more than
+        # a run that loses all of them.
+        linkable = [r for r in eval_results if getattr(r.eval_item, "trace", None) is not None]
+        dropped = len(eval_results) - len(linkable)
+        if dropped:
+            logger.warning(
+                "%s row(s) had no trace to link and were dropped from the result "
+                "frame; the aggregate is computed over the rest",
+                dropped,
+            )
+        if not linkable:
+            return None
+        return _orig_batch_link(run_id=run_id, eval_results=linkable)
+
+    def _construct_eval_result_df_none_safe(run_id, traces, eval_results):
+        # trace_utils.py:925 derefs ``eval_result.eval_item.trace.info.trace_id``
+        # inside a try/except that swallows the AttributeError and returns None.
+        # A None DataFrame then reaches ``_aggregate_report`` as
+        # ``len(None)`` -> TypeError, so guarding the two sites above merely
+        # moved the crash here. Observed live on 2026-08-22, after the
+        # batch-link guard: "Evaluation completed", run logged, then TypeError.
+        usable = [r for r in eval_results if getattr(r.eval_item, "trace", None) is not None]
+        return _orig_construct_df(run_id, traces, usable)
+
     _harness._get_new_expectations = _get_new_expectations_none_safe
     _harness._run_predict = _run_predict_with_minimal_trace_fallback
+    _harness.batch_link_traces_to_run = _batch_link_traces_to_run_none_safe
+    _harness.construct_eval_result_df = _construct_eval_result_df_none_safe
     try:
         yield
     finally:
         _harness._get_new_expectations = _orig_get_new_expectations
         _harness._run_predict = _orig_run_predict
+        _harness.batch_link_traces_to_run = _orig_batch_link
+        _harness.construct_eval_result_df = _orig_construct_df
 
 
 def _predict_one(
@@ -1082,13 +1239,15 @@ def evaluate_branch(
         )
 
         def predict_fn(query: str, **_kwargs: Any) -> str:
-            # Wrap in an explicit root span so every row yields a trace.
-            # See the prompt-mode predict_fn below for the full rationale.
-            with mlflow.start_span(name=_PREDICT_SPAN_NAME, span_type=SpanType.CHAIN) as span:
-                span.set_inputs({"query": query})
+            # Wrap in an explicit root span so every row yields a trace. See the
+            # prompt-mode predict_fn below for the full rationale, and
+            # ``_traced_predict`` for why the body's exception is re-raised
+            # *outside* the span rather than thrown into it.
+            def _body() -> str:
                 answer, _metadata = memory_system.predict(query)
-                span.set_outputs({"response": answer})
                 return answer
+
+            return _traced_predict({"query": query}, _body)
     else:
         # Prompt mode: compose the system prompt from scaffold/ and run
         # the AnvilAgent tool-calling loop against the runtime endpoint.
@@ -1127,15 +1286,14 @@ def evaluate_branch(
             # per-row trace. The span ends (and the trace exports) when the
             # ``with`` block exits — async logging is disabled during eval
             # (``is_evaluate=True``), so the trace is available immediately.
-            with mlflow.start_span(name=_PREDICT_SPAN_NAME, span_type=SpanType.CHAIN) as span:
-                span.set_inputs({"query": query})
+            def _body() -> str:
                 request = ResponsesAgentRequest(
                     input=[{"type": "message", "role": "user", "content": query}]
                 )
                 response = agent.predict(request)
-                text = _extract_final_text(response)
-                span.set_outputs({"response": text})
-                return text
+                return _extract_final_text(response)
+
+            return _traced_predict({"query": query}, _body)
 
     aggregate_scorer_configs = list(cfg.scorers)
     aggregate_scorer_names = [c.name for c in aggregate_scorer_configs]
@@ -1171,8 +1329,13 @@ def evaluate_branch(
     # Filled by the harness shim with trace_id -> error_message for any row
     # whose prediction raised. Those rows are excluded from the scores.
     errored: dict[str, str] = {}
+    # Rows whose trace never became retrievable, so mlflow cannot represent them
+    # in the result frame. Counted so the sample-size floor sees them.
+    dropped: set[str] = set()
     _prev_workers = os.environ.get(_MLFLOW_MAX_WORKERS_ENV)
     os.environ[_MLFLOW_MAX_WORKERS_ENV] = str(n_workers)
+    _prev_skip = os.environ.get(_MLFLOW_SKIP_VALIDATION_ENV)
+    os.environ[_MLFLOW_SKIP_VALIDATION_ENV] = "True"
     try:
         # On the Databricks Tracing Server, async export can race the eval
         # harness's immediate per-row get_trace(request_id). A missing trace
@@ -1186,7 +1349,10 @@ def evaluate_branch(
         # synthesizes a minimal trace so the run completes with a real
         # result DataFrame. See its docstring for the exact harness.py
         # symbols and lines patched.
-        with _resilient_eval_harness(error_sink=errored), _synchronous_trace_logging():
+        with (
+            _resilient_eval_harness(error_sink=errored, dropped_sink=dropped),
+            _synchronous_trace_logging(),
+        ):
             result = mlflow.genai.evaluate(
                 data=dataset,
                 scorers=scorers,
@@ -1197,6 +1363,20 @@ def evaluate_branch(
             os.environ.pop(_MLFLOW_MAX_WORKERS_ENV, None)
         else:
             os.environ[_MLFLOW_MAX_WORKERS_ENV] = _prev_workers
+        if _prev_skip is None:
+            os.environ.pop(_MLFLOW_SKIP_VALIDATION_ENV, None)
+        else:
+            os.environ[_MLFLOW_SKIP_VALIDATION_ENV] = _prev_skip
+
+    if result.result_df is None:
+        # Every row lost its trace, so mlflow built no frame at all. Raising here
+        # beats letting ``len(None)`` surface as a TypeError three frames deeper,
+        # which is how this presented live before the shim guarded it.
+        raise RuntimeError(
+            f"mlflow produced no result frame: all {len(dataset)} row(s) lacked a "
+            "retrievable trace. The eval ran and was paid for, but nothing can be "
+            "scored from it."
+        )
 
     experiment = mlflow.get_experiment_by_name(snapshot.config.experiments.eval)
     return _aggregate_report(
@@ -1211,4 +1391,5 @@ def evaluate_branch(
         mode=selected_mode,
         scorer_fingerprint=scorer_fingerprint,
         errored=errored,
+        n_dropped_rows=len(dropped),
     )
