@@ -51,7 +51,10 @@ def default_runtime_config_path(scaffold_root: Path | str) -> Path:
     return Path(scaffold_root).parent / "harness" / "config.yaml"
 
 
-def load_eval_config(scaffold_root: Path | str) -> EvalConfig:
+def load_eval_config(
+    scaffold_root: Path | str,
+    runtime_config_path: Path | str | None = None,
+) -> EvalConfig:
     """Read and validate just the ``eval`` section of ``harness/config.yaml``.
 
     For callers that need one eval setting (the round's error-rate ceiling, the
@@ -60,10 +63,20 @@ def load_eval_config(scaffold_root: Path | str) -> EvalConfig:
     through :class:`EvalConfig` rather than read raw so a nonsense value fails
     here instead of silently disabling the guard it configures.
 
+    ``runtime_config_path`` mirrors :func:`load_harness`'s parameter and matters
+    for the same reason: a caller that ran the eval against an explicit config
+    must read its thresholds from *that* file. Resolving the default path here
+    while the eval ran under a custom one would judge a report against a ceiling
+    it was never measured under.
+
     Falls back to the model defaults when the file or the section is absent, so
     the loop keeps running on a repo that predates a field.
     """
-    path = default_runtime_config_path(Path(scaffold_root))
+    path = (
+        Path(runtime_config_path)
+        if runtime_config_path is not None
+        else default_runtime_config_path(Path(scaffold_root))
+    )
     if not path.is_file():
         return EvalConfig()
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}

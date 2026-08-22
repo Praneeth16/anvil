@@ -730,6 +730,61 @@ def test_baseline_generation_accepts_a_healthy_eval(
     assert baseline.to_dict()["n_errors"] == 1
 
 
+def test_baseline_gate_reads_the_config_the_eval_ran_under(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate's thresholds must come from the same file as the eval's.
+
+    ``build_baseline`` forwards an explicit ``runtime_config_path`` to
+    ``evaluate_branch`` precisely so the recorded endpoints cannot diverge from
+    the config that produced the eval. The judgeability gate has to honour the
+    same path: resolving the default one would judge the report against a
+    ceiling it was never measured under. The earlier tests here pass no custom
+    path, so both resolve identically and the divergence is invisible to them.
+    """
+    module = _load_script("make_baseline")
+    repo = _baseline_repo(tmp_path)
+
+    # A second config, permissive, at a non-default location. The default one
+    # written by _baseline_repo would reject this report.
+    custom = tmp_path / "custom-config.yaml"
+    custom.write_text(
+        "runtime_endpoint: rt\noptimizer_endpoint: op\njudge_endpoint: j\n"
+        "experiments:\n  runtime: r\n  eval: e\n  optimizer: o\n"
+        "eval:\n  max_error_rate: 1.0\n  min_scorable_rows: 0\n"
+    )
+
+    monkeypatch.setattr(
+        module, "evaluate_branch", lambda **_kw: _report_with_error_rate(0.75, aggregate=0.9)
+    )
+
+    baseline = module.build_baseline(
+        scaffold_root=repo / "scaffold", runtime_config_path=custom
+    )
+    assert baseline.aggregate == 0.9
+
+    # And the strict default config still rejects the same report, proving the
+    # custom thresholds are what allowed it through rather than a disabled gate.
+    with pytest.raises(RuntimeError, match="refusing to cache a baseline"):
+        module.build_baseline(scaffold_root=repo / "scaffold")
+
+
+def test_load_eval_config_honours_an_explicit_path(tmp_path: Path) -> None:
+    from anvil.runtime.loader import load_eval_config
+
+    (tmp_path / "scaffold").mkdir()
+    (tmp_path / "harness").mkdir()
+    (tmp_path / "harness" / "config.yaml").write_text("eval:\n  max_error_rate: 0.1\n")
+    other = tmp_path / "other.yaml"
+    other.write_text("eval:\n  max_error_rate: 0.9\n")
+
+    assert load_eval_config(tmp_path / "scaffold").max_error_rate == 0.1
+    assert load_eval_config(tmp_path / "scaffold", other).max_error_rate == 0.9
+    # A path that does not exist falls back to defaults rather than raising, so
+    # a repo predating the field keeps working.
+    assert load_eval_config(tmp_path / "scaffold", tmp_path / "nope.yaml").max_error_rate == 0.2
+
+
 def test_a_clean_baseline_keeps_the_historical_on_disk_schema() -> None:
     """``n_errors`` is additive: a baseline with none omits the key, so files
     written before the failure/error split still round-trip byte-identically."""

@@ -2,12 +2,14 @@
 
 Four codes, borrowed from the heddle contracts:
 
-======  =========================================================
-``0``   Every case was assessed and met its expectations.
+======  ==========================================================
+``0``   The run produced a usable measurement. May still contain
+        assessed failures -- see the note on ``1`` below.
 ``1``   Cases were assessed and some did not meet expectations.
+        Only ever returned when failure gating is asked for.
 ``2``   The run could not produce a usable answer.
 ``130`` An operator interrupted it (``128 + SIGINT``).
-======  =========================================================
+======  ==========================================================
 
 The load-bearing distinction is 1 vs 2, and it is the same one as failure vs
 error a layer down (:mod:`anvil.eval.outcome`): a caller that cannot tell "the

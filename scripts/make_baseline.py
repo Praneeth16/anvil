@@ -153,7 +153,11 @@ def build_baseline(
     # operator would rerun; now those rows are excluded and the same run reads
     # the mean of the two that survived -- higher than a healthy baseline, and
     # indistinguishable from one. Refuse instead.
-    reason = unjudgeable_reason_for(report, load_eval_config(scaffold_path))
+    # Thresholds from ``runtime_path``, the same file the eval above ran under.
+    # Resolving the default path here instead would judge the report against a
+    # ceiling it was never measured under whenever a custom config is passed --
+    # the same divergence the comment above guards the endpoints from.
+    reason = unjudgeable_reason_for(report, load_eval_config(scaffold_path, runtime_path))
     if reason:
         raise RuntimeError(
             f"refusing to cache a baseline that cannot be judged: {reason}. "
