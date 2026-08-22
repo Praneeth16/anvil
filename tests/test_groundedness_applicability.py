@@ -531,6 +531,65 @@ def test_semantics_version_is_in_the_groundedness_fingerprint() -> None:
     assert fp[0]["semantics"] == SCORER_SEMANTICS_VERSIONS[GROUNDEDNESS_SCORER_NAME]
 
 
+def _cached(**overrides: Any):
+    from anvil.eval.cache import CachedBaseline
+
+    kwargs: dict[str, Any] = {
+        "scaffold_commit_sha": "abc",
+        "evaluated_at": "2026-04-28T03:42:00+00:00",
+        "mode": "quick",
+        "scorers": ["correctness", "retrieval_groundedness"],
+        "runtime_endpoint": "databricks-claude-sonnet-4-6",
+        "judge_endpoint": "databricks-claude-sonnet-4-6",
+        "aggregate": 0.74,
+    }
+    kwargs.update(overrides)
+    return CachedBaseline(**kwargs)
+
+
+def test_a_fingerprintless_baseline_is_refused_for_a_versioned_scorer() -> None:
+    """The gap the semantics version left open, and the only baseline on disk.
+
+    ``eval/runs/baseline.json`` predates fingerprinting, so the
+    backward-compatibility exemption waved it straight through — meaning the
+    version bump protected every baseline except the one that actually needed
+    invalidating. Its ``per_bucket`` still records ``out_of_scope:
+    {retrieval_groundedness: 0.0}``, a bucket that now carries no groundedness
+    value at all.
+    """
+    from anvil.eval.cache import compute_scorer_fingerprint, is_compatible
+    from anvil.runtime.models import ScorerConfig
+
+    fingerprint = compute_scorer_fingerprint(
+        [ScorerConfig(name="correctness"), ScorerConfig(name="retrieval_groundedness")]
+    )
+    assert not is_compatible(
+        _cached(scorer_fingerprint=""),
+        mode="quick",
+        scorers=["correctness", "retrieval_groundedness"],
+        runtime_endpoint="databricks-claude-sonnet-4-6",
+        judge_endpoint="databricks-claude-sonnet-4-6",
+        scorer_fingerprint=fingerprint,
+    )
+
+
+def test_a_fingerprintless_baseline_still_works_for_unversioned_scorers() -> None:
+    """The exemption survives where it was justified: a scorer whose meaning has
+    never changed does not need a fingerprint to be comparable."""
+    from anvil.eval.cache import compute_scorer_fingerprint, is_compatible
+    from anvil.runtime.models import ScorerConfig
+
+    fingerprint = compute_scorer_fingerprint([ScorerConfig(name="correctness")])
+    assert is_compatible(
+        _cached(scorers=["correctness"], scorer_fingerprint=""),
+        mode="quick",
+        scorers=["correctness"],
+        runtime_endpoint="databricks-claude-sonnet-4-6",
+        judge_endpoint="databricks-claude-sonnet-4-6",
+        scorer_fingerprint=fingerprint,
+    )
+
+
 def test_unversioned_scorers_keep_their_old_fingerprint() -> None:
     """Bumping one scorer's semantics must not invalidate baselines for configs
     that do not use it."""

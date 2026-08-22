@@ -205,6 +205,21 @@ def is_compatible(
     An empty fingerprint on either side (e.g. a baseline written before
     this field existed) skips the fingerprint check for backward
     compatibility.
+
+    **Except** when the requested scorers include one whose semantics have been
+    versioned (:data:`anvil.eval.scorers.SCORER_SEMANTICS_VERSIONS`). Then a
+    missing fingerprint is refused rather than waved through, because the
+    exemption and the version bump contradict each other: the bump says this
+    scorer's meaning demonstrably changed, and an absent fingerprint means we
+    cannot tell which meaning the baseline was measured under. Waving it through
+    is the one case where the answer is knowably wrong.
+
+    Not hypothetical. The shipped ``eval/runs/baseline.json`` predates
+    fingerprinting entirely, and it is exactly the baseline that needed
+    invalidating when ``retrieval_groundedness`` gained its applicability rule —
+    its ``per_bucket`` still records ``out_of_scope: {retrieval_groundedness:
+    0.0}``, a bucket that now has no groundedness value at all. Without this
+    branch the version bump protected every baseline except the only one on disk.
     """
     if (
         cached.mode != mode
@@ -213,10 +228,11 @@ def is_compatible(
         or cached.judge_endpoint != judge_endpoint
     ):
         return False
-    return (
+    if cached.scorer_fingerprint and scorer_fingerprint:
+        return cached.scorer_fingerprint == scorer_fingerprint
+    return not (
         not cached.scorer_fingerprint
-        or not scorer_fingerprint
-        or cached.scorer_fingerprint == scorer_fingerprint
+        and any(name in SCORER_SEMANTICS_VERSIONS for name in scorers)
     )
 
 
