@@ -140,12 +140,36 @@ class EvalReport:
         this today (``_aggregate_report`` needs a DataFrame), but a guard's
         degenerate case should point at "refuse", not at "fine".
 
-        Clamped to ``1.0`` because ``n_errors`` counts captured errors, which
-        can in principle exceed the rows that made it into ``result_df``.
+        Clamped to ``1.0`` because ``n_errors`` counts captured errors, which can
+        exceed the rows that made it into ``result_df`` -- not hypothetically:
+        a row can error AND then lose its trace, leaving it counted here and
+        absent from ``n_rows``.
+
+        This is for reporting. Guards should read :attr:`unmeasured_rate`, which
+        also sees rows that vanished without erroring.
         """
         if not self.n_rows:
             return 1.0 if self.n_errors else 0.0
         return min(1.0, self.n_errors / self.n_rows)
+
+    @property
+    def unmeasured_rate(self) -> float:
+        """Fraction of ATTEMPTED cases that produced no usable score.
+
+        The number a guard should read, because it is the union of the two ways a
+        case goes unscored: it errored, or it vanished from the frame. Neither is
+        visible in :attr:`error_rate`, which divides errors by the *surviving*
+        rows and so cannot see a dropped one at all.
+
+        Without this, a 20-row run that loses 16 traces reports ``error_rate``
+        0.0, four scorable rows, and a floor of 4 -- judgeable, and a four-row
+        mean extends the frontier. An absolute floor alone is too blunt: it is
+        satisfiable by any run big enough, which is every mode above ``quick``.
+        """
+        attempted = self.n_attempted
+        if not attempted:
+            return 1.0 if (self.n_errors or self.n_dropped_rows) else 0.0
+        return min(1.0, (self.n_errors + self.n_dropped_rows) / attempted)
 
     @property
     def n_attempted(self) -> int:
@@ -385,6 +409,7 @@ def _aggregate_report(
     scorer_fingerprint: str = "",
     errored: dict[str, str] | None = None,
     n_dropped_rows: int = 0,
+    attempted_examples: list[dict] | None = None,
 ) -> EvalReport:
     n_rows = len(result_df)
 
@@ -543,11 +568,15 @@ def _aggregate_report(
         errors=errors,
         n_unattributed_errors=len(unattributed),
         n_dropped_rows=n_dropped_rows,
+        # Cost is what the run SPENT, so it is measured over the rows it
+        # attempted. Measuring it over the survivors would make losing rows look
+        # like a cost improvement to a minimising Pareto objective on ``n_rows``
+        # or ``context_chars`` -- row loss registering as a win.
         cost_metrics={
             "total_context_chars": float(
-                sum(len(str(ex.get("query", ""))) for ex in examples[:n_rows])
+                sum(len(str(ex.get("query", ""))) for ex in (attempted_examples or examples))
             ),
-            "n_rows": float(n_rows),
+            "n_rows": float(n_rows + n_dropped_rows),
         },
         scorer_fingerprint=scorer_fingerprint,
     )
@@ -713,9 +742,17 @@ def _traced_predict(inputs: dict[str, Any], body: Callable[[], str]) -> str:
             text = body()
         except BaseException as exc:  # noqa: BLE001 - re-raised below, unchanged
             error = exc
-            # Best-effort annotation: a no-op span (trace_disabled) may not
-            # accept attributes, and losing the annotation must not lose the
-            # error itself.
+            # Record the failure ON the span. Catching inside the ``with`` means
+            # ``mlflow.start_span`` never sees the exception, so it cannot run its
+            # own ``record_exception`` -- without this the span would close with
+            # status OK and a failed row's trace would read as a success in the
+            # MLflow UI, which is the opposite of the legibility this function
+            # exists for. Best-effort: a no-op span (trace_disabled) may accept
+            # none of these, and losing the annotation must not lose the error.
+            with suppress(Exception):
+                span.record_exception(exc)
+            with suppress(Exception):
+                span.set_status("ERROR")
             with suppress(Exception):
                 span.set_attribute("anvil.predict_error", f"{type(exc).__name__}: {exc}")
         else:
@@ -744,6 +781,7 @@ def _resilient_eval_harness(
     *,
     error_sink: dict[str, str] | None = None,
     dropped_sink: set[str] | None = None,
+    kept_rows_sink: list[int] | None = None,
 ):
     """Scope a defensive shim around ``mlflow.genai.evaluate``'s harness.
 
@@ -852,7 +890,23 @@ def _resilient_eval_harness(
             # None, and then nothing has been fixed. Retry a couple of times --
             # export is synchronous here, but the server can still lag the write.
             for attempt in range(_TRACE_FALLBACK_ATTEMPTS):
-                eval_item.trace = create_minimal_trace(eval_item)
+                # create_minimal_trace opens a span and calls get_trace; either can
+                # raise on a transport error. An escape here propagates through
+                # mlflow's ``future.result()`` and aborts the whole run after every
+                # prediction and judge call is paid for -- the exact failure this
+                # fallback exists to prevent. Retrying made that three chances
+                # instead of one, so a raise is treated exactly like a None.
+                try:
+                    eval_item.trace = create_minimal_trace(eval_item)
+                except Exception as exc:  # noqa: BLE001 - a raise is just a miss
+                    logger.warning(
+                        "minimal-trace fallback attempt %s for row %s raised %s: %s",
+                        attempt + 1,
+                        eval_item.request_id,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    eval_item.trace = None
                 if eval_item.trace is not None:
                     break
                 if attempt + 1 < _TRACE_FALLBACK_ATTEMPTS:
@@ -908,8 +962,21 @@ def _resilient_eval_harness(
         # ``len(None)`` -> TypeError, so guarding the two sites above merely
         # moved the crash here. Observed live on 2026-08-22, after the
         # batch-link guard: "Evaluation completed", run logged, then TypeError.
-        usable = [r for r in eval_results if getattr(r.eval_item, "trace", None) is not None]
-        return _orig_construct_df(run_id, traces, usable)
+        kept = [
+            i
+            for i, r in enumerate(eval_results)
+            if getattr(r.eval_item, "trace", None) is not None
+        ]
+        # Which rows survived, not just how many. ``_aggregate_report`` joins the
+        # frame to ``examples`` BY POSITION, so filtering rows out silently shifts
+        # every example_id and query by the number dropped before it -- a failure
+        # would be reported against the previous golden case, and the optimizer
+        # reads those failures to choose its next mutation. Recording the indices
+        # lets the caller filter ``examples`` the same way.
+        if kept_rows_sink is not None:
+            kept_rows_sink.clear()
+            kept_rows_sink.extend(kept)
+        return _orig_construct_df(run_id, traces, [eval_results[i] for i in kept])
 
     _harness._get_new_expectations = _get_new_expectations_none_safe
     _harness._run_predict = _run_predict_with_minimal_trace_fallback
@@ -1332,6 +1399,7 @@ def evaluate_branch(
     # Rows whose trace never became retrievable, so mlflow cannot represent them
     # in the result frame. Counted so the sample-size floor sees them.
     dropped: set[str] = set()
+    kept_rows: list[int] = []
     _prev_workers = os.environ.get(_MLFLOW_MAX_WORKERS_ENV)
     os.environ[_MLFLOW_MAX_WORKERS_ENV] = str(n_workers)
     _prev_skip = os.environ.get(_MLFLOW_SKIP_VALIDATION_ENV)
@@ -1350,7 +1418,9 @@ def evaluate_branch(
         # result DataFrame. See its docstring for the exact harness.py
         # symbols and lines patched.
         with (
-            _resilient_eval_harness(error_sink=errored, dropped_sink=dropped),
+            _resilient_eval_harness(
+                error_sink=errored, dropped_sink=dropped, kept_rows_sink=kept_rows
+            ),
             _synchronous_trace_logging(),
         ):
             result = mlflow.genai.evaluate(
@@ -1369,13 +1439,39 @@ def evaluate_branch(
             os.environ[_MLFLOW_SKIP_VALIDATION_ENV] = _prev_skip
 
     if result.result_df is None:
-        # Every row lost its trace, so mlflow built no frame at all. Raising here
-        # beats letting ``len(None)`` surface as a TypeError three frames deeper,
-        # which is how this presented live before the shim guarded it.
+        # mlflow returns None here for more than one reason -- every row filtered,
+        # an empty ``search_traces``, or an exception swallowed inside its own
+        # try -- so report what is actually known instead of asserting a cause and
+        # sending the operator hunting for the wrong thing. Raising beats letting
+        # ``len(None)`` surface as a TypeError three frames deeper, which is how
+        # this presented live. The run id matters: the eval was paid for and the
+        # traces are still inspectable.
         raise RuntimeError(
-            f"mlflow produced no result frame: all {len(dataset)} row(s) lacked a "
-            "retrievable trace. The eval ran and was paid for, but nothing can be "
-            "scored from it."
+            f"mlflow produced no result frame for run {result.run_id!r}: "
+            f"{len(dataset)} row(s) submitted, {len(dropped)} known to have lost "
+            f"their trace during predict, {len(errored)} errored. The eval ran and "
+            "was paid for, but nothing can be scored from it."
+        )
+
+    # Rows dropped anywhere between submission and the frame. Derived, not
+    # accumulated: mlflow nulls traces AFTER our shims run -- its
+    # ``_refresh_eval_result_traces`` reassigns ``eval_item.trace`` from
+    # ``mlflow.get_trace``, which returns None on a miss -- so a counter fed only
+    # at predict time undercounts, and the sample-size floor built on it would be
+    # defeated by the exact flakiness it targets. The frame is the ground truth.
+    n_dropped = max(0, len(dataset) - len(result.result_df))
+
+    # Realign ``examples`` with the surviving frame. The join is positional, so a
+    # filtered frame otherwise attributes every failure to the wrong golden case.
+    # ``kept_rows`` indexes the eval_results list, whose order the frame follows.
+    aligned = [selected[i] for i in kept_rows if i < len(selected)] if kept_rows else selected
+    if n_dropped and len(aligned) != len(result.result_df):
+        # Cannot trust the join; better to say so than to mislabel every failure.
+        logger.warning(
+            "could not realign %s example(s) with a %s-row frame; per-case "
+            "attribution in failures/errors may be unreliable",
+            len(selected),
+            len(result.result_df),
         )
 
     experiment = mlflow.get_experiment_by_name(snapshot.config.experiments.eval)
@@ -1385,11 +1481,12 @@ def evaluate_branch(
         scorer_names=active_scorer_names,
         aggregate_scorer_names=aggregate_scorer_names,
         weights=weights,
-        examples=selected,
+        examples=aligned,
         run_id=result.run_id,
         experiment_id=experiment.experiment_id if experiment else "",
         mode=selected_mode,
         scorer_fingerprint=scorer_fingerprint,
         errored=errored,
-        n_dropped_rows=len(dropped),
+        n_dropped_rows=n_dropped,
+        attempted_examples=selected,
     )

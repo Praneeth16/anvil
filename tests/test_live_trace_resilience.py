@@ -255,8 +255,11 @@ def test_dropped_rows_cannot_lower_the_floor_they_should_trip() -> None:
     assert survived_two_of_eight.n_attempted == 8
 
     reason = unjudgeable_reason(survived_two_of_eight, min_scorable_rows=4)
-    assert reason != "", "row loss must not pass the sample-size floor"
-    assert "dropped for want of a trace" in reason
+    assert reason != "", "row loss must not pass unchecked"
+    # The unmeasured-rate ceiling catches this before the floor does, and names
+    # the cause. The floor remains the backstop for a run whose rate is under the
+    # ceiling but whose surviving sample is still too small to compare.
+    assert "6 lost their trace" in reason
 
 
 def test_a_single_dropped_row_is_still_judgeable() -> None:
@@ -466,3 +469,272 @@ def test_n_attempted_counts_rows_the_run_actually_tried() -> None:
         scorers=[],
         evaluated_at="x",
     ).n_attempted == 0
+
+
+# ---------------------------------------------------------------------------
+# 4. Review findings — what the first round of these fixes got wrong
+# ---------------------------------------------------------------------------
+
+
+def test_dropped_rows_do_not_misattribute_failures_to_the_wrong_case(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Filtering rows out of the frame broke the positional join to ``examples``.
+
+    ``_aggregate_report`` reads ``examples[i]["example_id"]`` for df row ``i``.
+    Once a row is filtered, every later row lines up with the *previous* golden
+    case, so a failure is reported against the wrong query — and those failures
+    are what the optimizer reads to choose its next mutation. It aims at a case
+    that never failed, with nothing indicating a shift.
+    """
+    import pandas as pd
+
+    from anvil.eval.runner import _aggregate_report
+
+    examples = [
+        {"example_id": "g0", "query": "q0", "category": "direct"},
+        {"example_id": "g1", "query": "q1", "category": "direct"},
+        {"example_id": "g2", "query": "q2", "category": "direct"},
+    ]
+    # Row g0 lost its trace; the frame holds g1 and g2. The caller realigns
+    # ``examples`` to match, which is what evaluate_branch now does via kept_rows.
+    frame = pd.DataFrame({"correctness/value": [1.0, 0.0], "trace_id": ["t1", "t2"]})
+
+    report = _aggregate_report(
+        result_df=frame,
+        metrics={},
+        scorer_names=["correctness"],
+        aggregate_scorer_names=["correctness"],
+        weights={"correctness": 1.0},
+        examples=examples[1:],
+        run_id="r",
+        experiment_id="e",
+        mode="quick",
+        n_dropped_rows=1,
+        attempted_examples=examples,
+    )
+
+    assert [f["example_id"] for f in report.failures] == ["g2"], (
+        "the failing row is g2; attributing it to g1 would send the optimizer "
+        "after a case that passed"
+    )
+    assert report.failures[0]["query"] == "q2"
+
+
+def test_cost_metrics_measure_what_the_run_spent_not_what_survived() -> None:
+    """Row loss must not read as a cost win.
+
+    ``n_rows`` and ``context_chars`` are both valid minimising Pareto objectives,
+    so a round that silently loses 6 of 8 rows would otherwise report a strictly
+    better cost than the frontier on that axis and be KEPT for it.
+    """
+    import pandas as pd
+
+    from anvil.eval.runner import _aggregate_report
+
+    attempted = [
+        {"example_id": f"g{i}", "query": "x" * 10, "category": "direct"} for i in range(8)
+    ]
+    frame = pd.DataFrame({"correctness/value": [1.0, 1.0], "trace_id": ["t0", "t1"]})
+
+    report = _aggregate_report(
+        result_df=frame,
+        metrics={},
+        scorer_names=["correctness"],
+        aggregate_scorer_names=["correctness"],
+        weights={"correctness": 1.0},
+        examples=attempted[:2],
+        run_id="r",
+        experiment_id="e",
+        mode="quick",
+        n_dropped_rows=6,
+        attempted_examples=attempted,
+    )
+
+    assert report.cost_metrics["n_rows"] == 8.0, "cost is over attempted rows"
+    assert report.cost_metrics["total_context_chars"] == 80.0
+
+
+def test_a_run_that_loses_most_of_its_traces_is_unjudgeable_at_any_size() -> None:
+    """The absolute floor alone is too blunt, and that is not a corner case.
+
+    ``full`` mode is 20 rows with a floor of 4. Lose 16 traces and 4 rows survive:
+    ``error_rate`` is 0.0 (nothing errored), ``n_scorable`` is 4, the floor is 4,
+    and ``4 < 4`` is false — judgeable. A four-row mean then extends the frontier
+    and becomes the bar for every later round. A floor is satisfiable by any run
+    big enough, so a *rate* over attempted cases is what has to catch this.
+    """
+    from anvil.eval.judgeability import unjudgeable_reason
+
+    lost_16_of_20 = _report(n_rows=4, n_dropped=16)
+    assert lost_16_of_20.error_rate == 0.0
+    assert lost_16_of_20.n_scorable == 4  # clears the floor of 4
+
+    reason = unjudgeable_reason(lost_16_of_20, max_error_rate=0.2, min_scorable_rows=4)
+    assert reason != "", "20-row run measured on 4 rows must not be compared"
+    assert "unmeasured rate" in reason
+    assert "16 lost their trace" in reason
+
+
+def test_unmeasured_rate_unions_both_ways_a_case_goes_unscored() -> None:
+    from anvil.eval.judgeability import unjudgeable_reason
+
+    # 1 errored + 1 dropped out of 8 attempted = 0.25 > 0.2
+    mixed = _report(n_rows=7, n_errors=1, n_dropped=1)
+    assert mixed.unmeasured_rate == pytest.approx(0.25)
+    assert unjudgeable_reason(mixed, max_error_rate=0.2) != ""
+    # The same counts under a laxer ceiling are fine.
+    assert unjudgeable_reason(mixed, max_error_rate=0.3) == ""
+    # And a clean run is still clean.
+    assert _report(n_rows=8).unmeasured_rate == 0.0
+
+
+def test_the_failed_row_trace_is_marked_as_failed() -> None:
+    """Catching inside the ``with`` means ``mlflow.start_span`` never sees the
+    exception, so it cannot run its own ``record_exception``. Without setting the
+    status explicitly, a wrong endpoint yields a set of traces all marked OK in
+    the MLflow UI — legible in the report, misleading in the traces."""
+    from anvil.eval.runner import _traced_predict
+
+    recorded: dict[str, object] = {}
+
+    class _Span:
+        def set_inputs(self, _v): pass
+        def set_outputs(self, _v): recorded["outputs"] = True
+        def record_exception(self, exc): recorded["exception"] = exc
+        def set_status(self, status): recorded["status"] = status
+        def set_attribute(self, k, v): recorded[k] = v
+
+    class _CM:
+        def __enter__(self): return _Span()
+        def __exit__(self, *a): return False
+
+    import anvil.eval.runner as runner
+
+    boom = RuntimeError("404")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(runner.mlflow, "start_span", lambda **_kw: _CM())
+        with pytest.raises(RuntimeError):
+            _traced_predict({"query": "q"}, lambda: (_ for _ in ()).throw(boom))
+
+    assert recorded["exception"] is boom
+    assert recorded["status"] == "ERROR"
+    assert "outputs" not in recorded
+
+
+def test_a_raising_fallback_is_treated_as_a_miss_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``create_minimal_trace`` opens a span and calls ``get_trace``; either can
+    raise on a transport error. An escape propagates through mlflow's
+    ``future.result()`` and aborts the run after every prediction and judge call
+    is paid for — the exact failure the fallback exists to prevent. Retrying made
+    that three chances instead of one."""
+    import mlflow.genai.evaluation.harness as harness
+    from mlflow.genai.utils import trace_utils
+
+    from anvil.eval import runner
+    from anvil.eval.runner import _resilient_eval_harness
+
+    monkeypatch.setattr(runner, "_TRACE_FALLBACK_BACKOFF_S", 0.0)
+    monkeypatch.setattr(harness, "_run_predict", lambda *a, **kw: None)
+
+    calls = {"n": 0}
+
+    def _always_raises(_eval_item):
+        calls["n"] += 1
+        raise ConnectionError("tracing server unreachable")
+
+    monkeypatch.setattr(trace_utils, "create_minimal_trace", _always_raises)
+
+    item = SimpleNamespace(trace=None, request_id="req-boom", error_message=None)
+    dropped: set[str] = set()
+    with _resilient_eval_harness(dropped_sink=dropped):
+        harness._run_predict(item, object(), None, None)  # must not raise
+
+    assert calls["n"] == runner._TRACE_FALLBACK_ATTEMPTS
+    assert dropped == {"req-boom"}
+
+
+def test_baseline_records_rows_that_vanished(tmp_path) -> None:
+    """``n_examples`` counts survivors, so without a dropped count a baseline
+    measured on two of eight rows reads clean and the gate chases that two-row
+    bar for the whole run."""
+    from anvil.eval.cache import CachedBaseline, report_to_baseline
+
+    baseline = report_to_baseline(
+        _report(n_rows=2, n_dropped=6),
+        scaffold_commit_sha="a" * 40,
+        runtime_endpoint="rt",
+        judge_endpoint="j",
+    )
+    assert baseline.n_dropped_rows == 6
+    assert baseline.to_dict()["n_dropped_rows"] == 6
+    assert CachedBaseline.from_dict(baseline.to_dict()).n_dropped_rows == 6
+
+    # Still additive: a clean baseline keeps the historical on-disk schema.
+    clean = report_to_baseline(
+        _report(n_rows=8),
+        scaffold_commit_sha="a" * 40,
+        runtime_endpoint="rt",
+        judge_endpoint="j",
+    )
+    assert "n_dropped_rows" not in clean.to_dict()
+
+
+def test_empty_frame_error_names_the_run_and_does_not_assert_a_cause(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """mlflow returns None for several reasons — every row filtered, an empty
+    ``search_traces``, or a swallowed exception. Claiming "all N rows lacked a
+    trace" sends the operator after the wrong thing, and omitting the run id
+    hides the traces of an eval that was already paid for."""
+    from anvil.eval import runner
+    from anvil.runtime.models import (
+        EvalConfig,
+        EvalModeConfig,
+        ExperimentsConfig,
+        HarnessConfig,
+        ScorerConfig,
+    )
+
+    config = HarnessConfig(
+        runtime_endpoint="rt",
+        optimizer_endpoint="op",
+        judge_endpoint="j",
+        experiments=ExperimentsConfig(runtime="r", eval="e", optimizer="o"),
+        eval=EvalConfig(
+            default_mode="quick",
+            scorers=[ScorerConfig(name="correctness")],
+            modes={"quick": EvalModeConfig(rows=1, buckets={"direct": 1})},
+        ),
+    )
+    gold = {
+        "example_id": "g1", "query": "q", "category": "direct", "expected_doc_ids": [],
+        "reference_answer": "a", "should_refuse": False, "expected_citations": [],
+        "must_include": ["a"], "must_not_include": [], "notes_for_judge": "",
+    }
+    monkeypatch.setattr(runner, "load_harness", lambda *a, **kw: SimpleNamespace(config=config))
+    monkeypatch.setattr(runner, "load_golden_set", lambda _p: [gold])
+    monkeypatch.setattr(runner, "select_subset", lambda exs, **_k: exs)
+    monkeypatch.setattr(runner, "make_kb_executor", lambda *a, **kw: SimpleNamespace())
+    monkeypatch.setattr(runner, "AnvilAgent", lambda *a, **kw: SimpleNamespace())
+    monkeypatch.setattr(runner, "enable_runtime_tracing", lambda *a, **kw: None)
+    monkeypatch.setattr(runner, "build_scorers", lambda **_kw: [])
+    monkeypatch.setattr(runner.mlflow, "set_experiment", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        runner.mlflow.genai,
+        "evaluate",
+        lambda **_kw: SimpleNamespace(result_df=None, metrics={}, run_id="run-abc"),
+    )
+
+    with pytest.raises(RuntimeError) as exc:
+        runner.evaluate_branch(
+            scaffold_root=tmp_path / "scaffold",
+            runtime_config_path=tmp_path / "config.yaml",
+            runtime_client=SimpleNamespace(),
+            judge_client=SimpleNamespace(),
+        )
+    message = str(exc.value)
+    assert "run-abc" in message, "the paid-for run must be locatable"
+    assert "known to have lost" in message, "reports what it knows, not a cause"

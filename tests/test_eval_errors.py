@@ -462,8 +462,10 @@ def test_round_refuses_to_judge_an_eval_above_the_error_ceiling(
     report = round_mod.run_round(round_id=1, repo_root=anvil_repo)
 
     assert report.decision == Decision.INFRA_FAIL
-    assert "error rate 0.50 exceeds ceiling 0.25" in report.notes
-    assert "4/8 cases never assessed" in report.notes
+    # "unmeasured", not "error": the ceiling now covers both ways a case goes
+    # unscored -- it raised, or it lost its trace and vanished from the frame.
+    assert "unmeasured rate 0.50 exceeds ceiling 0.25" in report.notes
+    assert "4/8 cases never scored" in report.notes
     # The score is kept on the record even though it was not compared: "0.9,
     # but half the cases never ran" is more useful later than a null.
     assert report.mutated_score == 0.9

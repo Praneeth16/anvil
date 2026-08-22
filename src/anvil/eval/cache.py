@@ -101,6 +101,12 @@ class CachedBaseline:
     # a baseline looks *better*, not broken. Recording the count is what lets a
     # reader tell the difference later.
     n_errors: int = 0
+    # Rows that never reached the result frame. ``n_examples`` counts SURVIVORS,
+    # so without this a baseline measured on two of eight rows reads
+    # ``{"n_examples": 2, "n_errors": 0}`` -- perfectly clean -- and the gate
+    # chases that two-row bar for the whole 50+-round run with nothing on disk
+    # recording why. Same argument that put ``n_errors`` here.
+    n_dropped_rows: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -122,6 +128,8 @@ class CachedBaseline:
         # failure/error split existed.
         if self.n_errors:
             payload["n_errors"] = self.n_errors
+        if self.n_dropped_rows:
+            payload["n_dropped_rows"] = self.n_dropped_rows
         # Keep the historical on-disk schema byte-for-byte compatible for
         # baselines created before cost tracking, while retaining metrics
         # whenever the eval report supplies them.
@@ -146,6 +154,7 @@ class CachedBaseline:
             scorer_fingerprint=raw.get("scorer_fingerprint", ""),
             cost_metrics={k: float(v) for k, v in raw.get("cost_metrics", {}).items()},
             n_errors=int(raw.get("n_errors", 0)),
+            n_dropped_rows=int(raw.get("n_dropped_rows", 0)),
         )
 
 
@@ -245,4 +254,5 @@ def report_to_baseline(
         scorer_fingerprint=getattr(report, "scorer_fingerprint", ""),
         cost_metrics=dict(getattr(report, "cost_metrics", {})),
         n_errors=getattr(report, "n_errors", 0),
+        n_dropped_rows=getattr(report, "n_dropped_rows", 0),
     )
