@@ -40,6 +40,28 @@ optimizer = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# Pin the package index to public PyPI at the *project* level, so the lockfile
+# stays portable no matter what index the machine running `uv lock` defaults to.
+#
+# This is not hypothetical: a Databricks laptop typically has
+# `~/.config/uv/uv.toml` pointing at an internal pypi proxy, and a lock
+# regenerated there records that host in every wheel URL. The result is a
+# lockfile only reachable from inside the corporate network -- CI fails on
+# `uv sync --locked` with a connection timeout, external contributors cannot
+# install at all, and internal infrastructure hostnames end up committed to a
+# public repository. User-level config is silent about all of this; project-level
+# config overrides it.
+#
+# Anyone who genuinely needs the proxy can still set `UV_INDEX` for a single run
+# without touching the lock. The corollary is that regenerating the lock needs
+# real access to pypi.org: on a machine where only the proxy resolves, `uv lock`
+# will fail here rather than silently producing an unportable lockfile, which is
+# the intended behaviour. Re-lock from CI, or from a network that can reach PyPI.
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/anvil"]
 
