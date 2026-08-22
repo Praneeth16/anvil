@@ -45,7 +45,7 @@ from anvil.optimizer import (
     run_optimizer_session,
 )
 from anvil.optimizer.policy import ToolPolicy
-from anvil.runtime.loader import default_runtime_config_path
+from anvil.runtime.loader import default_runtime_config_path, load_eval_config
 
 
 @dataclass
@@ -97,6 +97,7 @@ def run_round(
     mode = _read_optimization_mode(scaffold_root)
     optimizer_endpoint = _read_optimizer_endpoint(scaffold_root)
     cost_budget_usd = _read_cost_budget_usd(scaffold_root)
+    max_error_rate = load_eval_config(scaffold_root).max_error_rate
     policy = ToolPolicy(root=repo_root)
     print(f"[round {round_id}] mode={mode}")
 
@@ -218,6 +219,27 @@ def run_round(
             mutated_score = None
             notes = f"eval failed: {exc.__class__.__name__}: {exc}"
             print(f"[round {round_id}] eval failure: {notes}")
+        else:
+            # An errored case is excluded from the aggregate, so a degraded
+            # endpoint does not drag the score down -- it shrinks the sample
+            # the score was measured on. Past a ceiling that sample is not
+            # worth comparing: the round is unjudgeable, so it is failed rather
+            # than reverted. Without this, a throttled gateway silently
+            # discards good mutations and the round record cannot say why.
+            #
+            # ``eval_failed`` short-circuits ``gate_decision`` to INFRA_FAIL
+            # before any frontier I/O, so the frontier is not advanced by a
+            # number that was never trustworthy. ``mutated_score`` is kept on
+            # the record: "0.41, but 40% of cases never ran" is a more useful
+            # thing to read six rounds later than a null.
+            if eval_report.error_rate > max_error_rate:
+                eval_failed = True
+                notes = (
+                    f"error rate {eval_report.error_rate:.2f} exceeds ceiling "
+                    f"{max_error_rate:.2f} ({eval_report.n_errors}/"
+                    f"{eval_report.n_rows} cases never assessed)"
+                )
+                print(f"[round {round_id}] unjudgeable: {notes}")
 
     # 7. Compute score delta + decision.
     #
@@ -568,6 +590,13 @@ def _build_round_json(
                 "mode": eval_report.mode,
                 "scorers": list(eval_report.scorers),
                 "aggregate": eval_report.aggregate,
+                # How much of the eval actually happened. A reader six rounds
+                # later needs this next to the aggregate: it is the difference
+                # between "the agent scored 0.41" and "0.41 was measured on
+                # three of eight cases".
+                "n_errors": eval_report.n_errors,
+                "error_rate": eval_report.error_rate,
+                "errors": list(eval_report.errors),
                 "per_judge": dict(eval_report.per_judge),
                 "per_bucket": {k: dict(v) for k, v in eval_report.per_bucket.items()},
                 "cost_metrics": dict(getattr(eval_report, "cost_metrics", {})),

@@ -23,6 +23,7 @@ from anvil.runtime.composer import ComposeManifest, compose_prompt
 from anvil.runtime.models import (
     RUNTIME_FIELDS,
     SCAFFOLD_FIELDS,
+    EvalConfig,
     HarnessConfig,
     RuntimeYAML,
     SamplingConfig,
@@ -48,6 +49,25 @@ def default_runtime_config_path(scaffold_root: Path | str) -> Path:
     """Convention: ``<repo>/scaffold/`` and ``<repo>/harness/config.yaml``
     are siblings."""
     return Path(scaffold_root).parent / "harness" / "config.yaml"
+
+
+def load_eval_config(scaffold_root: Path | str) -> EvalConfig:
+    """Read and validate just the ``eval`` section of ``harness/config.yaml``.
+
+    For callers that need one eval setting (the round's error-rate ceiling, the
+    CLI's exit code) without composing the whole runtime prompt, which
+    :func:`load_harness` does and which needs the scaffold to exist. Validated
+    through :class:`EvalConfig` rather than read raw so a nonsense value fails
+    here instead of silently disabling the guard it configures.
+
+    Falls back to the model defaults when the file or the section is absent, so
+    the loop keeps running on a repo that predates a field.
+    """
+    path = default_runtime_config_path(Path(scaffold_root))
+    if not path.is_file():
+        return EvalConfig()
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return EvalConfig.model_validate(raw.get("eval") or {})
 
 
 def load_harness(

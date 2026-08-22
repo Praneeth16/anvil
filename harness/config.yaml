@@ -98,6 +98,13 @@ eval:
   # Cooldown seconds between row tasks inside the thread pool when
   # the endpoint is approaching its quota.
   inter_row_cooldown_s: 0.0
+  # Fraction of cases that may go unassessed (the prediction raised) before
+  # the round is refused as unjudgeable rather than compared. Errored cases
+  # are excluded from the aggregate, so a degraded gateway does not drag the
+  # score down -- it shrinks the sample the score was measured on. Past this
+  # ceiling the round is an INFRA_FAIL and never a revert, so a bad afternoon
+  # on the endpoint cannot discard a good mutation. 1.0 disables the guard.
+  max_error_rate: 0.2
   # Scorers active by default. Each entry may be a bare name string
   # (legacy form → type: llm, weight: 1.0) or a dict with ``name``,
   # ``type`` (``llm`` or ``programmatic``), ``weight`` (default 1.0),
