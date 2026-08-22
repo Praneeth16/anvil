@@ -36,9 +36,11 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import yaml  # noqa: E402
 
+from anvil.cli import ExitCode, run_cli  # noqa: E402
 from anvil.eval.cache import CachedBaseline, report_to_baseline  # noqa: E402
+from anvil.eval.judgeability import unjudgeable_reason_for  # noqa: E402
 from anvil.eval.runner import evaluate_branch  # noqa: E402
-from anvil.runtime.loader import default_runtime_config_path  # noqa: E402
+from anvil.runtime.loader import default_runtime_config_path, load_eval_config  # noqa: E402
 from anvil.runtime.models import RuntimeYAML  # noqa: E402
 
 # Default cache location the loop's gate reads. Relative to the repo
@@ -143,6 +145,25 @@ def build_baseline(
         mode=mode,
         include_safety=include_safety,
     )
+
+    # The baseline is the bar every round is compared against and the frontier's
+    # seed, so a degraded run must never be frozen into it. This matters MORE
+    # since errored cases stopped being scored as zeros: a baseline run that
+    # 429'd on six of eight rows used to produce a visibly broken ~0.25 that an
+    # operator would rerun; now those rows are excluded and the same run reads
+    # the mean of the two that survived -- higher than a healthy baseline, and
+    # indistinguishable from one. Refuse instead.
+    # Thresholds from ``runtime_path``, the same file the eval above ran under.
+    # Resolving the default path here instead would judge the report against a
+    # ceiling it was never measured under whenever a custom config is passed --
+    # the same divergence the comment above guards the endpoints from.
+    reason = unjudgeable_reason_for(report, load_eval_config(scaffold_path, runtime_path))
+    if reason:
+        raise RuntimeError(
+            f"refusing to cache a baseline that cannot be judged: {reason}. "
+            "Rerun once the endpoint is healthy."
+        )
+
     scaffold_commit_sha = _git_head_sha(scaffold_path)
     return report_to_baseline(
         report,
@@ -170,8 +191,8 @@ def main(argv: list[str] | None = None) -> int:
         f"Baseline written to {out_path}. Aggregate: {baseline.aggregate:.4f}. "
         f"{baseline.n_examples} examples, {baseline.mode} mode."
     )
-    return 0
+    return ExitCode.OK
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_cli(main))

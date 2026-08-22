@@ -6,8 +6,12 @@ Covers the acceptance contract:
   sequential when ``n_workers <= 1`` (backward compatible), parallel via
   :class:`ThreadPoolExecutor` otherwise.
 * Results preserve input order regardless of completion order.
-* A prediction that raises is recorded as an empty string and logged —
-  one bad row does not abort the whole eval.
+* A prediction that raises is recorded as a :class:`CaseRecord` whose
+  outcome is ``error`` and logged — one bad row does not abort the whole
+  eval, and the row is *excluded* from scoring rather than scored as an
+  empty (i.e. very bad) answer. The empty-string contract these tests
+  used to assert was the Phase 2 defect; see
+  ``docs/design/failure-vs-error.md``.
 * :func:`evaluate_branch` wires ``eval.n_workers`` from
   ``harness/config.yaml`` into the ``MLFLOW_GENAI_EVAL_MAX_WORKERS`` env
   var so the configured value controls mlflow's predict/score thread
@@ -82,6 +86,14 @@ def _result_df() -> pd.DataFrame:
     )
 
 
+def _outputs(records) -> list[str]:
+    return [r.output for r in records]
+
+
+def _outcomes(records) -> list[str]:
+    return [str(r.outcome) for r in records]
+
+
 # ---------------------------------------------------------------------------
 # 1. _run_predictions_parallel — sequential mode (n_workers <= 1)
 # ---------------------------------------------------------------------------
@@ -100,7 +112,8 @@ def test_run_predictions_sequential_default() -> None:
 
     queries = ["a", "b", "c"]
     out = _run_predictions_parallel(predict_fn, queries)
-    assert out == ["r-a", "r-b", "r-c"]
+    assert _outputs(out) == ["r-a", "r-b", "r-c"]
+    assert _outcomes(out) == ["ok", "ok", "ok"]
     # Called exactly once per query, in input order.
     assert calls == ["a", "b", "c"]
 
@@ -115,7 +128,7 @@ def test_run_predictions_sequential_n_zero_and_negative() -> None:
 
     for n in (0, -1, -5):
         out = _run_predictions_parallel(predict_fn, ["a", "b"], n_workers=n)
-        assert out == ["A", "B"]
+        assert _outputs(out) == ["A", "B"]
 
 
 def test_run_predictions_empty_queries() -> None:
@@ -124,6 +137,29 @@ def test_run_predictions_empty_queries() -> None:
 
     assert _run_predictions_parallel(lambda q: q, [], n_workers=4) == []
     assert _run_predictions_parallel(lambda q: q, []) == []
+
+
+def test_run_predictions_case_ids_default_to_row_index() -> None:
+    """Every record carries a case_id. Absent explicit ids the row index
+    is used, so a record is always attributable to a row."""
+    from anvil.eval.runner import _run_predictions_parallel
+
+    out = _run_predictions_parallel(lambda q: q, ["a", "b"], n_workers=2)
+    assert [r.case_id for r in out] == ["0", "1"]
+
+    out = _run_predictions_parallel(
+        lambda q: q, ["a", "b"], n_workers=2, case_ids=["g1", "g2"]
+    )
+    assert [r.case_id for r in out] == ["g1", "g2"]
+
+
+def test_run_predictions_rejects_mismatched_case_ids() -> None:
+    """A case_ids list that does not line up with queries is a caller bug
+    that would silently mis-attribute every record — reject it."""
+    from anvil.eval.runner import _run_predictions_parallel
+
+    with pytest.raises(ValueError, match="case_ids"):
+        _run_predictions_parallel(lambda q: q, ["a", "b"], case_ids=["only-one"])
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +187,7 @@ def test_run_predictions_parallel_preserves_order() -> None:
     out = _run_predictions_parallel(predict_fn, queries, n_workers=4)
 
     # Results are in input order regardless of completion order.
-    assert out == [f"r{i}" for i in range(n)]
+    assert _outputs(out) == [f"r{i}" for i in range(n)]
     # And parallelism actually happened: completion order is NOT the
     # input order (the longest-sleeping q0 finished after the quick ones).
     assert completion_order != list(range(n))
@@ -163,7 +199,7 @@ def test_run_predictions_parallel_more_workers_than_queries() -> None:
     from anvil.eval.runner import _run_predictions_parallel
 
     out = _run_predictions_parallel(lambda q: f"x{q}", ["a", "b"], n_workers=16)
-    assert out == ["xa", "xb"]
+    assert _outputs(out) == ["xa", "xb"]
 
 
 def test_run_predictions_parallel_single_worker_equivalent_to_sequential() -> None:
@@ -174,20 +210,27 @@ def test_run_predictions_parallel_single_worker_equivalent_to_sequential() -> No
     queries = [f"q{i}" for i in range(5)]
     expected = [f"r{q}" for q in queries]
     out = _run_predictions_parallel(lambda q: f"r{q}", queries, n_workers=1)
-    assert out == expected
+    assert _outputs(out) == expected
 
 
 # ---------------------------------------------------------------------------
-# 3. _run_predictions_parallel — error handling
+# 3. _run_predictions_parallel — errors are errors, not zero-scored answers
 # ---------------------------------------------------------------------------
 
 
-def test_run_predictions_failed_row_recorded_empty_not_raised(
+def test_run_predictions_failed_row_is_an_error_record_not_empty_output(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A prediction that raises is recorded as an empty string and
-    logged; the surrounding rows still complete and the call does not
-    propagate the exception."""
+    """A prediction that raises yields an ``error`` record naming the
+    exception, and the surrounding rows still complete.
+
+    This is the Phase 2 correction. The old contract recorded ``""`` for a
+    raised prediction, which the judges score at or near 0.0 — so a
+    throttled gateway was indistinguishable from a bad answer and moved
+    the promotion gate the same way. The record's outcome now says the
+    case was never assessed, and ``scorable`` is False so nothing
+    downstream averages it in.
+    """
     from anvil.eval.runner import _run_predictions_parallel
 
     def predict_fn(q: str) -> str:
@@ -197,17 +240,24 @@ def test_run_predictions_failed_row_recorded_empty_not_raised(
 
     with caplog.at_level(logging.WARNING, logger="anvil.eval.runner"):
         out = _run_predictions_parallel(predict_fn, ["a", "boom", "c"], n_workers=3)
-    assert out == ["ok-a", "", "ok-c"]
 
+    assert _outcomes(out) == ["ok", "error", "ok"]
+    assert _outputs(out) == ["ok-a", "", "ok-c"]
+    assert [r.scorable for r in out] == [True, False, True]
+
+    errored = out[1]
+    assert errored.error_type == "RuntimeError"
+    assert "synthetic failure" in errored.error_message
     assert "prediction failed for row 1" in caplog.text
     assert "synthetic failure" in caplog.text
 
 
-def test_run_predictions_all_fail_returns_all_empty(
+def test_run_predictions_all_fail_are_all_errors(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Every row failing still yields a full-length list of empty
-    strings — the eval is not aborted by a uniformly broken agent."""
+    """Every row failing yields a full-length list of ``error`` records —
+    the eval is not aborted by a uniformly broken agent, and no row
+    contributes a zero to the aggregate."""
     from anvil.eval.runner import _run_predictions_parallel
 
     def predict_fn(q: str) -> str:
@@ -215,19 +265,16 @@ def test_run_predictions_all_fail_returns_all_empty(
 
     with caplog.at_level(logging.WARNING, logger="anvil.eval.runner"):
         out = _run_predictions_parallel(predict_fn, ["a", "b", "c"], n_workers=2)
-    assert out == ["", "", ""]
+    assert _outcomes(out) == ["error", "error", "error"]
+    assert not any(r.scorable for r in out)
     assert caplog.text.count("prediction failed") == 3
 
 
 def test_run_predictions_sequential_failure_isolated(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The sequential path (n_workers <= 1) isolates failures the same way
-    the parallel path does: a row that raises is recorded as an empty
-    string and logged, and the surrounding rows still complete — the call
-    does not propagate the exception. This unifies the acceptance contract
-    ("a prediction that raises is recorded as an empty string and does not
-    abort the whole eval") across both paths."""
+    """The sequential path (n_workers <= 1) isolates failures exactly as
+    the parallel path does, so the contract holds uniformly across both."""
     from anvil.eval.runner import _run_predictions_parallel
 
     def predict_fn(q: str) -> str:
@@ -237,9 +284,240 @@ def test_run_predictions_sequential_failure_isolated(
 
     with caplog.at_level(logging.WARNING, logger="anvil.eval.runner"):
         out = _run_predictions_parallel(predict_fn, ["a", "boom", "c"], n_workers=1)
-    assert out == ["a", "", "c"]
+    assert _outcomes(out) == ["ok", "error", "ok"]
+    assert _outputs(out) == ["a", "", "c"]
     assert "prediction failed for row 1" in caplog.text
-    assert "synthetic failure" in caplog.text
+
+
+def test_run_predictions_summarizes_to_an_error_rate() -> None:
+    """The records summarise to the error rate the round-level guard reads."""
+    from anvil.eval.outcome import summarize
+    from anvil.eval.runner import _run_predictions_parallel
+
+    def predict_fn(q: str) -> str:
+        if q.startswith("bad"):
+            raise TimeoutError("gateway timeout")
+        return q
+
+    out = _run_predictions_parallel(
+        predict_fn, ["a", "bad1", "b", "bad2"], n_workers=2
+    )
+    summary = summarize(out)
+    assert summary.total == 4
+    assert summary.error == 2
+    assert summary.error_rate == 0.5
+    assert summary.scorable == 2
+
+
+# ---------------------------------------------------------------------------
+# 3b. Retries — on error only, never on a returned answer
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("n_workers", [1, 3])
+def test_run_predictions_retries_an_error_and_keeps_the_attempts(n_workers: int) -> None:
+    """A transient error is retried up to ``max_retries`` times, and the
+    failed attempts are retained on the record.
+
+    A round that only succeeded on its third try is not the same round as
+    one that succeeded immediately — the difference is a degrading
+    endpoint, and the evidence should say so rather than leaving it to be
+    inferred from a latency graph.
+    """
+    from anvil.eval.runner import _run_predictions_parallel
+
+    calls: dict[str, int] = {}
+
+    def predict_fn(q: str) -> str:
+        calls[q] = calls.get(q, 0) + 1
+        if calls[q] < 3:
+            raise ConnectionError(f"attempt {calls[q]} refused")
+        return f"ok-{q}"
+
+    out = _run_predictions_parallel(
+        predict_fn, ["a"], n_workers=n_workers, max_retries=2
+    )
+    assert _outcomes(out) == ["ok"]
+    assert out[0].output == "ok-a"
+    # Two failed attempts precede the success and are kept.
+    assert len(out[0].attempts) == 2
+    assert [a.error_type for a in out[0].attempts] == ["ConnectionError"] * 2
+    assert calls["a"] == 3
+
+
+def test_run_predictions_gives_up_after_max_retries() -> None:
+    """Exhausted retries land as one ``error`` record carrying every
+    attempt, not as a partial success."""
+    from anvil.eval.runner import _run_predictions_parallel
+
+    def predict_fn(q: str) -> str:
+        raise ConnectionError("always refused")
+
+    out = _run_predictions_parallel(predict_fn, ["a"], max_retries=2)
+    assert _outcomes(out) == ["error"]
+    assert out[0].error_type == "ConnectionError"
+    # 1 initial + 2 retries, all recorded.
+    assert len(out[0].attempts) == 3
+
+
+def test_run_predictions_never_retries_a_returned_answer() -> None:
+    """Retry is for errors only. A returned answer — even an empty one —
+    is a *failure* at worst, which is signal about the agent and must not
+    be re-rolled until it improves. Re-rolling failures is how an
+    optimizer's score becomes a function of how many samples it bought."""
+    from anvil.eval.runner import _run_predictions_parallel
+
+    calls: list[str] = []
+
+    def predict_fn(q: str) -> str:
+        calls.append(q)
+        return ""  # a bad answer, not an error
+
+    out = _run_predictions_parallel(predict_fn, ["a"], max_retries=5)
+    assert calls == ["a"]
+    assert _outcomes(out) == ["ok"]
+    assert out[0].output == ""
+    assert out[0].attempts == ()
+
+
+# ---------------------------------------------------------------------------
+# 3c. Interruption — partial results stay readable
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("n_workers", [1, 2])
+def test_run_predictions_interrupt_accounts_for_every_row(n_workers: int) -> None:
+    """Ctrl-C stops the run and raises :class:`RunInterrupted` carrying a
+    record for every row, so a killed run is still readable.
+
+    Which rows finished is timing-dependent under a thread pool, so this
+    asserts the invariant that holds either way: every row is accounted
+    for, and no row is misreported as an infrastructure ``error`` — an
+    operator's Ctrl-C is not a degraded endpoint, and recording it as one
+    would trip the round's error-rate guard.
+    """
+    from anvil.eval.outcome import RunInterrupted
+    from anvil.eval.runner import _run_predictions_parallel
+
+    def predict_fn(q: str) -> str:
+        if q == "stop":
+            raise KeyboardInterrupt
+        time.sleep(0.1)
+        return f"ok-{q}"
+
+    # Far more queries than the pool can drain before the main thread reacts,
+    # so "some row was never reached" is not a race: two workers need ten
+    # 0.1s rounds to finish this list and the cancel happens in microseconds.
+    # A tighter list would pass on a quiet laptop and flake on a loaded runner.
+    queries = ["a", "stop", *[f"q{i}" for i in range(18)]]
+    with pytest.raises(RunInterrupted) as exc:
+        _run_predictions_parallel(predict_fn, queries, n_workers=n_workers)
+
+    records = exc.value.records
+    assert len(records) == len(queries)
+    assert {str(r.outcome) for r in records} <= {"ok", "interrupted"}
+    assert any(r.outcome == "interrupted" for r in records)
+    # RunInterrupted derives from BaseException, like KeyboardInterrupt, so
+    # the ``except Exception`` handlers between here and the CLI cannot
+    # swallow a Ctrl-C and report it as an eval failure.
+    assert not isinstance(exc.value, Exception)
+
+
+def test_run_predictions_survives_a_main_thread_interrupt() -> None:
+    """The real Ctrl-C path, which the worker-raises tests do not reach.
+
+    A SIGINT is delivered to the *main* thread while it is blocked in
+    ``as_completed``, not to a worker. That is the path that then cancels
+    unstarted rows, waits for the in-flight ones, and rebuilds the slots — so
+    without this test the drain logic is exercised only via ``future.result()``
+    re-raising, which enters it from a different direction.
+    """
+    from concurrent import futures as _futures
+
+    from anvil.eval import runner
+    from anvil.eval.outcome import RunInterrupted
+    from anvil.eval.runner import _run_predictions_parallel
+
+    real_as_completed = _futures.as_completed
+
+    def _interrupting_as_completed(fs, timeout=None):
+        # Yield the first completed future, then interrupt the main thread
+        # exactly as a SIGINT would.
+        for i, future in enumerate(real_as_completed(fs, timeout=timeout)):
+            yield future
+            if i == 0:
+                raise KeyboardInterrupt
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(runner, "as_completed", _interrupting_as_completed)
+        with pytest.raises(RunInterrupted) as exc:
+            _run_predictions_parallel(
+                lambda q: f"ok-{q}", [f"q{i}" for i in range(12)], n_workers=2
+            )
+
+    records = exc.value.records
+    assert len(records) == 12, "every row is accounted for after a main-thread SIGINT"
+    assert {str(r.outcome) for r in records} <= {"ok", "interrupted"}
+    assert any(r.outcome == "ok" for r in records), "finished work is kept, not discarded"
+
+
+def test_run_predictions_second_interrupt_still_returns_records() -> None:
+    """A second Ctrl-C abandons the wait but keeps the records.
+
+    The in-flight wait is unbounded — there is no per-case timeout and the HTTP
+    client's default deadline is 600s — so an operator facing an apparent hang
+    will press Ctrl-C again. If that raised out of ``shutdown`` the collected
+    records would be thrown away, breaking the one guarantee ``RunInterrupted``
+    makes. Simulated by making ``shutdown`` itself raise, which is what a SIGINT
+    arriving during the join does.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from anvil.eval import runner
+    from anvil.eval.outcome import RunInterrupted
+    from anvil.eval.runner import _run_predictions_parallel
+
+    real_shutdown = ThreadPoolExecutor.shutdown
+    raised = {"count": 0}
+
+    def _shutdown(self, wait=True, **kwargs):
+        if wait and not raised["count"]:
+            raised["count"] += 1
+            raise KeyboardInterrupt
+        return real_shutdown(self, wait=wait, **kwargs)
+
+    def _interrupting_as_completed(fs, timeout=None):
+        raise KeyboardInterrupt
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(runner, "as_completed", _interrupting_as_completed)
+        mp.setattr(ThreadPoolExecutor, "shutdown", _shutdown)
+        with pytest.raises(RunInterrupted) as exc:
+            _run_predictions_parallel(lambda q: q, ["a", "b", "c"], n_workers=2)
+
+    assert raised["count"] == 1, "the second interrupt was actually simulated"
+    assert len(exc.value.records) == 3
+
+
+def test_run_predictions_interrupt_marks_the_unreached_rows_sequentially() -> None:
+    """The sequential path pins down the exact marking the parallel path
+    can only be asserted loosely about: rows before the interrupt keep
+    their result, the interrupted row and every row after it are
+    ``interrupted`` — never ``error``, and never silently absent."""
+    from anvil.eval.outcome import RunInterrupted
+    from anvil.eval.runner import _run_predictions_parallel
+
+    def predict_fn(q: str) -> str:
+        if q == "stop":
+            raise KeyboardInterrupt
+        return f"ok-{q}"
+
+    with pytest.raises(RunInterrupted) as exc:
+        _run_predictions_parallel(predict_fn, ["a", "stop", "c", "d"], n_workers=1)
+
+    records = exc.value.records
+    assert _outcomes(records) == ["ok", "interrupted", "interrupted", "interrupted"]
+    assert records[0].output == "ok-a"
 
 
 # ---------------------------------------------------------------------------

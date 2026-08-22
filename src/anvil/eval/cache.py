@@ -95,6 +95,12 @@ class CachedBaseline:
     # fingerprint on either side as "not checked" for backward compat.
     scorer_fingerprint: str = ""
     cost_metrics: dict[str, float] = field(default_factory=dict)
+    # How many of ``n_examples`` were never assessed. The gate compares every
+    # round against this aggregate, so a baseline measured on two of eight rows
+    # is a bar the loop will chase for its whole run -- and post-exclusion such
+    # a baseline looks *better*, not broken. Recording the count is what lets a
+    # reader tell the difference later.
+    n_errors: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -111,6 +117,11 @@ class CachedBaseline:
             "mlflow_run_id": self.mlflow_run_id,
             "scorer_fingerprint": self.scorer_fingerprint,
         }
+        # Additive: keep the historical on-disk schema byte-for-byte identical
+        # for a clean baseline, which is every baseline written before the
+        # failure/error split existed.
+        if self.n_errors:
+            payload["n_errors"] = self.n_errors
         # Keep the historical on-disk schema byte-for-byte compatible for
         # baselines created before cost tracking, while retaining metrics
         # whenever the eval report supplies them.
@@ -134,6 +145,7 @@ class CachedBaseline:
             mlflow_run_id=raw.get("mlflow_run_id"),
             scorer_fingerprint=raw.get("scorer_fingerprint", ""),
             cost_metrics={k: float(v) for k, v in raw.get("cost_metrics", {}).items()},
+            n_errors=int(raw.get("n_errors", 0)),
         )
 
 
@@ -232,4 +244,5 @@ def report_to_baseline(
         mlflow_run_id=report.run_id,
         scorer_fingerprint=getattr(report, "scorer_fingerprint", ""),
         cost_metrics=dict(getattr(report, "cost_metrics", {})),
+        n_errors=getattr(report, "n_errors", 0),
     )

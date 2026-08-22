@@ -32,7 +32,16 @@ class CaseOutcome(StrEnum):
     """Terminal state of one evaluated case."""
 
     OK = "ok"
-    """Assessed, and every expectation met."""
+    """Assessed, and every expectation met.
+
+    Prediction and scoring are separate stages, and the prediction stage
+    cannot know whether expectations were met -- only whether an answer
+    exists to assess. It therefore records a produced answer as ``OK``,
+    meaning *assessable*, and scoring narrows it to ``FAILURE`` where an
+    expectation went unmet. Both are in :data:`SCORABLE`, so the
+    distinction never changes what the aggregate averages -- which is
+    what makes the staging safe.
+    """
 
     FAILURE = "failure"
     """Assessed, and at least one expectation not met. Signal -- keep it."""
@@ -162,3 +171,27 @@ def summarize(records: list[CaseRecord]) -> OutcomeSummary:
         skipped=counts[CaseOutcome.SKIPPED],
         interrupted=counts[CaseOutcome.INTERRUPTED],
     )
+
+
+class RunInterrupted(BaseException):  # noqa: N818 - a cancellation, not an Error
+    """The run was cancelled; carries the records that exist.
+
+    Derives from :class:`BaseException` rather than :class:`Exception`, for the
+    same reason :class:`KeyboardInterrupt` does: every ``except Exception``
+    between the eval and the CLI is there to isolate a *row* failure, and an
+    operator's Ctrl-C must not be caught by one of them and reported as an
+    infrastructure error. That misreporting would not be cosmetic -- error
+    records feed the round's error-rate guard, so a swallowed interrupt would
+    read as a degraded endpoint and could revert good work.
+
+    ``records`` covers every case in the run, the unreached ones as
+    :attr:`CaseOutcome.INTERRUPTED`, so a killed run is still readable.
+    """
+
+    def __init__(self, records: list[CaseRecord]) -> None:
+        summary = summarize(records)
+        super().__init__(
+            f"interrupted after {summary.scorable}/{summary.total} cases "
+            f"({summary.interrupted} not reached)"
+        )
+        self.records = records

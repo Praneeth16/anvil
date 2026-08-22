@@ -98,6 +98,20 @@ eval:
   # Cooldown seconds between row tasks inside the thread pool when
   # the endpoint is approaching its quota.
   inter_row_cooldown_s: 0.0
+  # Fraction of cases that may go unassessed (the prediction raised) before
+  # the round is refused as unjudgeable rather than compared. Errored cases
+  # are excluded from the aggregate, so a degraded gateway does not drag the
+  # score down -- it shrinks the sample the score was measured on. Past this
+  # ceiling the round is an INFRA_FAIL and never a revert, so a bad afternoon
+  # on the endpoint cannot discard a good mutation.
+  max_error_rate: 0.2
+  # Absolute floor on assessed cases (capped at the mode's row count, so a
+  # small smoke mode stays runnable). Raising max_error_rate to ride out a
+  # flaky endpoint would otherwise let the aggregate become the score of one
+  # surviving row -- which post-exclusion can read 1.0 and EXTEND the frontier,
+  # where before exclusion the same run scored ~0.12 and was reverted. A rate
+  # ceiling cannot express this; only a count can. 0 disables the floor.
+  min_scorable_rows: 4
   # Scorers active by default. Each entry may be a bare name string
   # (legacy form → type: llm, weight: 1.0) or a dict with ``name``,
   # ``type`` (``llm`` or ``programmatic``), ``weight`` (default 1.0),

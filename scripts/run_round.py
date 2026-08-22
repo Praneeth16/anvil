@@ -24,6 +24,15 @@ The runner expects:
   Databricks CLI (``CLAUDE_CODE_USE_GATEWAY=1``), using the active
   profile / ``DATABRICKS_HOST`` — no secret is required. An operator
   may set ``ANTHROPIC_AUTH_TOKEN`` in the env as an optional override.
+
+Exit status (see :mod:`anvil.cli`): ``0`` every requested round ran to a
+verdict, ``2`` a round could not be judged (``INFRA_FAIL``: the eval broke, the
+error rate was above ``eval.max_error_rate``, or the session wrote outside its
+scope) or the invocation itself was wrong, ``130`` interrupted.
+
+A REVERT is not a failure of this script — a mutation that does not improve the
+agent is the loop working — so a run of 50 rounds that keeps two of them exits
+``0``. Only a round that could not be *measured* is an error.
 """
 
 from __future__ import annotations
@@ -37,6 +46,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from anvil.cli import ExitCode, run_cli  # noqa: E402
+from anvil.loop.decision import Decision  # noqa: E402
 from anvil.loop.git_ops import check_clean_worktree  # noqa: E402
 from anvil.loop.round import run_round  # noqa: E402
 
@@ -89,7 +100,10 @@ def main(argv: list[str] | None = None) -> int:
     finalized_path = REPO_ROOT / "eval" / "runs" / "finalized.json"
     if finalized_path.is_file() and not args.force:
         print(f"ERROR: optimization is finalized ({finalized_path}); pass --force to override.")
-        return 1
+        # 2, not 1: refusing to run is a malfunction of the invocation, not a
+        # result about the agent. Exit 1 is reserved for "measured, and not
+        # good enough".
+        return ExitCode.ERROR
 
     if args.allow_dirty:
         print("WARNING: --allow-dirty specified; skipping clean-worktree safety check.")
@@ -106,10 +120,12 @@ def main(argv: list[str] | None = None) -> int:
     if proc.returncode != 0:
         print(f"ERROR: parent branch {args.parent_branch!r} does not exist.")
         print(f"Create it first: git -C {REPO_ROOT} checkout -b {args.parent_branch} main")
-        return 2
+        return ExitCode.ERROR
 
     next_id = args.round_id if args.round_id is not None else _next_round_id(REPO_ROOT)
 
+    unjudged: list[str] = []
+    escaped: list[str] = []
     for i in range(args.rounds):
         rid = next_id + i
         print(f"\n=== round {rid} ===")
@@ -121,13 +137,46 @@ def main(argv: list[str] | None = None) -> int:
             eval_mode=args.eval_mode,
             max_turns=args.max_turns,
         )
+        if report.decision == Decision.INFRA_FAIL:
+            # Both a throttled gateway and an optimizer writing outside its
+            # writable scope land as INFRA_FAIL, and they are not remotely the
+            # same event: one is a bad afternoon, the other is the session
+            # reaching for its own grader, which this repo treats as a security
+            # property. A caller reading only the exit status cannot tell them
+            # apart, so at minimum they are separated on stderr.
+            if report.notes.startswith("scope violation"):
+                escaped.append(f"round {rid}: {report.notes}")
+            else:
+                unjudged.append(f"round {rid}: {report.notes or 'eval failed'}")
         print(
             f"=== round {rid} done · {report.decision} · "
             f"action={report.action_kind} · Δ={report.score_delta}\n"
         )
 
-    return 0
+    if escaped:
+        print(
+            f"\nSCOPE VIOLATION in {len(escaped)}/{args.rounds} round(s) — the optimizer "
+            "wrote outside its writable scope. This is not a flaky endpoint; treat it as "
+            "a containment failure and read the round records before running more rounds:",
+            file=sys.stderr,
+        )
+        for line in escaped:
+            print(f"  {line}", file=sys.stderr)
+    if unjudged:
+        # A round that could not be measured is a malfunction worth surfacing to
+        # whatever launched this, even though the loop kept going: it means a
+        # round was spent without producing evidence about the agent.
+        print(
+            f"\nUNJUDGEABLE: {len(unjudged)}/{args.rounds} round(s) produced no usable "
+            "measurement:",
+            file=sys.stderr,
+        )
+        for line in unjudged:
+            print(f"  {line}", file=sys.stderr)
+    if escaped or unjudged:
+        return ExitCode.ERROR
+    return ExitCode.OK
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_cli(main))

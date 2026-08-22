@@ -255,6 +255,44 @@ class EvalConfig(BaseModel):
         ]
     )
     safety_guard_threshold: float = 0.95
+    # Ceiling on the fraction of cases that may go unassessed (the prediction
+    # raised) before the round is refused as unjudgeable rather than compared.
+    # An errored case is excluded from the aggregate, so a high error rate does
+    # not drag the score down -- it means the score was measured on too few
+    # cases to be worth comparing to the frontier. Above this, the round is an
+    # INFRA_FAIL and never a revert, so a degraded gateway cannot throw away a
+    # good mutation. See ``docs/design/failure-vs-error.md``.
+    max_error_rate: float = 0.2
+    # Absolute floor on assessed cases, capped at the run's own row count. A
+    # rate ceiling is relative, so raising it to ride out a flaky endpoint also
+    # permits the aggregate to become the score of a single surviving row --
+    # which, post-exclusion, can read 1.0 and EXTEND the frontier where the
+    # same run used to score ~0.12 and be reverted. Only an absolute floor
+    # catches that.
+    min_scorable_rows: int = 4
+
+    @field_validator("min_scorable_rows")
+    @classmethod
+    def _min_scorable_rows_must_be_nonneg(cls, v: int) -> int:
+        """``0`` disables the floor; a negative value is a config mistake that
+        would read as "disabled" while meaning nothing."""
+        if v < 0:
+            raise ValueError("eval min_scorable_rows must be >= 0")
+        return v
+
+    @field_validator("max_error_rate")
+    @classmethod
+    def _max_error_rate_must_be_a_fraction(cls, v: float) -> float:
+        """Reject a non-finite or out-of-range ceiling.
+
+        ``1.0`` disables the guard (every case may error); ``0.0`` demands a
+        perfect run. Anything outside that is a config mistake, and a NaN would
+        make the comparison silently False -- i.e. would disable the guard
+        while looking like it was set.
+        """
+        if not math.isfinite(v) or not 0.0 <= v <= 1.0:
+            raise ValueError("eval max_error_rate must be finite and between 0 and 1")
+        return v
 
     @field_validator("scorers", mode="before")
     @classmethod
