@@ -151,18 +151,55 @@ and the damage landed two ways:
 
 Which is exactly the observed signature, and exactly why the count varied.
 
-**Fix.** Delete the suppression. The orphan traces it prevented are still worth
-avoiding, so the runner sets `MLFLOW_GENAI_EVAL_ENABLE_SCORER_TRACING` for the
-duration of the evaluate call: mlflow then wraps each scorer in
-`mlflow.trace(name=scorer.name, span_type=EVALUATOR)`, and the judge's autolog
-span becomes a child of a named, scorer-tagged span instead of an orphan root.
-Same goal, no global mutation.
+**Fix.** `mlflow.tracing.context(enabled=False)` around the judge call. It sets a
+**ContextVar**, so suppression is confined to the calling thread, and its
+docstring states it "does not affect the global tracing state set by
+`mlflow.tracing.disable`". Verified rather than trusted: inside the block a span
+comes back as `MLFLOW_NO_OP_SPAN_TRACE_ID` while `is_tracing_enabled()` stays
+`True`, and a thread started concurrently still gets a real trace id.
 
-An earlier reading of this had a stray root trace "winning the request-ID →
-trace-ID mapping". That was wrong, and worth recording as wrong: `_run_predict`
-mints an explicit `eval_request_id` and resolves the trace by it, so a stray root
-trace cannot steal a row's trace. The mechanism is the no-op provider, not a
-race for identity.
+**Two wrong turns worth recording, because both looked right.**
+
+*"No scoped suppression exists."* `trace_disabled`, `disable_autologging` and
+`disable_discrete_autologging` were each checked and each found process-global,
+and "none exists" was concluded from three misses rather than from the API.
+`mlflow.tracing.context` was there the whole time. Three negative results are not
+a proof of absence.
+
+*The first replacement was `MLFLOW_GENAI_EVAL_ENABLE_SCORER_TRACING`.* It does
+remove the global switch — mlflow wraps each scorer in an `EVALUATOR` span, so
+the judge's autolog nests rather than orphaning — and it verified clean live. But
+it costs 24 extra retained root traces per quick run and adds an **unguarded
+`set_trace_tag` server call per scorer**, whose failure can abort scoring. Buying
+a new dependency on the tracing server that `_resilient_eval_harness` exists to
+survive is the wrong trade, so it was reverted. Turn it on by hand to debug
+scorer behaviour.
+
+*And one claim that needed narrowing.* An earlier reading had a stray root trace
+"winning the request-ID → trace-ID mapping". `_run_predict` mints an explicit
+`eval_request_id` and resolves by it, so a stray root trace from *another row*
+cannot steal a row's trace — but "not last-root-wins" is too absolute. The
+exporter assigns `_EVAL_REQUEST_ID_TO_TRACE_ID[eval_request_id] = trace_id`, so
+multiple roots created inside the *same* prediction context overwrite each other.
+That matters here: if the root span is a no-op because tracing was suppressed
+mid-prediction, an autolog `CHAT_MODEL` span can become a new root inside that
+same context and claim the mapping — yielding a row whose "trace" is a chat
+completion with no `RETRIEVER` span. A third route to the observed symptom, and
+another reason not to flip the provider.
+
+### The stand-in trace must not be scored
+
+A row whose trace the server will not return gets a synthesized minimal trace so
+the run completes. That trace is root-span-only, so it has no `RETRIEVER` span —
+and the applicability rule above would score it `"no"`, i.e. **infrastructure
+damage recorded as an agent failure**, which is precisely the substitution the
+failure-vs-error work exists to prevent. It is also the most likely error to
+occur, since a lost trace is what this repo keeps hitting live.
+
+So the harness tags the trace it synthesizes (`anvil.synthesized_trace`, injected
+at creation via `mlflow.tracing.context(tags=...)` so it survives mlflow
+re-fetching the trace), and the scorer returns *not applicable* on seeing it.
+Unmeasured, never scored.
 
 ## 4. Every guard was blind to all of it
 
@@ -185,12 +222,18 @@ where it does survive; `EvalReport` gains `per_judge_assessed`,
 `per_judge_errors` and `scorer_errors`; and `unjudgeable_reason` grows a
 **per-judge floor**.
 
-The floor is measured against what each judge *attempted* — rows it scored plus
-rows it errored on — not against the run's row count. A judge is allowed to
-decline rows (groundedness scores 6 of 8 in quick mode by design), so measuring
+Both are measured against what each judge *attempted* — rows it scored plus rows
+it errored on — not against the run's row count. A judge is allowed to decline
+rows (groundedness scores 10 of 12 in standard mode by design), so measuring
 against `n_rows` would make a correct eval unjudgeable, and a guard that fires on
 correct usage gets switched off. A row a judge declines is not evidence of
 anything wrong; a row it broke on is.
+
+**Both**, because a floor alone is as blunt one level down as it was one level up.
+`min(4, 8)` is cleared by 4 assessed rows, so a judge failing half its
+invocations — the exact live symptom that started this — would pass a floor-only
+check. The ceiling is the run's `max_error_rate` reused: "how much of this
+measurement may be missing" is not a different question per judge.
 
 This is also what makes a per-judge score *safe* to compute over a subset, which
 Phase 3 needs before it leans on per-judge numbers.
@@ -237,28 +280,32 @@ Consequences, which are deliberate and not side effects:
 
 ## Verification
 
-Offline: 25 tests in `tests/test_groundedness_applicability.py`, covering each
+Offline: 29 tests in `tests/test_groundedness_applicability.py`, covering each
 branch of the applicability rule, the reward-hacking direction explicitly, the
+synthesized-trace escape hatch *and* that it does not swallow that guard, the
 span-union behaviour (and that the judge runs exactly once per row regardless of
-span count), the tracing assertion made from *inside* the judge call — the only
-place the window was ever open — scorer-error extraction, the per-judge floor
-including the cases where it must **not** fire, the NaN coercion, and that the
-gate and `is_compatible` cannot drift apart again.
+span count), the thread-scoping of the judge's tracing suppression asserted from a
+second thread started *inside* the judge call, scorer-error extraction, the
+per-judge floor and ceiling including the cases where they must **not** fire, the
+NaN coercion, and that the gate and `is_compatible` cannot drift apart again.
 
-Live, `--mode quick` against `fe-vm-lakebase-praneeth`, before the span-union
-change:
+Live, against `fe-vm-lakebase-praneeth`:
 
 | | before | after |
 |---|---|---|
-| groundedness scorer errors | 3–4 of 8 | **0** |
-| groundedness rows scored | 4–5 of 8 | **6 of 8** (the 2 `out_of_scope` rows abstain) |
+| groundedness scorer errors | 3–4 of 8, every run | **0** (3 runs) |
+| groundedness rows scored | 4–5 of 8 | **6 of 8** quick / **10 of 12** standard — the `out_of_scope` rows abstain |
 | `n_dropped_rows` | intermittent | **0** |
 | exit | 0 | 0 |
-
-`n_dropped_rows: 0` also answers the open question about
-`MLFLOW_GENAI_EVAL_ENABLE_SCORER_TRACING`: the extra scorer traces did not strain
-the tracing server that had been returning `None` under load.
 
 Fault injection (`runtime_endpoint` pointed at a nonexistent model) still exits
 **2** with `unmeasured rate 1.00 exceeds ceiling 0.20 (8/8 cases never scored: 8
 errored)`, so none of this weakened the Phase 2 refusal path.
+
+**On causation, honestly.** The applicability rule accounts for exactly 2 of the
+3–4 failures, deterministically. The remaining 1–2 disappeared when the global
+tracing switch did, across three runs — which is strong evidence rather than
+proof: the race is probabilistic, and both changes shipped together. What can be
+said precisely is that the structural cause is proven by construction and the
+residual is consistent with the race and with nothing else identified. A
+row-level timing trace would settle it; nobody has one.

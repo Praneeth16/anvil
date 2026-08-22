@@ -22,20 +22,18 @@ all 11 measured rounds it has been a flat 1.000 — it provides no
 gradient. Treat it as a guard-rail that aborts a round if it ever
 drops below ``safety_guard_threshold``.
 
-**Nothing here suppresses tracing, and that is deliberate.** The custom
-judge's ``chat.completions.create`` used to run inside
-``mlflow.tracing.disable()`` to stop ``mlflow.openai.autolog`` spawning an
-orphan ``CHAT_MODEL`` trace per row. The intent was local; the mechanism was
-not. ``mlflow.tracing.provider.disable()`` installs a **process-global**
-``NoOpTracerProvider`` — there is no thread-local form of it in mlflow 3.11.1
-(``trace_disabled``, ``disable_autologging`` and
-``disable_discrete_autologging`` are all global too, all three checked) — and
-``mlflow.genai.evaluate`` runs scoring **concurrently with predictions**: two
-pools, ``MlflowGenAIEvalPredict`` and ``MlflowGenAIEvalScore``, with a score
-task submitted the moment one row's prediction returns
-(``genai/evaluation/harness.py``). So a judge call on a scorer thread blinded
-the tracer for every prediction thread running at that moment, and the damage
-landed two ways:
+**Tracing suppression around the judge call is scoped, not global**, and the
+difference is the whole point. The custom judge's
+``chat.completions.create`` is autologged by ``mlflow.openai.autolog``, which
+without suppression spawns an orphan ``CHAT_MODEL`` trace per row. That much was
+always worth preventing. It used to be prevented with
+``mlflow.tracing.disable()``, which installs a **process-global**
+``NoOpTracerProvider`` — and ``mlflow.genai.evaluate`` runs scoring
+**concurrently with predictions**: two pools, ``MlflowGenAIEvalPredict`` and
+``MlflowGenAIEvalScore``, with a score task submitted the moment one row's
+prediction returns (``genai/evaluation/harness.py:569-603``). So a judge call on
+a scorer thread blinded the tracer for every prediction thread running at that
+moment, and the damage landed two ways:
 
 * A prediction wholly inside the window registers no trace under the
   ``eval_request_id`` that ``_run_predict`` resolves by, so
@@ -48,10 +46,23 @@ landed two ways:
   while ``Correctness`` and the refusal judge — which read inputs and outputs,
   not the trace — score the same row perfectly happily.
 
-The orphan traces the suppression existed to prevent are worth avoiding, but
-not with a global switch: the eval runner asks mlflow to trace scorers
-instead (``MLFLOW_GENAI_EVAL_ENABLE_SCORER_TRACING``), which nests the judge's
-autolog span under a named ``EVALUATOR`` span rather than orphaning it.
+``mlflow.tracing.context(enabled=False)`` is the right instrument and it exists
+in 3.11.1: it sets a **ContextVar**, so suppression is confined to the calling
+thread, and its own docstring notes it "does not affect the global tracing state
+set by ``mlflow.tracing.disable``". Verified rather than assumed — inside the
+block a span comes back as ``MLFLOW_NO_OP_SPAN_TRACE_ID`` while
+``is_tracing_enabled()`` stays ``True``, and a concurrently running thread still
+gets a real trace id.
+
+Worth recording how the earlier attempt went wrong, because the reasoning looks
+sound: ``trace_disabled``, ``disable_autologging`` and
+``disable_discrete_autologging`` were each checked, each found to be
+process-global, and "no scoped form exists" was concluded from three misses
+rather than from the API. The fix then reached for
+``MLFLOW_GENAI_EVAL_ENABLE_SCORER_TRACING``, which does remove the global switch
+but pays for it: 24 extra retained root traces per quick run, plus an unguarded
+``set_trace_tag`` server call per scorer whose failure can abort scoring — a new
+dependency on the very tracing server this module already works around.
 """
 
 from __future__ import annotations
@@ -65,6 +76,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import mlflow
 from mlflow.entities import AssessmentSource, Feedback
 from mlflow.genai import judges
 from mlflow.genai.scorers import Correctness, Safety, scorer
@@ -84,6 +96,13 @@ DEFAULT_JUDGE_MODEL = "databricks-claude-sonnet-4-6"
 REFUSAL_SCORER_NAME = "refusal_appropriateness"
 
 GROUNDEDNESS_SCORER_NAME = "retrieval_groundedness"
+
+# Set by ``anvil.eval.runner``'s harness shim on a trace it synthesized because
+# the tracing server would not return the real one. Such a trace is root-span-only
+# -- no ``RETRIEVER`` span -- so a trace-reading scorer must not treat its absence
+# as evidence about the agent. Defined here, next to the only reader, and imported
+# by the writer.
+SYNTHESIZED_TRACE_TAG = "anvil.synthesized_trace"
 
 # Bumped when a scorer's *semantics* change without its config changing.
 # ``compute_scorer_fingerprint`` folds this in, so a cached baseline measured
@@ -201,15 +220,17 @@ def _build_refusal_scorer(ctx: _JudgeContext):
         notes = expectations.get("notes_for_judge", "")
         prompt = _judge_prompt(query, str(outputs), should_refuse, notes)
         try:
-            # No tracing suppression here on purpose. See the module docstring:
-            # this call used to run inside ``mlflow.tracing.disable()``, which
-            # is process-global and corrupted concurrent predictions.
-            response = ctx.client.chat.completions.create(
-                model=ctx.model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=400,
-                temperature=0,
-            )
+            # ContextVar-scoped, so this silences the judge's own autolog on THIS
+            # thread only. Never mlflow.tracing.disable() here: that swaps the
+            # global tracer provider, and mlflow scores this row while still
+            # predicting others. See the module docstring.
+            with mlflow.tracing.context(enabled=False):
+                response = ctx.client.chat.completions.create(
+                    model=ctx.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=400,
+                    temperature=0,
+                )
             raw = response.choices[0].message.content or ""
             parsed = _parse_judge_json(raw)
         except Exception as exc:
@@ -284,6 +305,20 @@ def _retrieved_chunks(trace: Any) -> list[Any]:
     return [chunk for chunks in by_span.values() for chunk in chunks]
 
 
+def _is_synthesized_trace(trace: Any) -> bool:
+    """Whether this trace is the harness's stand-in for one the server lost.
+
+    See :data:`SYNTHESIZED_TRACE_TAG`. Defensive about the shape because a
+    ``Trace`` reaches scorers from several paths and a missing ``info`` or
+    ``tags`` must read as "not synthesized" rather than raise inside a scorer.
+    """
+    try:
+        tags = trace.info.tags
+    except AttributeError:
+        return False
+    return bool(tags) and str(tags.get(SYNTHESIZED_TRACE_TAG, "")).lower() == "true"
+
+
 def _build_groundedness_scorer(*, name: str = GROUNDEDNESS_SCORER_NAME):
     """Return a ``@scorer`` wrapping ``RetrievalGroundedness`` with an
     applicability rule.
@@ -338,6 +373,14 @@ def _build_groundedness_scorer(*, name: str = GROUNDEDNESS_SCORER_NAME):
             # Not applicable. Returning None yields zero feedbacks, so the row
             # contributes nothing to this judge's mean and — unlike raising —
             # is not counted as a scorer error either.
+            return None
+        if _is_synthesized_trace(trace):
+            # The prediction ran; the tracing server would not give back its
+            # trace, so the harness substituted a root-span-only stand-in. There
+            # is no RETRIEVER span to find and no evidence either way. Returning
+            # "no" here would score infrastructure damage as an agent failure --
+            # and reliably, since a lost trace is exactly what this repo's
+            # resilience work keeps hitting live.
             return None
         chunks = _retrieved_chunks(trace)
         if not chunks:

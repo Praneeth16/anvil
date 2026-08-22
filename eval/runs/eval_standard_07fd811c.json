@@ -1,0 +1,120 @@
+{
+  "aggregate": 0.861111111111111,
+  "per_judge": {
+    "correctness": 0.6666666666666666,
+    "retrieval_groundedness": 1.0,
+    "refusal_appropriateness": 0.9166666666666666
+  },
+  "per_bucket": {
+    "direct": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 0.75
+    },
+    "multi_hop": {
+      "correctness": 0.75,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "distractor": {
+      "correctness": 0.5,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "out_of_scope": {
+      "correctness": 0.0,
+      "refusal_appropriateness": 1.0
+    }
+  },
+  "failures": [
+    {
+      "example_id": "golden_003",
+      "query": "What payment methods does NeoVolt accept for residential bills?",
+      "category": "direct",
+      "judge_failures": [
+        "refusal_appropriateness"
+      ],
+      "trace_id": "tr-3962891b8bec2f8588083c2ce5b922ad"
+    },
+    {
+      "example_id": "golden_010",
+      "query": "I lost my job and cannot pay this month's electricity bill. What protections do I have as a NeoVolt customer?",
+      "category": "multi_hop",
+      "judge_failures": [
+        "correctness"
+      ],
+      "trace_id": "tr-0d31e3a42d6b4acc641fa9a187cbccc5"
+    },
+    {
+      "example_id": "golden_013",
+      "query": "I read on a community forum that NeoVolt's residential rate is $0.085 per kWh. Is that what I'm currently paying?",
+      "category": "distractor",
+      "judge_failures": [
+        "correctness"
+      ],
+      "trace_id": "tr-55e6b6ff6ca2fa3fad29aca22593b129"
+    },
+    {
+      "example_id": "golden_017",
+      "query": "What's the weather forecast for tomorrow afternoon? I'm planning a barbecue.",
+      "category": "out_of_scope",
+      "judge_failures": [
+        "correctness"
+      ],
+      "trace_id": "tr-14741d1d5af1b1d7004115c8f3cc5bc6"
+    },
+    {
+      "example_id": "golden_018",
+      "query": "Can you recommend a good electric induction stove for my new kitchen?",
+      "category": "out_of_scope",
+      "judge_failures": [
+        "correctness"
+      ],
+      "trace_id": "tr-154ebf922d5d56776d222ceadd70e881"
+    }
+  ],
+  "run_id": "edd83e0ba0a04f19ae187e52fb495464",
+  "experiment_id": "3194748038636715",
+  "n_rows": 12,
+  "mode": "standard",
+  "scorers": [
+    "correctness",
+    "retrieval_groundedness",
+    "refusal_appropriateness"
+  ],
+  "evaluated_at": "2026-08-22T21:05:01+00:00",
+  "trace_ids": [
+    "tr-144bd80642f795527531ba984f456817",
+    "tr-19f48e110e95e45da42587536288bd32",
+    "tr-3962891b8bec2f8588083c2ce5b922ad",
+    "tr-5d931e4a56fa87ccbc2149a04b94b8fc",
+    "tr-198942a19faddb644ad948fd9b8cde2d",
+    "tr-237929ac7abfb4150a171fa1d17b3737",
+    "tr-1df42e0864c145cd25a6fca33ba75f3b",
+    "tr-0d31e3a42d6b4acc641fa9a187cbccc5",
+    "tr-55e6b6ff6ca2fa3fad29aca22593b129",
+    "tr-5951188fc9860a9b1e28bc1f15622ebb",
+    "tr-14741d1d5af1b1d7004115c8f3cc5bc6",
+    "tr-154ebf922d5d56776d222ceadd70e881"
+  ],
+  "n_errors": 0,
+  "errors": [],
+  "n_unattributed_errors": 0,
+  "n_dropped_rows": 0,
+  "per_judge_assessed": {
+    "correctness": 12,
+    "retrieval_groundedness": 10,
+    "refusal_appropriateness": 12
+  },
+  "per_judge_errors": {
+    "correctness": 0,
+    "retrieval_groundedness": 0,
+    "refusal_appropriateness": 0
+  },
+  "scorer_errors": [],
+  "cost_metrics": {
+    "total_context_chars": 1042.0,
+    "n_rows": 12.0
+  },
+  "scorer_fingerprint": "[{\"check_function\": null, \"name\": \"correctness\", \"type\": \"llm\", \"weight\": 1.0}, {\"check_function\": null, \"name\": \"refusal_appropriateness\", \"type\": \"llm\", \"weight\": 1.0}, {\"check_function\": null, \"name\": \"retrieval_groundedness\", \"semantics\": 3, \"type\": \"llm\", \"weight\": 1.0}]"
+}

@@ -122,6 +122,20 @@ def unjudgeable_reason(
             continue
         assessed = report.per_judge_assessed.get(name, 0)
         attempted = assessed + n_errors
+        # Rate first, for the same reason the run-level checks are ordered that
+        # way: a floor alone is too blunt here too. ``min(4, attempted)`` is
+        # cleared by 4 of 8 assessed rows, so a judge failing half its
+        # invocations -- the live symptom that started this -- would pass a
+        # floor-only check. The ceiling is the run's ``max_error_rate`` reused:
+        # "how much of this measurement may be missing" does not become a
+        # different question one level down.
+        if attempted and (n_errors / attempted) > max_error_rate:
+            return (
+                f"scorer {name!r} errored on {n_errors} of the {attempted} case(s) "
+                f"it attempted ({n_errors / attempted:.2f} exceeds ceiling "
+                f"{max_error_rate:.2f}) — its per-judge mean, and so the weighted "
+                "aggregate built on it, is measured on what happened to survive"
+            )
         judge_floor = min(min_scorable_rows, attempted)
         if assessed < judge_floor:
             return (

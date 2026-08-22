@@ -67,7 +67,7 @@ from anvil.eval.outcome import (
     CaseRecord,
     RunInterrupted,
 )
-from anvil.eval.scorers import build_scorers
+from anvil.eval.scorers import SYNTHESIZED_TRACE_TAG, build_scorers
 from anvil.observability import SOURCE_EVAL, enable_runtime_tracing
 from anvil.runtime.agent import AnvilAgent
 from anvil.runtime.client import build_gateway_client
@@ -843,15 +843,17 @@ _MLFLOW_MAX_WORKERS_ENV = "MLFLOW_GENAI_EVAL_MAX_WORKERS"
 # reported as an error rather than silently passing.
 _MLFLOW_SKIP_VALIDATION_ENV = "MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"
 
-# With this on, mlflow wraps each scorer call in
-# ``mlflow.trace(name=scorer.name, span_type=EVALUATOR)``, so the refusal
-# judge's own autologged ``chat.completions.create`` becomes a child of a named,
-# scorer-tagged span instead of an orphan ``CHAT_MODEL`` root trace. That is the
-# replacement for the ``mlflow.tracing.disable()`` the refusal scorer used to
-# wrap its judge call in: same goal, no process-global tracer swap racing the
-# prediction threads. See the ``anvil.eval.scorers`` module docstring for what
-# that race cost. mlflow defaults it off.
-_MLFLOW_SCORER_TRACING_ENV = "MLFLOW_GENAI_EVAL_ENABLE_SCORER_TRACING"
+# Deliberately NOT set: ``MLFLOW_GENAI_EVAL_ENABLE_SCORER_TRACING``.
+#
+# It wraps every scorer in an ``EVALUATOR`` span, which would nest the refusal
+# judge's autolog span instead of orphaning it — and it was briefly used here for
+# that. But it costs 24 extra retained root traces per quick run and adds an
+# unguarded ``set_trace_tag`` server call per scorer, whose failure can abort
+# scoring. Buying a new dependency on the tracing server that this module spends
+# ``_resilient_eval_harness`` defending against is the wrong trade. The judge's
+# autolog is silenced at the call site instead, with ContextVar-scoped
+# ``mlflow.tracing.context(enabled=False)`` — see ``anvil.eval.scorers``. Turn
+# the env var on by hand when debugging scorer behaviour.
 
 # Name of the per-row root span ``evaluate_branch`` wraps every
 # ``predict_fn`` invocation in. The span yields a real per-row trace
@@ -1079,7 +1081,17 @@ def _resilient_eval_harness(
                 # fallback exists to prevent. Retrying made that three chances
                 # instead of one, so a raise is treated exactly like a None.
                 try:
-                    eval_item.trace = create_minimal_trace(eval_item)
+                    # Tagged as synthesized, and the tag is injected at creation
+                    # (ContextVar-scoped) so it survives mlflow re-fetching the
+                    # trace later. A minimal trace is root-span-only: it carries
+                    # no RETRIEVER span, and without the tag a trace-reading
+                    # scorer cannot tell "the agent did not retrieve" from "the
+                    # tracing server lost the evidence that it did". The first is
+                    # a finding about the agent; the second is infrastructure
+                    # damage, and scoring it would be the exact error this
+                    # repo's failure-vs-error work exists to prevent.
+                    with mlflow.tracing.context(tags={SYNTHESIZED_TRACE_TAG: "true"}):
+                        eval_item.trace = create_minimal_trace(eval_item)
                 except Exception as exc:  # noqa: BLE001 - a raise is just a miss
                     logger.warning(
                         "minimal-trace fallback attempt %s for row %s raised %s: %s",
@@ -1597,7 +1609,6 @@ def evaluate_branch(
             {
                 _MLFLOW_MAX_WORKERS_ENV: str(n_workers),
                 _MLFLOW_SKIP_VALIDATION_ENV: "True",
-                _MLFLOW_SCORER_TRACING_ENV: "True",
             }
         ),
         _resilient_eval_harness(error_sink=errored, dropped_sink=dropped, kept_rows_sink=kept_rows),

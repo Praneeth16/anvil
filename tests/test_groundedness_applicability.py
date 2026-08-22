@@ -223,6 +223,101 @@ def test_the_judge_is_called_once_regardless_of_span_count(
     assert len(calls[0]["context"]) == 5
 
 
+def test_a_synthesized_trace_is_not_scored_as_an_agent_failure() -> None:
+    """The prediction ran; the tracing server would not return its trace, so the
+    harness substituted a root-span-only stand-in. That trace has no RETRIEVER
+    span for the same reason it has no other spans — infrastructure, not agent
+    behaviour. Scoring it "no" would be the precise error this repo's
+    failure-vs-error work exists to prevent, and a lost trace is what it keeps
+    hitting live.
+    """
+    from anvil.eval.scorers import SYNTHESIZED_TRACE_TAG, _build_groundedness_scorer
+
+    class _Info:
+        tags = {SYNTHESIZED_TRACE_TAG: "true"}
+
+    class _Trace:
+        info = _Info()
+
+    result = _build_groundedness_scorer().run(
+        inputs={"query": "q"},
+        outputs="an answer that did get produced",
+        expectations={"expected_doc_ids": ["tariff_standard_residential"]},
+        trace=_Trace(),
+    )
+    assert result is None, "a lost trace must be unmeasured, never scored 0"
+
+
+def test_a_real_trace_without_the_tag_is_still_scored() -> None:
+    """The escape hatch must not swallow the reward-hacking guard: an ordinary
+    trace that simply has no retrieval still scores "no"."""
+    from anvil.eval.scorers import _build_groundedness_scorer
+
+    class _Info:
+        tags: dict[str, str] = {}
+
+    class _Trace:
+        info = _Info()
+
+    result = _build_groundedness_scorer().run(
+        inputs={"query": "q"},
+        outputs="a",
+        expectations={"expected_doc_ids": ["d"]},
+        trace=_Trace(),
+    )
+    assert result is not None
+    assert result.value == "no"
+
+
+def test_the_refusal_judge_suppresses_tracing_only_on_its_own_thread() -> None:
+    """``mlflow.tracing.context(enabled=False)`` is ContextVar-scoped, so the
+    judge's autolog is silenced without touching the global tracer that
+    concurrent predictions depend on. The earlier code used
+    ``mlflow.tracing.disable()``, which swaps the provider process-wide.
+
+    Asserted from inside the judge call, on a second thread, because that is the
+    only place and moment the old bug was observable.
+    """
+    import threading
+
+    import mlflow
+    from mlflow.tracing.provider import is_tracing_enabled
+
+    from anvil.eval.scorers import _build_refusal_scorer, _JudgeContext
+
+    observed: dict[str, Any] = {}
+
+    class _Completions:
+        def create(self, **kwargs: Any) -> Any:
+            observed["global_still_enabled"] = is_tracing_enabled()
+            with mlflow.start_span(name="judge-own-thread") as own:
+                observed["own_thread_suppressed"] = own.trace_id == "MLFLOW_NO_OP_SPAN_TRACE_ID"
+
+            def _other_thread() -> None:
+                with mlflow.start_span(name="concurrent-prediction") as span:
+                    observed["other_thread_trace_id"] = span.trace_id
+
+            t = threading.Thread(target=_other_thread)
+            t.start()
+            t.join()
+            raise RuntimeError("stop here — the judge's verdict is not what we test")
+
+    class _Chat:
+        completions = _Completions()
+
+    class _Client:
+        chat = _Chat()
+
+    scorer = _build_refusal_scorer(_JudgeContext(client=_Client(), model="m"))  # type: ignore[arg-type]
+    scorer.run(inputs={"query": "q"}, outputs="a", expectations={"should_refuse": False})
+
+    assert observed["global_still_enabled"] is True
+    assert observed["own_thread_suppressed"] is True, "the judge's own autolog must be silenced"
+    assert observed["other_thread_trace_id"] != "MLFLOW_NO_OP_SPAN_TRACE_ID", (
+        "a concurrent prediction must still get a real trace"
+    )
+
+
 def test_groundedness_reads_expected_doc_ids_not_should_refuse() -> None:
     """``expected_doc_ids`` is what groundedness is about.
 
@@ -279,47 +374,6 @@ def test_build_scorers_wires_the_wrapper_not_the_bare_mlflow_scorer() -> None:
 # ---------------------------------------------------------------------------
 # The tracing race
 # ---------------------------------------------------------------------------
-
-
-def test_refusal_judge_does_not_disable_tracing_while_it_runs() -> None:
-    """The judge call must leave the global tracer alone.
-
-    ``mlflow.tracing.disable()`` installs a process-global NoOpTracerProvider,
-    and mlflow scores row N while still predicting row N+1 on a separate pool. So
-    the old suppression blinded concurrent predictions: a prediction wholly
-    inside the window registered no trace under its ``eval_request_id`` and lost
-    its trace entirely, and one partly inside it kept the trace but lost whatever
-    spans were emitted meanwhile — including the ``RETRIEVER`` span groundedness
-    needs.
-
-    Asserted from *inside* the judge call, which is the only place the window was
-    ever open.
-    """
-    import mlflow
-    from mlflow.tracing.provider import is_tracing_enabled
-
-    from anvil.eval.scorers import _build_refusal_scorer, _JudgeContext
-
-    observed: dict[str, Any] = {}
-
-    class _Completions:
-        def create(self, **kwargs: Any) -> Any:
-            observed["tracing_enabled"] = is_tracing_enabled()
-            with mlflow.start_span(name="concurrent-prediction") as span:
-                observed["span_is_real"] = span.trace_id is not None
-            raise RuntimeError("stop here — the judge's verdict is not what we test")
-
-    class _Chat:
-        completions = _Completions()
-
-    class _Client:
-        chat = _Chat()
-
-    scorer = _build_refusal_scorer(_JudgeContext(client=_Client(), model="m"))  # type: ignore[arg-type]
-    scorer.run(inputs={"query": "q"}, outputs="a", expectations={"should_refuse": False})
-
-    assert observed["tracing_enabled"] is True
-    assert observed["span_is_real"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -581,7 +635,7 @@ def test_a_judge_that_broke_on_most_of_its_attempts_is_unjudgeable() -> None:
     )
     reason = unjudgeable_reason(report, min_scorable_rows=4)
     assert "retrieval_groundedness" in reason
-    assert "1 of the 6" in reason
+    assert "5 of the 6" in reason
 
 
 def test_a_judge_that_merely_applies_to_few_rows_is_fine() -> None:
@@ -601,16 +655,32 @@ def test_a_judge_that_merely_applies_to_few_rows_is_fine() -> None:
     assert unjudgeable_reason(report, min_scorable_rows=4) == ""
 
 
-def test_a_judge_with_errors_that_still_clears_the_floor_is_judgeable() -> None:
-    """Errors are not automatically disqualifying; too small a surviving sample
-    is. Two errors out of eight leaves six assessed, well clear of four."""
+def test_a_judge_with_a_few_errors_under_the_ceiling_is_judgeable() -> None:
+    """Errors are not automatically disqualifying. One of eight is 0.125, inside
+    the 0.20 ceiling, and leaves seven assessed."""
     from anvil.eval.judgeability import unjudgeable_reason
 
     report = _report(
-        per_judge_assessed={"correctness": 8, "retrieval_groundedness": 6},
-        per_judge_errors={"correctness": 0, "retrieval_groundedness": 2},
+        per_judge_assessed={"correctness": 8, "retrieval_groundedness": 7},
+        per_judge_errors={"correctness": 0, "retrieval_groundedness": 1},
     )
-    assert unjudgeable_reason(report, min_scorable_rows=4) == ""
+    assert unjudgeable_reason(report, max_error_rate=0.2, min_scorable_rows=4) == ""
+
+
+def test_a_judge_error_rate_over_the_ceiling_is_unjudgeable_even_above_the_floor() -> None:
+    """The floor alone is too blunt one level down, exactly as it is at the run
+    level: ``min(4, 8)`` is cleared by 4 assessed rows, so a judge failing half
+    its invocations — the live symptom that started all of this — would pass a
+    floor-only check. 4 errors of 8 is 0.50 against a 0.20 ceiling.
+    """
+    from anvil.eval.judgeability import unjudgeable_reason
+
+    report = _report(
+        per_judge_assessed={"retrieval_groundedness": 4},
+        per_judge_errors={"retrieval_groundedness": 4},
+    )
+    reason = unjudgeable_reason(report, max_error_rate=0.2, min_scorable_rows=4)
+    assert "0.50 exceeds ceiling 0.20" in reason
 
 
 def test_the_per_judge_floor_is_capped_at_what_the_judge_attempted() -> None:
