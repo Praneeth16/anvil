@@ -590,6 +590,28 @@ def test_a_fingerprintless_baseline_still_works_for_unversioned_scorers() -> Non
     )
 
 
+def test_the_gate_and_is_compatible_share_one_definition() -> None:
+    """``loop/round.py`` used to inline its own copy of the fingerprint rule, so
+    fixing ``is_compatible`` left the check that actually gates keep/revert on the
+    old behaviour. Both now call ``scorer_incomparability_reason``, and this
+    asserts they cannot disagree again."""
+    import inspect
+
+    from anvil.eval.cache import is_compatible, scorer_incomparability_reason
+    from anvil.loop import round as round_mod
+
+    assert "scorer_incomparability_reason" in inspect.getsource(round_mod.run_round)
+    assert "scorer_incomparability_reason" in inspect.getsource(is_compatible)
+
+    # And the shared rule refuses the fingerprintless baseline both paths see.
+    reason = scorer_incomparability_reason(
+        _cached(scorer_fingerprint=""),
+        scorers=["correctness", "retrieval_groundedness"],
+        scorer_fingerprint="anything",
+    )
+    assert "retrieval_groundedness" in reason
+
+
 def test_unversioned_scorers_keep_their_old_fingerprint() -> None:
     """Bumping one scorer's semantics must not invalidate baselines for configs
     that do not use it."""

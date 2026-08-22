@@ -17,6 +17,7 @@ from anvil.eval.cache import (
     load_baseline,
     report_to_baseline,
     save_baseline,
+    scorer_incomparability_reason,
 )
 from anvil.eval.outcome import (
     Attempt,
@@ -41,6 +42,7 @@ __all__ = [
     "compute_scorer_fingerprint",
     "evaluate_branch",
     "is_compatible",
+    "scorer_incomparability_reason",
     "load_baseline",
     "report_to_baseline",
     "save_baseline",

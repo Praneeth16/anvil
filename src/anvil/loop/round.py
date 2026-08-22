@@ -20,6 +20,7 @@ from pathlib import Path
 import yaml
 
 from anvil.eval import evaluate_branch, load_baseline
+from anvil.eval.cache import scorer_incomparability_reason
 from anvil.eval.judgeability import unjudgeable_reason_for
 from anvil.loop.builder import build_round_prompt
 from anvil.loop.decision import Decision
@@ -264,24 +265,22 @@ def run_round(
         else None
     )
 
-    # Validate scorer-config compatibility between the cached baseline
-    # and the current eval run. A weight or check_function change
-    # invalidates the comparison even when scorer names are unchanged —
-    # the cached aggregate has a different meaning under a different
-    # weighting, so the frontier gate could make an invalid decision.
-    # An empty fingerprint on either side (e.g. a baseline written
-    # before this field existed) skips the check for backward compat.
-    if (
-        baseline is not None
-        and eval_report is not None
-        and baseline.scorer_fingerprint
-        and eval_report.scorer_fingerprint
-        and baseline.scorer_fingerprint != eval_report.scorer_fingerprint
-    ):
-        raise RuntimeError(
-            "scorer configuration has changed since baseline was cached — "
-            "regenerate the baseline with scripts/make_baseline.py"
+    # Validate scorer-config comparability between the cached baseline and this
+    # run before the gate reads either number. Delegated rather than decided
+    # here: this check used to be an inline copy of the rule in
+    # ``eval/cache.is_compatible``, and the two drifted the moment one was
+    # fixed -- leaving the copy that actually gates keep/revert on the old
+    # behaviour. One definition, consulted by both.
+    if baseline is not None and eval_report is not None:
+        incomparable = scorer_incomparability_reason(
+            baseline,
+            scorers=list(eval_report.scorers),
+            scorer_fingerprint=eval_report.scorer_fingerprint,
         )
+        if incomparable:
+            raise RuntimeError(
+                f"{incomparable} — regenerate the baseline with scripts/make_baseline.py"
+            )
 
     # A round that wrote outside its scope does not reach the gate at all.
     # Routing it through `gate_decision` would be wrong twice over: `decide()`

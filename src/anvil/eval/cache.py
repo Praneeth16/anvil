@@ -188,6 +188,57 @@ def save_baseline(repo_root: Path | str, baseline: CachedBaseline) -> Path:
     return path
 
 
+def scorer_incomparability_reason(
+    cached: CachedBaseline,
+    *,
+    scorers: list[str],
+    scorer_fingerprint: str = "",
+) -> str:
+    """Why ``cached``'s scorer configuration cannot be compared, or ``""``.
+
+    The single definition of scorer comparability, because there used to be two:
+    :func:`is_compatible` and an inline copy in ``loop/round.py``. They agreed
+    until one was fixed, at which point the gate — the copy that actually decides
+    keep/revert — kept the old behaviour. Same failure mode
+    :mod:`anvil.eval.judgeability` exists to prevent one level up.
+
+    When both sides carry a fingerprint, they must match: a weight or
+    ``check_function`` change gives the cached aggregate a different meaning even
+    though the scorer names are identical.
+
+    A missing fingerprint on either side is normally waved through, for baselines
+    written before the field existed. The exception is a scorer whose *semantics*
+    have been versioned (:data:`anvil.eval.scorers.SCORER_SEMANTICS_VERSIONS`):
+    there the exemption and the version bump contradict each other. The bump says
+    this scorer's meaning demonstrably changed; an absent fingerprint says we
+    cannot tell which meaning the baseline was measured under. That is the one
+    case where waving it through is knowably wrong.
+
+    Not hypothetical. The shipped ``eval/runs/baseline.json`` predates
+    fingerprinting entirely, and it is exactly the baseline that needed
+    invalidating when ``retrieval_groundedness`` gained its applicability rule —
+    its ``per_bucket`` still records ``out_of_scope: {retrieval_groundedness:
+    0.0}``, a bucket that now has no groundedness value at all. Without this the
+    version bump protected every baseline except the only one on disk.
+    """
+    if cached.scorer_fingerprint and scorer_fingerprint:
+        if cached.scorer_fingerprint != scorer_fingerprint:
+            return (
+                "scorer configuration has changed since the baseline was cached "
+                "(fingerprint mismatch)"
+            )
+        return ""
+    if not cached.scorer_fingerprint:
+        versioned = sorted(name for name in scorers if name in SCORER_SEMANTICS_VERSIONS)
+        if versioned:
+            return (
+                f"the cached baseline carries no scorer fingerprint, so it cannot be "
+                f"shown to have been measured under the current meaning of "
+                f"{', '.join(versioned)} — whose semantics have changed since"
+            )
+    return ""
+
+
 def is_compatible(
     cached: CachedBaseline,
     *,
@@ -199,27 +250,8 @@ def is_compatible(
 ) -> bool:
     """Return True if ``cached`` is comparable with the requesting context.
 
-    When both sides carry a non-empty ``scorer_fingerprint``, the
-    fingerprints must match — a weight or check_function change
-    invalidates the comparison even if the scorer names are unchanged.
-    An empty fingerprint on either side (e.g. a baseline written before
-    this field existed) skips the fingerprint check for backward
-    compatibility.
-
-    **Except** when the requested scorers include one whose semantics have been
-    versioned (:data:`anvil.eval.scorers.SCORER_SEMANTICS_VERSIONS`). Then a
-    missing fingerprint is refused rather than waved through, because the
-    exemption and the version bump contradict each other: the bump says this
-    scorer's meaning demonstrably changed, and an absent fingerprint means we
-    cannot tell which meaning the baseline was measured under. Waving it through
-    is the one case where the answer is knowably wrong.
-
-    Not hypothetical. The shipped ``eval/runs/baseline.json`` predates
-    fingerprinting entirely, and it is exactly the baseline that needed
-    invalidating when ``retrieval_groundedness`` gained its applicability rule —
-    its ``per_bucket`` still records ``out_of_scope: {retrieval_groundedness:
-    0.0}``, a bucket that now has no groundedness value at all. Without this
-    branch the version bump protected every baseline except the only one on disk.
+    Mode, scorer names and both endpoints must match exactly; the scorer
+    configuration is delegated to :func:`scorer_incomparability_reason`.
     """
     if (
         cached.mode != mode
@@ -228,11 +260,8 @@ def is_compatible(
         or cached.judge_endpoint != judge_endpoint
     ):
         return False
-    if cached.scorer_fingerprint and scorer_fingerprint:
-        return cached.scorer_fingerprint == scorer_fingerprint
-    return not (
-        not cached.scorer_fingerprint
-        and any(name in SCORER_SEMANTICS_VERSIONS for name in scorers)
+    return not scorer_incomparability_reason(
+        cached, scorers=scorers, scorer_fingerprint=scorer_fingerprint
     )
 
 
