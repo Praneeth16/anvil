@@ -3,6 +3,12 @@ name: CI
 # Offline by design: no credentials, no network calls to Databricks, no LLM
 # calls. The whole suite must pass on a laptop with the wifi off. Live tests
 # are marked `live`, deselected by default, and run from live.yml instead.
+#
+# That is enforced rather than asserted: tests/conftest.py refuses off-machine
+# socket connections for every test not marked `live`. Deselecting by marker
+# alone would let an *unmarked* test make a real call, pass here, and only fail
+# once someone ran the suite without egress. The dependency install below is the
+# one step that legitimately needs the network.
 on:
   push:
     branches: [main]
