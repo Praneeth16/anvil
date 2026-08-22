@@ -263,6 +263,22 @@ class EvalConfig(BaseModel):
     # INFRA_FAIL and never a revert, so a degraded gateway cannot throw away a
     # good mutation. See ``docs/design/failure-vs-error.md``.
     max_error_rate: float = 0.2
+    # Absolute floor on assessed cases, capped at the run's own row count. A
+    # rate ceiling is relative, so raising it to ride out a flaky endpoint also
+    # permits the aggregate to become the score of a single surviving row --
+    # which, post-exclusion, can read 1.0 and EXTEND the frontier where the
+    # same run used to score ~0.12 and be reverted. Only an absolute floor
+    # catches that.
+    min_scorable_rows: int = 4
+
+    @field_validator("min_scorable_rows")
+    @classmethod
+    def _min_scorable_rows_must_be_nonneg(cls, v: int) -> int:
+        """``0`` disables the floor; a negative value is a config mistake that
+        would read as "disabled" while meaning nothing."""
+        if v < 0:
+            raise ValueError("eval min_scorable_rows must be >= 0")
+        return v
 
     @field_validator("max_error_rate")
     @classmethod

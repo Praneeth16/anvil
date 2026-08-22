@@ -523,6 +523,255 @@ def test_max_error_rate_ceiling_is_read_from_config() -> None:
             EvalConfig(max_error_rate=bad)
 
 
+# ---------------------------------------------------------------------------
+# 5. Judgeability — the three ways an excluded-errors report is still untrustworthy
+# ---------------------------------------------------------------------------
+
+
+def _eval_report(*, n_rows: int, n_errors: int = 0, n_unattributed: int = 0):
+    from anvil.eval.runner import EvalReport
+
+    return EvalReport(
+        aggregate=1.0,
+        per_judge={"correctness": 1.0},
+        per_bucket={},
+        failures=[],
+        run_id="r",
+        experiment_id="e",
+        n_rows=n_rows,
+        mode="quick",
+        scorers=["correctness"],
+        evaluated_at="2026-08-22T12:00:00+00:00",
+        n_errors=n_errors,
+        n_unattributed_errors=n_unattributed,
+    )
+
+
+def test_a_healthy_report_is_judgeable() -> None:
+    from anvil.eval.judgeability import unjudgeable_reason
+
+    assert unjudgeable_reason(_eval_report(n_rows=8)) == ""
+    assert unjudgeable_reason(_eval_report(n_rows=8, n_errors=1)) == ""
+
+
+def test_an_unexcludable_error_makes_the_report_unjudgeable() -> None:
+    """The hole that excluding-by-trace_id leaves open.
+
+    An error whose row is not in ``result_df`` cannot have its score removed —
+    there is no row to remove — so its infrastructure zero is still in the mean.
+    One such error in eight rows sits at an error rate of 0.125, comfortably
+    under the 0.2 ceiling, so without this check the round would be judged
+    normally on an aggregate that still contains the zero: exactly the bug the
+    exclusion exists to fix, quietly reintroduced.
+    """
+    from anvil.eval.judgeability import unjudgeable_reason
+
+    report = _eval_report(n_rows=8, n_errors=1, n_unattributed=1)
+    assert report.error_rate < 0.2
+    reason = unjudgeable_reason(report)
+    assert "could not be attributed" in reason
+    assert "did not happen" in reason
+
+
+def test_too_few_assessed_cases_is_unjudgeable_even_with_the_rate_guard_off() -> None:
+    """The floor exists because a rate is relative.
+
+    ``max_error_rate: 1.0`` reads as "disable the guard", i.e. as restoring the
+    pre-exclusion behaviour. It does something strictly more dangerous: seven
+    errors in eight rows used to score ~0.12 and be REVERTED, but excluded, the
+    aggregate becomes the score of the one surviving row — 1.0 if it passed —
+    which EXTENDS the frontier and becomes the bar every later round must beat.
+    No rate can express "at least N cases actually ran".
+    """
+    from anvil.eval.judgeability import unjudgeable_reason
+
+    report = _eval_report(n_rows=8, n_errors=7)
+    assert unjudgeable_reason(report, max_error_rate=1.0) != ""
+    assert "below the floor" in unjudgeable_reason(report, max_error_rate=1.0)
+
+
+def test_the_floor_is_capped_at_the_run_size() -> None:
+    """A deliberately small mode must stay runnable. A 2-row smoke eval cannot
+    satisfy a floor of 4, and a guard that fires on correct usage gets switched
+    off — so the floor asks for "4 assessed cases, or all of them if fewer"."""
+    from anvil.eval.judgeability import unjudgeable_reason
+
+    assert unjudgeable_reason(_eval_report(n_rows=2), min_scorable_rows=4) == ""
+    # But it still demands ALL of them when the run is that small.
+    assert unjudgeable_reason(_eval_report(n_rows=2, n_errors=1), min_scorable_rows=4) != ""
+
+
+def test_the_floor_can_be_switched_off_explicitly() -> None:
+    from anvil.eval.judgeability import unjudgeable_reason
+
+    report = _eval_report(n_rows=8, n_errors=7)
+    assert unjudgeable_reason(report, max_error_rate=1.0, min_scorable_rows=0) == ""
+
+
+def test_min_scorable_rows_is_validated() -> None:
+    from anvil.runtime.models import EvalConfig
+
+    assert EvalConfig().min_scorable_rows == 4
+    assert EvalConfig(min_scorable_rows=0).min_scorable_rows == 0
+    with pytest.raises(ValueError, match="min_scorable_rows"):
+        EvalConfig(min_scorable_rows=-1)
+
+
+def test_an_empty_run_reads_as_maximally_errored_not_clean() -> None:
+    """A guard's degenerate case must point at "refuse". ``0.0`` for a run with
+    no rows but recorded errors would be a fail-open sentinel: unmeasurable, and
+    passing every check."""
+    from anvil.eval.judgeability import unjudgeable_reason
+
+    assert _eval_report(n_rows=0, n_errors=3).error_rate == 1.0
+    assert _eval_report(n_rows=0).error_rate == 0.0
+    assert unjudgeable_reason(_eval_report(n_rows=0, n_errors=3)) != ""
+
+
+def test_round_refuses_a_round_measured_on_too_few_cases(
+    anvil_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The floor reaches the round gate, not just the CLI. Seven of eight cases
+    errored; the surviving one scored 0.9, better than the 0.5 baseline. Without
+    the floor this KEEPs and the frontier is advanced from a single row."""
+    import anvil.loop.round as round_mod
+    from anvil.loop.decision import Decision
+
+    # Rate guard wide open, so only the floor can catch this.
+    (anvil_repo / "harness" / "config.yaml").write_text(
+        "mode: prompt\neval:\n  max_error_rate: 1.0\n  min_scorable_rows: 4\n"
+    )
+    _git(anvil_repo, "commit", "-qam", "open the rate guard")
+
+    monkeypatch.setattr(round_mod, "run_optimizer_session", _mutating_session(anvil_repo))
+    monkeypatch.setattr(
+        round_mod, "evaluate_branch", lambda **_kw: _report_with_error_rate(0.875)
+    )
+
+    report = round_mod.run_round(round_id=1, repo_root=anvil_repo)
+
+    assert report.decision == Decision.INFRA_FAIL
+    assert "below the floor" in report.notes
+    assert not (anvil_repo / "eval" / "runs" / "frontier.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# 6. The baseline and the held-out finalization are guarded too
+# ---------------------------------------------------------------------------
+
+
+def _load_script(name: str):
+    import importlib.util
+    import sys
+
+    path = REPO_ROOT / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"anvil_script_{name}", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(spec.name, None)
+    return module
+
+
+def _baseline_repo(tmp_path: Path) -> Path:
+    (tmp_path / "scaffold").mkdir()
+    (tmp_path / "harness").mkdir()
+    (tmp_path / "harness" / "config.yaml").write_text(
+        "runtime_endpoint: rt\noptimizer_endpoint: op\njudge_endpoint: j\n"
+        "experiments:\n  runtime: r\n  eval: e\n  optimizer: o\n"
+        "eval:\n  max_error_rate: 0.2\n  min_scorable_rows: 4\n"
+    )
+    return tmp_path
+
+
+def test_baseline_generation_refuses_a_degraded_eval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The regression that excluding errors *introduced*, and the reason this
+    guard is not optional.
+
+    Before exclusion, a baseline run that 429'd on six of eight rows produced an
+    aggregate near 0.25 — visibly broken, and an operator would rerun it. After
+    exclusion the same run reads the mean of the two rows that survived, which
+    is *higher* than a healthy baseline and indistinguishable from one. And the
+    baseline is the frontier's seed and the bar every round is compared against,
+    so freezing it would mis-steer the entire run.
+    """
+    module = _load_script("make_baseline")
+    repo = _baseline_repo(tmp_path)
+
+    monkeypatch.setattr(
+        module, "evaluate_branch", lambda **_kw: _report_with_error_rate(0.75, aggregate=0.95)
+    )
+
+    with pytest.raises(RuntimeError, match="refusing to cache a baseline"):
+        module.build_baseline(scaffold_root=repo / "scaffold")
+
+
+def test_baseline_generation_accepts_a_healthy_eval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control case, and it records how much of the eval ran: a cached
+    baseline with an aggregate and no error count cannot be re-read later to
+    tell a good bar from a lucky one."""
+    module = _load_script("make_baseline")
+    repo = _baseline_repo(tmp_path)
+
+    monkeypatch.setattr(
+        module, "evaluate_branch", lambda **_kw: _report_with_error_rate(0.125, aggregate=0.7)
+    )
+
+    baseline = module.build_baseline(scaffold_root=repo / "scaffold")
+    assert baseline.aggregate == 0.7
+    assert baseline.n_errors == 1
+    assert baseline.to_dict()["n_errors"] == 1
+
+
+def test_a_clean_baseline_keeps_the_historical_on_disk_schema() -> None:
+    """``n_errors`` is additive: a baseline with none omits the key, so files
+    written before the failure/error split still round-trip byte-identically."""
+    from anvil.eval.cache import CachedBaseline
+
+    clean = CachedBaseline(
+        scaffold_commit_sha="a" * 40,
+        evaluated_at="2026-08-22T12:00:00+00:00",
+        mode="quick",
+        scorers=["correctness"],
+        runtime_endpoint="rt",
+        judge_endpoint="j",
+        aggregate=0.5,
+    )
+    assert "n_errors" not in clean.to_dict()
+    assert CachedBaseline.from_dict(clean.to_dict()).n_errors == 0
+
+
+def test_finalization_refuses_a_degraded_held_out_eval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The highest-stakes number the harness produces, and it was the only eval
+    path with no guard. It is also write-once — ``main`` refuses to overwrite an
+    existing finalized.json — so a degraded run does not merely mislead, it
+    locks in until someone deletes the file by hand."""
+    from anvil.loop.frontier import Frontier, save_frontier
+
+    module = _load_script("finalize")
+    repo = _baseline_repo(tmp_path)
+    (repo / "harness" / "config.yaml").write_text(
+        (repo / "harness" / "config.yaml").read_text() + "  held_out_test: true\n"
+    )
+    save_frontier(repo, Frontier.from_scores({"aggregate": 0.5}))
+
+    monkeypatch.setattr(
+        module, "evaluate_branch", lambda **_kw: _report_with_error_rate(0.75, aggregate=0.99)
+    )
+
+    with pytest.raises(RuntimeError, match="refusing to finalize"):
+        module.finalize(repo_root=repo, scaffold_root=repo / "scaffold")
+
+
 def test_shipped_config_declares_the_error_ceiling() -> None:
     """The guard is only useful if the shipped config surfaces it, otherwise
     nobody knows it exists to tune."""
@@ -532,4 +781,7 @@ def test_shipped_config_declares_the_error_ceiling() -> None:
 
     raw = yaml.safe_load((REPO_ROOT / "harness" / "config.yaml").read_text(encoding="utf-8"))
     assert "max_error_rate" in raw["eval"]
-    assert RuntimeYAML.model_validate(raw).eval.max_error_rate == 0.2
+    assert "min_scorable_rows" in raw["eval"]
+    cfg = RuntimeYAML.model_validate(raw).eval
+    assert cfg.max_error_rate == 0.2
+    assert cfg.min_scorable_rows == 4

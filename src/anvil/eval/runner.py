@@ -36,7 +36,7 @@ import time
 import warnings
 from collections import defaultdict
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -100,6 +100,12 @@ class EvalReport:
     # See ``docs/design/failure-vs-error.md``.
     n_errors: int = 0
     errors: list[dict[str, Any]] = field(default_factory=list)
+    # Errors that could NOT be joined back to a result row, and whose scores
+    # therefore could not be excluded. A report with any of these cannot honour
+    # its own contract -- the infrastructure zero is still in the mean -- so it
+    # is unjudgeable regardless of the error rate. See
+    # :func:`anvil.eval.judgeability.unjudgeable_reason`.
+    n_unattributed_errors: int = 0
     # Always-available eval cost proxies. Token usage may be added when
     # supplied by MLflow traces; context characters and row count do not
     # require another service call.
@@ -114,19 +120,35 @@ class EvalReport:
 
     @property
     def error_rate(self) -> float:
-        """Errored cases as a fraction of all cases. ``0.0`` for an empty run.
+        """Errored cases as a fraction of all cases.
 
         The round guard reads this instead of the score: a round with a high
         error rate has not measured the agent at all, so comparing its
         aggregate to the frontier would record a degraded gateway as a bad
         mutation and revert good work.
 
+        A run with no rows reads ``1.0`` when anything errored and ``0.0``
+        otherwise. ``0.0`` for the errored case would be a fail-*open* sentinel
+        in a guard: an unmeasurable run would pass every check. Nothing reaches
+        this today (``_aggregate_report`` needs a DataFrame), but a guard's
+        degenerate case should point at "refuse", not at "fine".
+
         Clamped to ``1.0`` because ``n_errors`` counts captured errors, which
         can in principle exceed the rows that made it into ``result_df``.
         """
         if not self.n_rows:
-            return 0.0
+            return 1.0 if self.n_errors else 0.0
         return min(1.0, self.n_errors / self.n_rows)
+
+    @property
+    def n_scorable(self) -> int:
+        """Cases that were actually assessed, i.e. that the scores rest on.
+
+        Exact wherever it is consulted: an unattributed error makes the report
+        unjudgeable outright, so on any path that gets as far as reading this,
+        every error corresponds to one excluded row.
+        """
+        return max(0, self.n_rows - self.n_errors)
 
 
 def partition_dataset(
@@ -389,8 +411,24 @@ def _aggregate_report(
         # sees the Nones written above.
         if metric_key in metrics and not errored:
             per_judge[name] = float(metrics[metric_key])
-        else:
-            per_judge[name] = _mean(per_judge_rows[name])
+            continue
+        contributing = [v for v in per_judge_rows[name] if v is not None]
+        if not contributing and metric_key in metrics:
+            # Switching away from mlflow's mean must not silently turn a real
+            # score into 0.0. That happens when a scorer's per-row
+            # ``{name}/value`` is absent from result_df while its mean is in
+            # ``metrics``: ``_mean`` has nothing to average and returns 0.0,
+            # which would drag the aggregate down and revert a good mutation
+            # for exactly the reason this exclusion exists to prevent. Say so
+            # rather than emitting the zero quietly.
+            logger.warning(
+                "scorer %r has no per-row scores in result_df, so excluding "
+                "errored rows leaves nothing to average; its mean reads 0.0 "
+                "instead of mlflow's %.4f. The aggregate is understated.",
+                name,
+                float(metrics[metric_key]),
+            )
+        per_judge[name] = _mean(per_judge_rows[name])
 
     # Weighted average across the configured scorers. ``weights`` maps a
     # scorer name to its config weight (defaulting to 1.0); with uniform
@@ -485,6 +523,7 @@ def _aggregate_report(
         trace_ids=trace_ids,
         n_errors=len(errored),
         errors=errors,
+        n_unattributed_errors=len(unattributed),
         cost_metrics={
             "total_context_chars": float(
                 sum(len(str(ex.get("query", ""))) for ex in examples[:n_rows])
@@ -790,6 +829,64 @@ def _elapsed_ms(since: float) -> int:
     return int((time.monotonic() - since) * 1000)
 
 
+def _drain_after_interrupt(
+    executor: ThreadPoolExecutor,
+    future_to_idx: dict[Future[CaseRecord], int],
+    slots: list[CaseRecord | None],
+    ids: list[str],
+) -> list[CaseRecord]:
+    """After a Ctrl-C: stop new work, keep what finished, account for the rest.
+
+    ``cancel()`` succeeds only for rows that never started, which is exactly the
+    set that should be marked interrupted. The rows already running are waited
+    for, because throwing away a completed answer to exit a few seconds sooner
+    is the wrong trade.
+
+    But that wait is unbounded -- there is no per-case timeout (see
+    :func:`_run_predictions_parallel`) and the HTTP client's default deadline is
+    600s -- so an operator could face ten minutes of apparent hang with no
+    output. Hence two things: the wait is announced, and a *second* Ctrl-C
+    abandons it and still returns the records. Otherwise the natural response to
+    the hang would raise out of ``shutdown`` and discard everything collected,
+    which is precisely the guarantee :class:`RunInterrupted` makes.
+
+    The abandoned threads keep running until their own sockets time out; Python
+    cannot cancel them. They no longer hold up the *records*, which is what this
+    function is responsible for.
+    """
+    n_cancelled = sum(1 for future in future_to_idx if future.cancel())
+    in_flight = sum(1 for future in future_to_idx if not future.done())
+    print(
+        f"\nInterrupted. {n_cancelled} case(s) not started; waiting for {in_flight} "
+        "in flight (Ctrl-C again to abandon them and keep what finished).",
+        file=sys.stderr,
+    )
+    try:
+        executor.shutdown(wait=True)
+    except KeyboardInterrupt:
+        print(
+            f"Abandoning {in_flight} in-flight case(s); their threads run on until "
+            "the HTTP client times out.",
+            file=sys.stderr,
+        )
+
+    for future, idx in future_to_idx.items():
+        if slots[idx] is not None:
+            continue
+        if not future.done() or future.cancelled():
+            slots[idx] = CaseRecord(case_id=ids[idx], outcome=CaseOutcome.INTERRUPTED)
+            continue
+        try:
+            slots[idx] = future.result()
+        except KeyboardInterrupt:
+            # The row's own predict_fn was the thing that raised.
+            slots[idx] = CaseRecord(case_id=ids[idx], outcome=CaseOutcome.INTERRUPTED)
+    return [
+        r or CaseRecord(case_id=ids[i], outcome=CaseOutcome.INTERRUPTED)
+        for i, r in enumerate(slots)
+    ]
+
+
 def _run_predictions_parallel(
     predict_fn: Callable[[str], str],
     queries: list[str],
@@ -883,49 +980,46 @@ def _run_predictions_parallel(
         return records
 
     slots: list[CaseRecord | None] = [None] * len(queries)
+    future_to_idx: dict[Future[CaseRecord], int] = {}
     executor = ThreadPoolExecutor(max_workers=n_workers)
     try:
-        future_to_idx = {
-            executor.submit(
-                _predict_one,
-                predict_fn,
-                q,
-                case_id=ids[i],
-                row=i,
-                max_retries=max_retries,
-            ): i
-            for i, q in enumerate(queries)
-        }
         try:
+            # Submission is INSIDE the try: a Ctrl-C landing here would
+            # otherwise escape as a bare KeyboardInterrupt, discarding the rows
+            # already submitted and breaking the promise that a killed run is
+            # readable.
+            for i, q in enumerate(queries):
+                future_to_idx[
+                    executor.submit(
+                        _predict_one,
+                        predict_fn,
+                        q,
+                        case_id=ids[i],
+                        row=i,
+                        max_retries=max_retries,
+                    )
+                ] = i
             for future in as_completed(future_to_idx):
                 slots[future_to_idx[future]] = future.result()
         except KeyboardInterrupt:
-            # Stop handing out new work, then let the in-flight rows finish
-            # so their results are not thrown away. cancel() succeeds only
-            # for rows that never started, which is exactly the set that
-            # should be marked interrupted.
-            for future in future_to_idx:
-                future.cancel()
-            executor.shutdown(wait=True)
-            for future, idx in future_to_idx.items():
-                if slots[idx] is not None:
-                    continue
-                if future.cancelled() or not future.done():
-                    slots[idx] = _interrupted(idx)
-                    continue
-                try:
-                    slots[idx] = future.result()
-                except KeyboardInterrupt:
-                    slots[idx] = _interrupted(idx)
-            raise RunInterrupted([r or _interrupted(i) for i, r in enumerate(slots)]) from None
+            raise RunInterrupted(
+                _drain_after_interrupt(executor, future_to_idx, slots, ids)
+            ) from None
     finally:
-        executor.shutdown(wait=True)
+        # wait=False: the in-flight rows were already waited for inside
+        # _drain_after_interrupt on the interrupt path, and on the normal path
+        # every future has completed. Waiting again here would be the second
+        # place a hung row could block, with no records to show for it.
+        executor.shutdown(wait=False)
 
     # _predict_one never raises for a row (it converts an exception into an
     # error record), and as_completed yields every submitted future, so every
-    # slot is filled by the time we get here.
+    # slot is filled by the time we get here. Reconstructed rather than filtered
+    # so the returned list is the same length as ``queries`` even with asserts
+    # stripped under ``python -O`` -- a short list would silently shift every
+    # index-based join downstream (case_ids, examples[i]) by one.
     assert all(r is not None for r in slots)
-    return [r for r in slots if r is not None]
+    return [r or _interrupted(i) for i, r in enumerate(slots)]
 
 
 def evaluate_branch(

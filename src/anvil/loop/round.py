@@ -20,6 +20,7 @@ from pathlib import Path
 import yaml
 
 from anvil.eval import evaluate_branch, load_baseline
+from anvil.eval.judgeability import unjudgeable_reason_for
 from anvil.loop.builder import build_round_prompt
 from anvil.loop.decision import Decision
 from anvil.loop.frontier import (
@@ -97,7 +98,7 @@ def run_round(
     mode = _read_optimization_mode(scaffold_root)
     optimizer_endpoint = _read_optimizer_endpoint(scaffold_root)
     cost_budget_usd = _read_cost_budget_usd(scaffold_root)
-    max_error_rate = load_eval_config(scaffold_root).max_error_rate
+    eval_cfg = load_eval_config(scaffold_root)
     policy = ToolPolicy(root=repo_root)
     print(f"[round {round_id}] mode={mode}")
 
@@ -221,24 +222,21 @@ def run_round(
             print(f"[round {round_id}] eval failure: {notes}")
         else:
             # An errored case is excluded from the aggregate, so a degraded
-            # endpoint does not drag the score down -- it shrinks the sample
-            # the score was measured on. Past a ceiling that sample is not
-            # worth comparing: the round is unjudgeable, so it is failed rather
-            # than reverted. Without this, a throttled gateway silently
-            # discards good mutations and the round record cannot say why.
+            # endpoint does not drag the score down -- it shrinks the sample the
+            # score was measured on. Past a point that sample is not worth
+            # comparing: the round is unjudgeable, so it is failed rather than
+            # reverted. Without this, a throttled gateway silently discards good
+            # mutations and the round record cannot say why.
             #
             # ``eval_failed`` short-circuits ``gate_decision`` to INFRA_FAIL
             # before any frontier I/O, so the frontier is not advanced by a
             # number that was never trustworthy. ``mutated_score`` is kept on
             # the record: "0.41, but 40% of cases never ran" is a more useful
             # thing to read six rounds later than a null.
-            if eval_report.error_rate > max_error_rate:
+            reason = unjudgeable_reason_for(eval_report, eval_cfg)
+            if reason:
                 eval_failed = True
-                notes = (
-                    f"error rate {eval_report.error_rate:.2f} exceeds ceiling "
-                    f"{max_error_rate:.2f} ({eval_report.n_errors}/"
-                    f"{eval_report.n_rows} cases never assessed)"
-                )
+                notes = reason
                 print(f"[round {round_id}] unjudgeable: {notes}")
 
     # 7. Compute score delta + decision.

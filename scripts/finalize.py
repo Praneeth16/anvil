@@ -22,6 +22,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 import yaml  # noqa: E402
 
 from anvil.cli import ExitCode, run_cli  # noqa: E402
+from anvil.eval.judgeability import unjudgeable_reason_for  # noqa: E402
 from anvil.eval.runner import EvalReport, evaluate_branch  # noqa: E402
 from anvil.loop.frontier import Frontier, load_frontier  # noqa: E402
 from anvil.runtime.models import RuntimeYAML  # noqa: E402
@@ -81,6 +82,20 @@ def finalize(
         allow_test=True,
         include_safety=include_safety,
     )
+
+    # This is the highest-stakes number the harness produces: the held-out score
+    # of the finished agent, run once, on the split nothing else is allowed to
+    # touch. And ``main`` refuses to overwrite the file afterwards, so a
+    # degraded run does not merely mislead -- it locks in and has to be deleted
+    # by hand. Refuse before writing rather than after.
+    reason = unjudgeable_reason_for(report, config.eval)
+    if reason:
+        raise RuntimeError(
+            f"refusing to finalize on an eval that cannot be judged: {reason}. "
+            "The held-out set is single-use by design, so rerun this only once "
+            "the endpoint is healthy."
+        )
+
     return {
         **asdict(report),
         "scaffold_commit_sha": _git_head_sha(root),
