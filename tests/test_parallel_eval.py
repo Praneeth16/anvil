@@ -402,10 +402,14 @@ def test_run_predictions_interrupt_accounts_for_every_row(n_workers: int) -> Non
     def predict_fn(q: str) -> str:
         if q == "stop":
             raise KeyboardInterrupt
-        time.sleep(0.05)
+        time.sleep(0.1)
         return f"ok-{q}"
 
-    queries = ["a", "stop", "c", "d", "e"]
+    # Far more queries than the pool can drain before the main thread reacts,
+    # so "some row was never reached" is not a race: two workers need ten
+    # 0.1s rounds to finish this list and the cancel happens in microseconds.
+    # A tighter list would pass on a quiet laptop and flake on a loaded runner.
+    queries = ["a", "stop", *[f"q{i}" for i in range(18)]]
     with pytest.raises(RunInterrupted) as exc:
         _run_predictions_parallel(predict_fn, queries, n_workers=n_workers)
 
