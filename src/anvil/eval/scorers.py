@@ -66,8 +66,13 @@ from types import ModuleType
 from typing import Any
 
 from mlflow.entities import AssessmentSource, Feedback
-from mlflow.genai.scorers import Correctness, RetrievalGroundedness, Safety, scorer
-from mlflow.genai.utils.trace_utils import extract_retrieval_context_from_trace
+from mlflow.genai import judges
+from mlflow.genai.scorers import Correctness, Safety, scorer
+from mlflow.genai.utils.trace_utils import (
+    extract_request_from_trace,
+    extract_response_from_trace,
+    extract_retrieval_context_from_trace,
+)
 from openai import OpenAI
 
 from anvil.runtime.models import ScorerConfig
@@ -87,11 +92,14 @@ GROUNDEDNESS_SCORER_NAME = "retrieval_groundedness"
 # (weight, check_function) are already covered by the config itself; this
 # covers the case the config cannot see.
 #
-# retrieval_groundedness v2: applicability rule added (see
-# ``_build_groundedness_scorer``). v1 scored whichever rows happened to reach
-# the judge.
+# retrieval_groundedness:
+#   v1 — scored whichever rows happened to reach the judge, and whichever
+#        retrieval span happened to be flattened last.
+#   v2 — applicability rule added (see ``_build_groundedness_scorer``).
+#   v3 — one verdict over the union of all retrieval spans instead of one
+#        verdict per span collapsed last-wins.
 SCORER_SEMANTICS_VERSIONS: dict[str, int] = {
-    GROUNDEDNESS_SCORER_NAME: 2,
+    GROUNDEDNESS_SCORER_NAME: 3,
 }
 
 # Default location of the programmatic check-function module, relative
@@ -238,20 +246,42 @@ def _expects_retrieval(expectations: Any) -> bool:
     return bool(expectations.get("expected_doc_ids"))
 
 
-def _has_retrieval_context(trace: Any) -> bool:
-    """Whether mlflow can extract retrieved chunks from ``trace``.
+def _retrieved_chunks(trace: Any) -> list[Any]:
+    """Every chunk the agent retrieved, across all retrieval spans, flattened.
 
-    Calls mlflow's own extractor — the same one
+    Uses mlflow's own extractor — the same one
     :meth:`RetrievalGroundedness.__call__` uses — so "the judge will find
     context" and "we predicted it would" cannot drift apart. Hand-rolling a
     ``span_type == RETRIEVER`` scan would be a second, silently diverging
     definition.
+
+    Flattened because grounding is a question about the answer and *everything
+    the agent found*, not about each search in isolation. mlflow's scorer instead
+    returns one feedback per retrieval span, and
+    ``construct_eval_result_df`` flattens those into a single ``{name}/value``
+    column where the last one wins. Two things follow, and both are wrong:
+
+    * **It is a lever.** Which span lands last is the agent's choice, so a final
+      narrow search whose chunks trivially support a closing sentence carries the
+      row. Same shape as the applicability hole — a score whose denominator, or
+      here whose *subject*, the agent picks.
+    * **It mismeasures multi-hop rows.** 6 of the 20 golden rows expect 2-4
+      documents, so the agent searches several times and no single search
+      supports the whole answer. Judging the complete answer against only the
+      last search's chunks understates those rows systematically. The legacy
+      baseline's ``multi_hop: {retrieval_groundedness: 0.5}`` is consistent with
+      exactly that.
+
+    Returns ``[]`` when nothing is extractable — extraction failing is not
+    evidence the agent retrieved.
     """
     try:
-        return bool(extract_retrieval_context_from_trace(trace))
+        by_span = extract_retrieval_context_from_trace(trace)
     except Exception:
-        # Extraction failing is not evidence the agent retrieved.
-        return False
+        return []
+    if not by_span:
+        return []
+    return [chunk for chunks in by_span.values() for chunk in chunks]
 
 
 def _build_groundedness_scorer(*, name: str = GROUNDEDNESS_SCORER_NAME):
@@ -288,21 +318,29 @@ def _build_groundedness_scorer(*, name: str = GROUNDEDNESS_SCORER_NAME):
     only arrangement under which "the agent stopped retrieving" cannot look
     like an improvement.
 
+    And it emits **one verdict per retrieval span**, which
+    ``construct_eval_result_df`` then collapses last-wins into a single column.
+    So the row's score was decided by whichever search happened to be flattened
+    last — the agent's choice, and a lever in its own right — and a multi-hop
+    answer drawn from several searches was judged against only the final one. So
+    the wrapper asks the grounding question once, against the union of everything
+    retrieved. See :func:`_retrieved_chunks`.
+
     ``prompts/anvil-round.md`` has told the optimizer since round one that this
     scorer is "only computed for in-scope rows with ``expected_doc_ids``". This
     makes that true.
     """
-    delegate = RetrievalGroundedness(name=name)
     source = AssessmentSource(source_type="CODE", source_id=f"applicability:{name}")
 
     @scorer(name=name)
-    def retrieval_groundedness(expectations: dict, trace: Any):
+    def retrieval_groundedness(expectations: dict, trace: Any) -> Feedback | None:
         if not _expects_retrieval(expectations):
             # Not applicable. Returning None yields zero feedbacks, so the row
             # contributes nothing to this judge's mean and — unlike raising —
             # is not counted as a scorer error either.
             return None
-        if not _has_retrieval_context(trace):
+        chunks = _retrieved_chunks(trace)
+        if not chunks:
             return Feedback(
                 # "no" and not False: the value type of the scorer being wrapped
                 # is Literal["yes", "no"], and mixing a bool into the same
@@ -316,7 +354,14 @@ def _build_groundedness_scorer(*, name: str = GROUNDEDNESS_SCORER_NAME):
                 ),
                 source=source,
             )
-        return delegate(trace=trace)
+        # Same judge and the same request/response extraction the built-in scorer
+        # uses; only the context differs, and only by being complete.
+        return judges.is_grounded(
+            request=extract_request_from_trace(trace),
+            response=extract_response_from_trace(trace),
+            context=chunks,
+            name=name,
+        )
 
     return retrieval_groundedness
 

@@ -91,6 +91,32 @@ function `RetrievalGroundedness.__call__` uses — so "the judge will find conte
 and "we predicted it would" cannot drift apart. Hand-rolling a
 `span_type == RETRIEVER` scan would be a second definition of the same thing.
 
+### The same lever again, one level down: which span gets to decide
+
+`RetrievalGroundedness.__call__` returns **one feedback per retrieval span**, and
+`construct_eval_result_df` flattens same-named assessments into a single
+`{name}/value` column — last one wins. So the row's grounding score was decided
+by whichever search happened to be flattened last, and the agent chooses that: a
+final narrow search whose chunks trivially support a closing sentence carries the
+row. Same shape as the applicability hole, with the agent picking the score's
+*subject* rather than its denominator.
+
+It was also mismeasuring. 6 of the 20 golden rows expect 2–4 documents, so the
+agent searches several times and **no single search supports the whole answer** —
+judging the complete answer against only the last search's chunks understates
+those rows systematically. The legacy baseline's
+`multi_hop: {retrieval_groundedness: 0.5}` is consistent with exactly that.
+
+So the wrapper asks the grounding question **once, against the union of every
+retrieved chunk**, via the same `judges.is_grounded` and the same
+request/response extraction the built-in uses. Adding a span can then no longer
+buy a verdict: extra context cannot make a hallucinated claim supported.
+
+Rejected alternatives: `min` across spans fails every multi-hop row (no single
+search grounds a multi-hop answer, so it would manufacture failures); `max` is
+strictly more gameable than last-wins; "last span only" is what mlflow's own
+docstring claims and its code contradicts, and it is the agent-chosen span.
+
 ## 3. A global tracing switch inside a concurrent pipeline
 
 Applicability explains 2 failures per run. It does not explain 3 or 4, and it
@@ -211,12 +237,28 @@ Consequences, which are deliberate and not side effects:
 
 ## Verification
 
-Offline: 20 tests in `tests/test_groundedness_applicability.py`, covering each
+Offline: 25 tests in `tests/test_groundedness_applicability.py`, covering each
 branch of the applicability rule, the reward-hacking direction explicitly, the
-tracing assertion made from *inside* the judge call (the only place the window
-was ever open), scorer-error extraction, the per-judge floor including the cases
-where it must **not** fire, and the NaN coercion.
+span-union behaviour (and that the judge runs exactly once per row regardless of
+span count), the tracing assertion made from *inside* the judge call — the only
+place the window was ever open — scorer-error extraction, the per-judge floor
+including the cases where it must **not** fire, the NaN coercion, and that the
+gate and `is_compatible` cannot drift apart again.
 
-Live, still to run: a quick eval should report `retrieval_groundedness` over 6 of
-8 rows with **zero** scorer errors. Any remaining error is a real defect, which
-is the point — the number is now readable.
+Live, `--mode quick` against `fe-vm-lakebase-praneeth`, before the span-union
+change:
+
+| | before | after |
+|---|---|---|
+| groundedness scorer errors | 3–4 of 8 | **0** |
+| groundedness rows scored | 4–5 of 8 | **6 of 8** (the 2 `out_of_scope` rows abstain) |
+| `n_dropped_rows` | intermittent | **0** |
+| exit | 0 | 0 |
+
+`n_dropped_rows: 0` also answers the open question about
+`MLFLOW_GENAI_EVAL_ENABLE_SCORER_TRACING`: the extra scorer traces did not strain
+the tracing server that had been returning `None` under load.
+
+Fault injection (`runtime_endpoint` pointed at a nonexistent model) still exits
+**2** with `unmeasured rate 1.00 exceeds ceiling 0.20 (8/8 cases never scored: 8
+errored)`, so none of this weakened the Phase 2 refusal path.

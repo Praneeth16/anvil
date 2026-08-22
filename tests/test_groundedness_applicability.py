@@ -116,12 +116,12 @@ def test_groundedness_scores_zero_when_retrieval_was_expected_but_skipped() -> N
     assert "expected_doc_ids" in (result.rationale or "")
 
 
-def test_groundedness_delegates_to_mlflow_when_retrieval_happened(
+def test_groundedness_defers_to_the_real_judge_when_retrieval_happened(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With retrieval context present, the real judge decides. The wrapper adds
-    an applicability rule and nothing else — it must not become a second opinion
-    on grounding."""
+    """With retrieval context present, mlflow's grounding judge decides. The
+    wrapper supplies applicability and the context; it must not become a second
+    opinion on grounding itself."""
     from mlflow.entities import Feedback
 
     import anvil.eval.scorers as scorers_mod
@@ -130,9 +130,12 @@ def test_groundedness_delegates_to_mlflow_when_retrieval_happened(
     monkeypatch.setattr(
         scorers_mod, "extract_retrieval_context_from_trace", lambda trace: {"span-1": ["chunk"]}
     )
+    monkeypatch.setattr(scorers_mod, "extract_request_from_trace", lambda trace: "the question")
+    monkeypatch.setattr(scorers_mod, "extract_response_from_trace", lambda trace: "the answer")
     monkeypatch.setattr(
-        scorers_mod.RetrievalGroundedness, "__call__", lambda self, *, trace: [sentinel]
+        scorers_mod.judges, "is_grounded", lambda **kwargs: (seen.update(kwargs), sentinel)[1]
     )
+    seen: dict[str, Any] = {}
 
     scorer = scorers_mod._build_groundedness_scorer()
     result = scorer.run(
@@ -141,7 +144,83 @@ def test_groundedness_delegates_to_mlflow_when_retrieval_happened(
         expectations={"expected_doc_ids": ["doc-1"]},
         trace=object(),
     )
-    assert result == [sentinel]
+    assert result is sentinel
+    assert seen["request"] == "the question"
+    assert seen["response"] == "the answer"
+    assert seen["context"] == ["chunk"]
+
+
+def test_groundedness_judges_the_union_of_every_retrieval_span(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The multi-span lever, and a real measurement error alongside it.
+
+    mlflow's scorer returns one feedback per retrieval span, and
+    ``construct_eval_result_df`` collapses them last-wins — so the row's score
+    was decided by whichever search happened to be flattened last, which the
+    agent chooses. A final narrow search whose chunks trivially support a closing
+    sentence carried the row.
+
+    It also mismeasured multi-hop: 6 of 20 golden rows expect 2-4 documents, so
+    no single search supports the whole answer, and judging the complete answer
+    against only the last search's chunks understates those rows systematically.
+    One verdict over the union fixes both.
+    """
+    import anvil.eval.scorers as scorers_mod
+
+    monkeypatch.setattr(
+        scorers_mod,
+        "extract_retrieval_context_from_trace",
+        lambda trace: {
+            "span-1": ["tariff chunk", "service charge chunk"],
+            "span-2": ["outage chunk"],
+        },
+    )
+    monkeypatch.setattr(scorers_mod, "extract_request_from_trace", lambda trace: "q")
+    monkeypatch.setattr(scorers_mod, "extract_response_from_trace", lambda trace: "a")
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(
+        scorers_mod.judges, "is_grounded", lambda **kwargs: (seen.update(kwargs), None)[1]
+    )
+
+    scorers_mod._build_groundedness_scorer().run(
+        inputs={"query": "q"},
+        outputs="a",
+        expectations={"expected_doc_ids": ["tariff", "outage"]},
+        trace=object(),
+    )
+    assert seen["context"] == ["tariff chunk", "service charge chunk", "outage chunk"], (
+        "every retrieved chunk must reach the judge, not just the last span's"
+    )
+
+
+def test_the_judge_is_called_once_regardless_of_span_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One row, one verdict. Several verdicts under one assessment name is what
+    let the flattening pick a winner in the first place."""
+    import anvil.eval.scorers as scorers_mod
+
+    monkeypatch.setattr(
+        scorers_mod,
+        "extract_retrieval_context_from_trace",
+        lambda trace: {f"span-{i}": [f"chunk-{i}"] for i in range(5)},
+    )
+    monkeypatch.setattr(scorers_mod, "extract_request_from_trace", lambda trace: "q")
+    monkeypatch.setattr(scorers_mod, "extract_response_from_trace", lambda trace: "a")
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        scorers_mod.judges, "is_grounded", lambda **kwargs: (calls.append(kwargs), None)[1]
+    )
+
+    scorers_mod._build_groundedness_scorer().run(
+        inputs={"query": "q"},
+        outputs="a",
+        expectations={"expected_doc_ids": ["d"]},
+        trace=object(),
+    )
+    assert len(calls) == 1
+    assert len(calls[0]["context"]) == 5
 
 
 def test_groundedness_reads_expected_doc_ids_not_should_refuse() -> None:
@@ -176,7 +255,7 @@ def test_extraction_failure_is_not_evidence_of_retrieval() -> None:
     original = scorers_mod.extract_retrieval_context_from_trace
     try:
         scorers_mod.extract_retrieval_context_from_trace = _boom  # type: ignore[assignment]
-        assert scorers_mod._has_retrieval_context(object()) is False
+        assert scorers_mod._retrieved_chunks(object()) == []
     finally:
         scorers_mod.extract_retrieval_context_from_trace = original  # type: ignore[assignment]
 
