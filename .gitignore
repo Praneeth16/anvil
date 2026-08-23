@@ -47,3 +47,5 @@ htmlcov/
 # any *.tmp.json or scratch/ output stays out.
 eval/runs/*.tmp.json
 eval/scratch/
+# Isaac Review local session state
+.isaac/

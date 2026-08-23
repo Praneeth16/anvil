@@ -55,8 +55,12 @@ Two boundaries, enforced rather than requested:
 The aggregate score is the mean of three per-judge scores:
 
 * **Correctness** — output covers the row's `expected_facts` tokens.
-* **RetrievalGroundedness** — output is grounded in retrieved chunks
-  (only computed for in-scope rows with `expected_doc_ids`).
+* **RetrievalGroundedness** — output is grounded in retrieved chunks.
+  Computed only for rows the golden set gives `expected_doc_ids`; rows
+  that should be refused are skipped, not scored. On a row that *does*
+  expect documents, answering without searching the knowledge base
+  scores **0**, the same as answering wrongly — so suppressing retrieval
+  is never a way to raise this score.
 * **refusal_appropriateness** — agent refuses iff `should_refuse=true`,
   cleanly.
 

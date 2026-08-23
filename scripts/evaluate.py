@@ -113,7 +113,19 @@ def main(argv: list[str] | None = None) -> int:
     print(f"== eval done: mode={report.mode} n={report.n_rows}")
     print(f"   aggregate: {report.aggregate:.3f}")
     for name, value in report.per_judge.items():
-        print(f"   {name:>26}: {value:.3f}")
+        # The denominator belongs next to the score for the same reason the error
+        # count belongs next to the aggregate. Shown only when it is not the full
+        # row count, so a clean run stays readable and anything else stands out:
+        # groundedness reporting 1.000 over 6 of 8 rows is the scorer working as
+        # designed, over 1 of 8 it is the scorer broken, and the two used to print
+        # identically.
+        assessed = report.per_judge_assessed.get(name)
+        errored = report.per_judge_errors.get(name, 0)
+        detail = ""
+        if assessed is not None and (assessed != report.n_rows or errored):
+            detail = f"  ({assessed}/{report.n_rows} scored"
+            detail += f", {errored} errored)" if errored else ")"
+        print(f"   {name:>26}: {value:.3f}{detail}")
     if report.n_errors:
         # Printed next to the aggregate, never folded into it: the aggregate is
         # the mean over the cases that ran, and how many did not is what says

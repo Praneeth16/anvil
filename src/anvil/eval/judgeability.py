@@ -21,6 +21,22 @@ better:
    surviving row. Before exclusion, seven errors in eight rows scored ~0.12 and
    was reverted; after exclusion the same run can read 1.0 and *extend the
    frontier*. An absolute floor is the only instrument that catches that.
+4. **Too few cases for one judge.** Checks 1-3 are about the run; this one is
+   about a column. The aggregate is a weighted mean of the per-judge values, and
+   each per-judge value is itself a mean over only the rows that produced a
+   score. So a judge that broke on all but one row contributes that single row as
+   if it were the judge's verdict on the whole run, and the run-level counts
+   above see nothing at all: the predictions succeeded and every row is in the
+   frame. Observed live -- ``retrieval_groundedness`` failing 3-4 of 8
+   invocations while the report read perfectly healthy.
+
+   This check is what makes a *per-judge* score safe to compute over a subset.
+   It cannot be replaced by a rate: a judge does not have to apply to every row
+   (``retrieval_groundedness`` applies only where the golden set names
+   ``expected_doc_ids``), so the floor is measured against the rows that judge
+   actually *attempted* -- ones it scored plus ones it errored on -- and not
+   against the run's row count. A row a judge declines to score is not evidence
+   of anything being wrong; a row it broke on is.
 
 Every path that turns a report into a decision -- the round gate, the CLI exit
 status, baseline generation, held-out finalization -- routes through
@@ -94,6 +110,40 @@ def unjudgeable_reason(
             f"{dropped}, below the floor of {floor} — the aggregate is a mean over "
             "too few cases to compare"
         )
+    # Per-judge, and only for judges that actually broke somewhere. A judge with
+    # no errors needs no check: whatever it scored, it scored on every row it was
+    # asked about. Applied to every configured scorer rather than only the ones in
+    # the aggregate, because a safety guard-rail measured on one row is no more
+    # trustworthy than an aggregate measured on one row -- it is just consulted
+    # by a different branch.
+    for name in sorted(report.per_judge_errors):
+        n_errors = report.per_judge_errors.get(name, 0)
+        if not n_errors:
+            continue
+        assessed = report.per_judge_assessed.get(name, 0)
+        attempted = assessed + n_errors
+        # Rate first, for the same reason the run-level checks are ordered that
+        # way: a floor alone is too blunt here too. ``min(4, attempted)`` is
+        # cleared by 4 of 8 assessed rows, so a judge failing half its
+        # invocations -- the live symptom that started this -- would pass a
+        # floor-only check. The ceiling is the run's ``max_error_rate`` reused:
+        # "how much of this measurement may be missing" does not become a
+        # different question one level down.
+        if attempted and (n_errors / attempted) > max_error_rate:
+            return (
+                f"scorer {name!r} errored on {n_errors} of the {attempted} case(s) "
+                f"it attempted ({n_errors / attempted:.2f} exceeds ceiling "
+                f"{max_error_rate:.2f}) — its per-judge mean, and so the weighted "
+                "aggregate built on it, is measured on what happened to survive"
+            )
+        judge_floor = min(min_scorable_rows, attempted)
+        if assessed < judge_floor:
+            return (
+                f"scorer {name!r} produced a score for only {assessed} of the "
+                f"{attempted} case(s) it attempted ({n_errors} errored), below the "
+                f"floor of {judge_floor} — its per-judge mean, and so the weighted "
+                "aggregate built on it, rests on too few cases to compare"
+            )
     return ""
 
 

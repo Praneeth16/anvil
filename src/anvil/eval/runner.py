@@ -30,6 +30,7 @@ import importlib
 import importlib.util
 import inspect
 import logging
+import math
 import os
 import sys
 import time
@@ -66,7 +67,7 @@ from anvil.eval.outcome import (
     CaseRecord,
     RunInterrupted,
 )
-from anvil.eval.scorers import build_scorers
+from anvil.eval.scorers import SYNTHESIZED_TRACE_TAG, build_scorers
 from anvil.observability import SOURCE_EVAL, enable_runtime_tracing
 from anvil.runtime.agent import AnvilAgent
 from anvil.runtime.client import build_gateway_client
@@ -113,6 +114,24 @@ class EvalReport:
     # error_rate 0.0 and shrinks the floor along with the sample, so no guard
     # fires. The judgeability floor is computed against ``n_attempted``.
     n_dropped_rows: int = 0
+    # Per-scorer coverage, for the rows that were NOT excluded as prediction
+    # errors. ``per_judge_assessed`` counts rows where the scorer produced a
+    # value; ``per_judge_errors`` counts rows where it raised and mlflow recorded
+    # a ``SCORER_ERROR`` feedback instead. Rows the scorer declined to judge --
+    # ``retrieval_groundedness`` on a row with no ``expected_doc_ids`` -- appear
+    # in neither, which is the point: not applicable is not the same as broken.
+    #
+    # Every per-judge mean is already computed over only the rows that produced a
+    # value, so without these counts a judge that broke on all but one row
+    # contributed that row's score to the aggregate as if it were the judge's
+    # verdict on the run. The whole Phase 2 argument -- exclusion fixes the bias
+    # but not the sample -- applies per judge, and did not reach here.
+    per_judge_assessed: dict[str, int] = field(default_factory=dict)
+    per_judge_errors: dict[str, int] = field(default_factory=dict)
+    # One entry per (row, scorer) that errored, for evidence and the operator's
+    # terminal. Kept separate from ``errors`` (prediction failures): a scorer
+    # error means the agent answered and the measurement failed.
+    scorer_errors: list[dict[str, Any]] = field(default_factory=list)
     # Always-available eval cost proxies. Token usage may be added when
     # supplied by MLflow traces; context characters and row count do not
     # require another service call.
@@ -332,12 +351,35 @@ def _build_dataset(examples: list[dict]) -> list[dict]:
 
 
 def _coerce_score(raw: Any) -> float | None:
+    """One scorer value as a float, or ``None`` when there is no score here.
+
+    ``None`` means "unscored", and every caller depends on that: it is what keeps
+    a row out of a judge's mean.
+
+    NaN must therefore map to ``None``, not to ``float('nan')``. A missing value
+    in a pandas column whose other entries are numeric does not survive as
+    ``None`` -- pandas stores it as NaN -- so a scorer error on such a column
+    used to come back as a *number*. That row then counted as assessed and its
+    NaN went into the mean, where it does not merely mislead: NaN propagates, so
+    one scorer error turned the judge's mean and the whole weighted aggregate
+    into NaN. And because every NaN comparison is False, a NaN aggregate fails
+    the frontier's ``>`` check silently and reverts the round, or gets written to
+    a baseline as the bar every later round is compared against.
+
+    Not hypothetical for long: it stayed hidden only because the live judges
+    return ``"yes"``/``"no"``, which makes the column ``object`` dtype and leaves
+    the missing value as ``None``. Any float-valued scorer -- a programmatic one
+    -- exposes it. ``_clamp_score`` already rejects non-finite values for exactly
+    this reason on the programmatic path; this is the same argument on the judge
+    path.
+    """
     if raw is None:
         return None
     if isinstance(raw, bool):
         return 1.0 if raw else 0.0
     if isinstance(raw, (int, float)):
-        return float(raw)
+        value = float(raw)
+        return value if math.isfinite(value) else None
     if isinstance(raw, str):
         s = raw.strip().lower()
         if s in ("yes", "pass", "true", "ok"):
@@ -345,9 +387,10 @@ def _coerce_score(raw: Any) -> float | None:
         if s in ("no", "fail", "false"):
             return 0.0
         try:
-            return float(s)
+            parsed = float(s)
         except ValueError:
             return None
+        return parsed if math.isfinite(parsed) else None
     return None
 
 
@@ -370,6 +413,42 @@ def _row_score(row: Any, scorer_name: str) -> float | None:
             coerced = _coerce_score(feedback.get("value"))
             if coerced is not None:
                 return coerced
+    return None
+
+
+def _row_scorer_error(row: Any, scorer_name: str) -> str | None:
+    """The scorer's error message on this row, or ``None`` if it did not error.
+
+    A scorer that raises does not abort the run: mlflow catches it and records a
+    ``Feedback`` with ``value=None`` and
+    ``error=AssessmentError(error_code="SCORER_ERROR", ...)``
+    (``genai/evaluation/harness.py``). ``construct_eval_result_df`` then flattens
+    only the *value* into the ``{name}/value`` column, so a scorer error and a
+    scorer that returned nothing are indistinguishable there — both read as
+    ``None``, both get dropped from the mean by :func:`_row_score`, and neither
+    was visible to any guard.
+
+    That is the difference between "this judge did not apply to this row" and
+    "this judge broke on this row", and only the second is a reason to distrust
+    the report. The full assessment dicts survive in the ``assessments`` column,
+    where the error does appear, so read it from there.
+    """
+    assessments = row.get("assessments") if hasattr(row, "get") else None
+    if not isinstance(assessments, list):
+        return None
+    for a in assessments:
+        if not isinstance(a, dict) or a.get("assessment_name") != scorer_name:
+            continue
+        feedback = a.get("feedback")
+        if not isinstance(feedback, dict):
+            continue
+        error = feedback.get("error")
+        if isinstance(error, dict):
+            code = error.get("error_code") or "SCORER_ERROR"
+            message = error.get("error_message") or ""
+            return f"{code}: {message}".strip()
+        if error:
+            return str(error)
     return None
 
 
@@ -441,9 +520,60 @@ def _aggregate_report(
         for name in scorer_names
     }
 
+    # Per-scorer coverage over the rows that were actually scored. Only rows
+    # outside ``errored_rows`` are considered: a row whose prediction failed was
+    # never offered to the scorers, so counting it as a scorer error would blame
+    # the judge for the gateway.
+    per_judge_assessed: dict[str, int] = {}
+    per_judge_errors: dict[str, int] = {}
+    scorer_errors: list[dict[str, Any]] = []
+    for name in scorer_names:
+        assessed = 0
+        failed = 0
+        for i in range(n_rows):
+            if i in errored_rows:
+                continue
+            if per_judge_rows[name][i] is not None:
+                assessed += 1
+                continue
+            message = _row_scorer_error(result_df.iloc[i], name)
+            if message is None:
+                # No value and no error: the scorer declined to judge this row.
+                continue
+            failed += 1
+            scorer_errors.append(
+                {
+                    "example_id": examples[i]["example_id"] if i < len(examples) else "",
+                    "scorer": name,
+                    "category": _category_for_row(result_df.iloc[i], examples, i),
+                    "trace_id": row_trace_ids[i],
+                    "error_message": message,
+                }
+            )
+        per_judge_assessed[name] = assessed
+        per_judge_errors[name] = failed
+    if scorer_errors:
+        logger.warning(
+            "%s scorer invocation(s) failed and were excluded from their judge's "
+            "mean: %s",
+            len(scorer_errors),
+            ", ".join(
+                f"{name}={count}" for name, count in sorted(per_judge_errors.items()) if count
+            ),
+        )
+
     def _mean(values: list[float | None]) -> float:
         nums = [v for v in values if v is not None]
         return sum(nums) / len(nums) if nums else 0.0
+
+    def _optional_mean(values: list[float | None]) -> float | None:
+        """``_mean``, but ``None`` rather than ``0.0`` when nothing contributed.
+
+        Where a caller can represent "no measurement", 0.0 is the wrong sentinel:
+        it is a real score, and a low one.
+        """
+        nums = [v for v in values if v is not None]
+        return sum(nums) / len(nums) if nums else None
 
     per_judge: dict[str, float] = {}
     for name in scorer_names:
@@ -499,9 +629,25 @@ def _aggregate_report(
             bucket_rows[category].append(i)
     per_bucket: dict[str, dict[str, float]] = {}
     for bucket, idxs in bucket_rows.items():
-        per_bucket[bucket] = {
-            name: _mean([per_judge_rows[name][i] for i in idxs]) for name in scorer_names
+        # A scorer with no scored row in this bucket is OMITTED, not reported as
+        # 0.0. ``_mean([])`` returns 0.0, and the same argument that keeps an
+        # all-errored bucket out of the table applies to a scorer that does not
+        # apply within one: ``out_of_scope`` rows have no ``expected_doc_ids``, so
+        # groundedness has no verdict there -- and it was being published as
+        # ``out_of_scope: {retrieval_groundedness: 0.0}``, indistinguishable from
+        # "the agent is completely ungrounded on refusals".
+        #
+        # This is not cosmetic. ``prompts/anvil-round.md`` tells the optimizer to
+        # "target a failure cluster you can read in the parent baseline's
+        # per_bucket", so a fabricated 0.0 aims the next mutation at making the
+        # agent retrieve on questions it is supposed to refuse -- against the
+        # refusal scorer, which is also in the aggregate.
+        scored = {
+            name: value
+            for name in scorer_names
+            if (value := _optional_mean([per_judge_rows[name][i] for i in idxs])) is not None
         }
+        per_bucket[bucket] = scored
 
     failures: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -568,6 +714,9 @@ def _aggregate_report(
         errors=errors,
         n_unattributed_errors=len(unattributed),
         n_dropped_rows=n_dropped_rows,
+        per_judge_assessed=per_judge_assessed,
+        per_judge_errors=per_judge_errors,
+        scorer_errors=scorer_errors,
         # Cost is what the run SPENT, so it is measured over the rows it
         # attempted. Measuring it over the survivors would make losing rows look
         # like a cost improvement to a minimising Pareto objective on ``n_rows``
@@ -694,6 +843,18 @@ _MLFLOW_MAX_WORKERS_ENV = "MLFLOW_GENAI_EVAL_MAX_WORKERS"
 # reported as an error rather than silently passing.
 _MLFLOW_SKIP_VALIDATION_ENV = "MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"
 
+# Deliberately NOT set: ``MLFLOW_GENAI_EVAL_ENABLE_SCORER_TRACING``.
+#
+# It wraps every scorer in an ``EVALUATOR`` span, which would nest the refusal
+# judge's autolog span instead of orphaning it — and it was briefly used here for
+# that. But it costs 24 extra retained root traces per quick run and adds an
+# unguarded ``set_trace_tag`` server call per scorer, whose failure can abort
+# scoring. Buying a new dependency on the tracing server that this module spends
+# ``_resilient_eval_harness`` defending against is the wrong trade. The judge's
+# autolog is silenced at the call site instead, with ContextVar-scoped
+# ``mlflow.tracing.context(enabled=False)`` — see ``anvil.eval.scorers``. Turn
+# the env var on by hand when debugging scorer behaviour.
+
 # Name of the per-row root span ``evaluate_branch`` wraps every
 # ``predict_fn`` invocation in. The span yields a real per-row trace
 # carrying the ``RETRIEVER`` span that ``RetrievalGroundedness`` scores;
@@ -760,6 +921,29 @@ def _traced_predict(inputs: dict[str, Any], body: Callable[[], str]) -> str:
     if error is not None:
         raise error
     return text
+
+
+@contextmanager
+def _scoped_env(overrides: dict[str, str]):
+    """Set env vars for the duration of the block, restoring exactly what was there.
+
+    Restores absence as absence rather than as ``""`` — mlflow's env-var readers
+    treat an empty string and a missing key differently, so writing ``""`` back
+    over a key that was never set is not a restore.
+
+    Process-global, so this is not safe for concurrent ``evaluate_branch`` calls
+    in one process. The loop runs rounds and evals synchronously.
+    """
+    previous = {name: os.environ.get(name) for name in overrides}
+    os.environ.update(overrides)
+    try:
+        yield
+    finally:
+        for name, before in previous.items():
+            if before is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = before
 
 
 @contextmanager
@@ -897,7 +1081,17 @@ def _resilient_eval_harness(
                 # fallback exists to prevent. Retrying made that three chances
                 # instead of one, so a raise is treated exactly like a None.
                 try:
-                    eval_item.trace = create_minimal_trace(eval_item)
+                    # Tagged as synthesized, and the tag is injected at creation
+                    # (ContextVar-scoped) so it survives mlflow re-fetching the
+                    # trace later. A minimal trace is root-span-only: it carries
+                    # no RETRIEVER span, and without the tag a trace-reading
+                    # scorer cannot tell "the agent did not retrieve" from "the
+                    # tracing server lost the evidence that it did". The first is
+                    # a finding about the agent; the second is infrastructure
+                    # damage, and scoring it would be the exact error this
+                    # repo's failure-vs-error work exists to prevent.
+                    with mlflow.tracing.context(tags={SYNTHESIZED_TRACE_TAG: "true"}):
+                        eval_item.trace = create_minimal_trace(eval_item)
                 except Exception as exc:  # noqa: BLE001 - a raise is just a miss
                     logger.warning(
                         "minimal-trace fallback attempt %s for row %s raised %s: %s",
@@ -1388,10 +1582,8 @@ def evaluate_branch(
     # pre-computed ``outputs``) so mlflow builds a per-row trace carrying
     # the ``RETRIEVER`` span that ``RetrievalGroundedness`` requires — a
     # static-dataset trace is root-span-only and makes that scorer raise.
-    # The env var is saved/restored so the override is scoped to this call.
-    # NOTE: the env var is process-global, so this override is not safe for
-    # concurrent ``evaluate_branch`` calls in one process; the optimizer
-    # runs rounds/evals synchronously, so this is not a live issue today.
+    # ``_scoped_env`` restores every override on the way out; see its docstring
+    # for the concurrency caveat.
     n_workers = max(1, cfg.n_workers)
     # Filled by the harness shim with trace_id -> error_message for any row
     # whose prediction raised. Those rows are excluded from the scores.
@@ -1400,43 +1592,33 @@ def evaluate_branch(
     # in the result frame. Counted so the sample-size floor sees them.
     dropped: set[str] = set()
     kept_rows: list[int] = []
-    _prev_workers = os.environ.get(_MLFLOW_MAX_WORKERS_ENV)
-    os.environ[_MLFLOW_MAX_WORKERS_ENV] = str(n_workers)
-    _prev_skip = os.environ.get(_MLFLOW_SKIP_VALIDATION_ENV)
-    os.environ[_MLFLOW_SKIP_VALIDATION_ENV] = "True"
-    try:
-        # On the Databricks Tracing Server, async export can race the eval
-        # harness's immediate per-row get_trace(request_id). A missing trace
-        # then reaches scoring as None and crashes _get_new_expectations.
-        # Keep export synchronous until evaluate has finished reading traces
-        # (PR #17; the env var is also forced from process start in
-        # anvil/__init__.py because the exporter caches the flag at construction).
-        # ``_resilient_eval_harness`` is the guarantee: even if a row's trace
-        # is still None despite the above, the harness shim yields no
-        # expectations for that row (no crash) and the _run_predict fallback
-        # synthesizes a minimal trace so the run completes with a real
-        # result DataFrame. See its docstring for the exact harness.py
-        # symbols and lines patched.
-        with (
-            _resilient_eval_harness(
-                error_sink=errored, dropped_sink=dropped, kept_rows_sink=kept_rows
-            ),
-            _synchronous_trace_logging(),
-        ):
-            result = mlflow.genai.evaluate(
-                data=dataset,
-                scorers=scorers,
-                predict_fn=predict_fn,
-            )
-    finally:
-        if _prev_workers is None:
-            os.environ.pop(_MLFLOW_MAX_WORKERS_ENV, None)
-        else:
-            os.environ[_MLFLOW_MAX_WORKERS_ENV] = _prev_workers
-        if _prev_skip is None:
-            os.environ.pop(_MLFLOW_SKIP_VALIDATION_ENV, None)
-        else:
-            os.environ[_MLFLOW_SKIP_VALIDATION_ENV] = _prev_skip
+    # ``_synchronous_trace_logging``: on the Databricks Tracing Server, async
+    # export can race the eval harness's immediate per-row
+    # get_trace(request_id). A missing trace then reaches scoring as None and
+    # crashes _get_new_expectations. Keep export synchronous until evaluate has
+    # finished reading traces (PR #17; the env var is also forced from process
+    # start in anvil/__init__.py because the exporter caches the flag at
+    # construction). ``_resilient_eval_harness`` is the guarantee: even if a
+    # row's trace is still None despite the above, the harness shim yields no
+    # expectations for that row (no crash) and the _run_predict fallback
+    # synthesizes a minimal trace so the run completes with a real result
+    # DataFrame. See its docstring for the exact harness.py symbols and lines
+    # patched.
+    with (
+        _scoped_env(
+            {
+                _MLFLOW_MAX_WORKERS_ENV: str(n_workers),
+                _MLFLOW_SKIP_VALIDATION_ENV: "True",
+            }
+        ),
+        _resilient_eval_harness(error_sink=errored, dropped_sink=dropped, kept_rows_sink=kept_rows),
+        _synchronous_trace_logging(),
+    ):
+        result = mlflow.genai.evaluate(
+            data=dataset,
+            scorers=scorers,
+            predict_fn=predict_fn,
+        )
 
     if result.result_df is None:
         # mlflow returns None here for more than one reason -- every row filtered,
