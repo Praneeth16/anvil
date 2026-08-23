@@ -4,7 +4,7 @@ What the loop does, where the project actually is, and what is left. For the
 reasoning behind the architecture, read `docs/decisions.md`. For the security
 model, `SECURITY.md`.
 
-Last updated: 2026-08-23.
+Last updated: 2026-08-24.
 
 ---
 
@@ -184,8 +184,12 @@ independent layers instead of one callback plus post-hoc diff verification.
 ### 7. Reusability queue
 
 - `CONTRIBUTING.md` — not yet written.
-- Copyright holder for the `LICENSE` appendix is undecided; the shipped
-  Apache-2.0 text is verbatim and asserts no owner.
+- Licensing is settled: Apache-2.0, `LICENSE` verbatim. The bracketed
+  `Copyright [yyyy] [name of copyright owner]` line is inside Apache's own
+  APPENDIX — instructions for applying the license, not a field to fill in —
+  so it stays as shipped, and no owner is asserted anywhere. No `NOTICE` file:
+  Apache-2.0 only requires one if the work already carries attribution
+  notices, and nothing here does.
 - `research/minimax-m27-*.md` is cited by `docs/decisions.md` D4 and
   `CLAUDE.md` but is not in the repository.
 
