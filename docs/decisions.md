@@ -167,11 +167,19 @@ That last one is why `judge_domain_name` and `judge_domain_context` are in
 this file even though they are domain content and everything else domain-shaped
 moved out to `examples/`. Convenience would put them next to the scaffold.
 
-**Enforced by.** A hard denylist plus post-hoc diff verification — the
-optimizer's writes are checked against its scope after the fact, and a
-violation is an `INFRA_FAIL` reported separately from a flaky endpoint, not a
-revert. See `SECURITY.md` for the trust boundaries and
-`src/anvil/optimizer/policy.py`.
+**Enforced by.** Four independent layers, then a check that does not depend on
+the SDK at all: an OS-level `sandbox` (`allowUnsandboxedCommands=False`), an
+`allowed_tools` allowlist, and two policy interception points — `can_use_tool`
+and a `PreToolUse` hook — followed by post-hoc diff verification. A violation is
+an `INFRA_FAIL` reported separately from a flaky endpoint, not a revert. See
+`SECURITY.md` for the trust boundaries and `src/anvil/optimizer/policy.py`.
+
+Both interception points call `ToolPolicy.decide`. That is the point rather than
+an accident: defence in depth means two *enforcement points* for one rule. Two
+copies of the rule is the failure mode D10 records — the gate kept its own copy
+of the comparability rule and kept the bug after the eval's copy was fixed — so
+`tests/test_optimizer_confinement.py` asserts the two verdicts are identical
+across the interesting inputs instead of testing them separately.
 
 **The secret set must follow the domain.** `ToolPolicy`'s denied paths are
 matched by exact relative path, which was airtight while the domain was a

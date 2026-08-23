@@ -341,3 +341,106 @@ def test_round_proceeds_normally_when_the_session_stays_in_scope(anvil_repo, mon
 
     assert report.decision != Decision.INFRA_FAIL
     assert "scope violation" not in report.notes
+
+# ---------------------------------------------------------------------------
+# The PreToolUse hook: a second enforcement point for the same rule.
+#
+# `can_use_tool` is one SDK code path and documented as best-effort. The hook is
+# another. What must NOT happen is the two disagreeing, so these tests drive the
+# hook and the permission callback with the same inputs and require identical
+# verdicts -- if a future change teaches one about a path and not the other, the
+# parity test fails rather than the round quietly losing a layer.
+
+
+def _run(coro):
+    import asyncio
+
+    return asyncio.run(coro)
+
+
+def _hook_verdict(policy, tool_name: str, tool_input: dict):
+    from anvil.optimizer.session import _pre_tool_use_hook
+
+    hook = _pre_tool_use_hook(policy)
+    out = _run(hook({"tool_name": tool_name, "tool_input": tool_input}, None, None))
+    specific = out.get("hookSpecificOutput") or {}
+    return specific.get("permissionDecision", "allow"), specific.get(
+        "permissionDecisionReason", ""
+    )
+
+
+@pytest.mark.unit
+def test_hook_denies_reading_the_golden_set(policy):
+    decision, reason = _hook_verdict(policy, "Read", {"file_path": "data/golden_set.jsonl"})
+    assert decision == "deny"
+    assert reason
+
+
+@pytest.mark.unit
+def test_hook_allows_reading_the_scaffold(policy):
+    decision, _ = _hook_verdict(policy, "Read", {"file_path": "scaffold/skills/identity.md"})
+    assert decision == "allow"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input"),
+    [
+        ("Read", {"file_path": "data/golden_set.jsonl"}),
+        ("Read", {"file_path": "scaffold/skills/identity.md"}),
+        ("Grep", {"pattern": "x"}),
+        ("Glob", {"path": "data"}),
+        ("Write", {"file_path": "harness/config.yaml"}),
+        ("Write", {"file_path": "scaffold/skills/identity.md"}),
+        ("Bash", {"command": "ls"}),
+        ("SomeFutureTool", {"file_path": "scaffold/x.md"}),
+        ("Read", {"file_path": "../outside.txt"}),
+    ],
+)
+def test_hook_and_permission_callback_never_disagree(policy, tool_name, tool_input):
+    """One rule, two enforcement points. Two rules would be the bug."""
+    from anvil.optimizer.session import _permission_callback
+
+    hook_decision, _ = _hook_verdict(policy, tool_name, tool_input)
+    result = _run(_permission_callback(policy)(tool_name, tool_input, None))
+    callback_allowed = type(result).__name__ == "PermissionResultAllow"
+
+    assert (hook_decision == "allow") is callback_allowed
+
+
+@pytest.mark.unit
+def test_hook_fails_closed_when_the_policy_raises():
+    """A broken hook must deny, not open the door.
+
+    The SDK may treat a hook that raises as a hook that is not there, which
+    would silently drop this layer at exactly the moment it is malfunctioning.
+    ``ToolPolicy`` is frozen, so this substitutes an exploding stand-in rather
+    than patching a field.
+    """
+
+    class _Exploding:
+        def decide(self, *_a, **_k):
+            raise RuntimeError("policy exploded")
+
+    decision, reason = _hook_verdict(
+        _Exploding(), "Read", {"file_path": "scaffold/skills/identity.md"}
+    )
+    assert decision == "deny"
+    assert "policy exploded" in reason
+
+
+@pytest.mark.unit
+def test_session_registers_the_hook_alongside_the_callback():
+    """Both layers must actually be wired into the options the SDK receives.
+
+    A hook that is written and never registered is the same as no hook, and
+    nothing else in this file would notice.
+    """
+    import inspect
+
+    from anvil.optimizer import session
+
+    source = inspect.getsource(session.run_optimizer_session)
+    assert "can_use_tool=_permission_callback(policy)" in source
+    assert "_pre_tool_use_hook(policy)" in source
+    assert '"PreToolUse"' in source

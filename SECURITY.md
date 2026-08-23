@@ -31,9 +31,17 @@ it is optimizing for the score.
 
 - **Reward hacking is the primary threat, not exfiltration.** The optimizer is not assumed
   malicious; it is assumed to be an optimizer. Treat gate integrity as a security property.
-- **The permission callback is best-effort.** It depends on the Claude Agent SDK version honoring
-  it. Diff verification before commit is the check that holds regardless, and it is the one to
-  keep working.
+- **Every in-session control is best-effort; the diff is not.** Confinement is four independent
+  layers — an OS-level `sandbox` with `allowUnsandboxedCommands=False`, an `allowed_tools`
+  allowlist (so a tool added by a future SDK release arrives denied), and *two* policy
+  interception points, `can_use_tool` and a `PreToolUse` hook. Both call the same
+  `ToolPolicy.decide`: two enforcement points for one rule, never two copies of the rule.
+  All four depend on the SDK honoring them. **Diff verification before commit is the check that
+  holds regardless, and it is the one to keep working.**
+- **A read leaves no diff.** Which is why the read side cannot rely on the after-the-fact check
+  at all, and why the secret set is built from the paths a round is actually using rather than
+  from a fixed list — a second domain inside the repo puts its golden set somewhere a hardcoded
+  policy has never heard of. See `docs/decisions.md` D8.
 - **Evidence redaction is advisory.** A regex pass over transcripts before they hit disk reduces
   accidental credential capture. It is not a guarantee. Do not run ANVIL with credentials you
   would mind seeing in a round transcript.
