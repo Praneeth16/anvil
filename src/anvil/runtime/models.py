@@ -385,6 +385,30 @@ class RuntimeYAML(BaseModel):
     eval: EvalConfig = Field(default_factory=EvalConfig)
     gate: GateConfig = Field(default_factory=GateConfig)
 
+    @model_validator(mode="after")
+    def _judge_domain_is_both_or_neither(self) -> RuntimeYAML:
+        """Reject setting one judge-domain key without the other.
+
+        They are interpolated into different parts of the same prompt, and each
+        falls back to the shipped NeoVolt default independently. So setting only
+        ``judge_domain_context`` -- the substantial one, and the one anyone
+        reaches for first -- produces a judge told it is grading a Python library
+        that still offers "I can only help with NeoVolt-related questions" as its
+        example of a refusal. Nothing downstream can detect that; the refusal
+        score simply becomes wrong.
+        """
+        name, context = self.judge_domain_name, self.judge_domain_context
+        if (name is None) != (context is None):
+            missing = "judge_domain_name" if name is None else "judge_domain_context"
+            present = "judge_domain_context" if name is None else "judge_domain_name"
+            raise ValueError(
+                f"{present} is set but {missing} is not: both are interpolated into "
+                "the refusal judge's prompt and each falls back to the shipped "
+                "default separately, so setting one leaves the other describing a "
+                f"different domain. Set {missing} too, or neither."
+            )
+        return self
+
 
 class HarnessConfig(BaseModel):
     """Merged view of both YAML files. Built by the loader."""

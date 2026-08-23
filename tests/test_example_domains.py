@@ -123,15 +123,42 @@ def test_every_must_include_string_is_present_in_a_cited_doc(domain: Path) -> No
 
     Otherwise the row is unanswerable: no retrieval and no amount of scaffold
     improvement can satisfy it, and it drags the bucket's score down forever.
+
+    Refusal rows are checked against their ``reference_answer`` instead, because
+    they cite no documents by definition -- for them the expected facts describe
+    the shape of the refusal, not the content of a source.
     """
     docs = _kb_docs(domain)
     for row in _rows(domain):
-        cited = "\n".join(docs[d] for d in row["expected_doc_ids"] if d in docs)
+        if row["should_refuse"]:
+            source, where = row["reference_answer"], "its reference_answer"
+        else:
+            source = "\n".join(docs[d] for d in row["expected_doc_ids"] if d in docs)
+            where = f"any of its cited docs {row['expected_doc_ids']}"
         for needle in row["must_include"]:
-            assert needle in cited, (
-                f"{row['example_id']}: must_include {needle!r} appears in none of "
-                f"its cited docs {row['expected_doc_ids']}"
+            assert needle in source, (
+                f"{row['example_id']}: must_include {needle!r} does not appear in {where}"
             )
+
+
+@_domain
+@pytest.mark.unit
+def test_no_row_has_an_empty_must_include(domain: Path) -> None:
+    """Every row needs expected facts, refusal rows included.
+
+    Not a style rule. ``_build_dataset`` projects ``must_include`` onto
+    mlflow's ``expected_facts``, and the Correctness judge requires either
+    ``expected_facts`` or ``expected_response``; given an empty list it raises
+    "Missing input fields" rather than scoring. Four refusal rows shipped with
+    ``must_include: []``, and the first live run of this example errored
+    correctness on 2 of 8 cases and exited 2 as unjudgeable -- the harness
+    caught it, but only after paying for the run.
+    """
+    for row in _rows(domain):
+        assert row["must_include"], (
+            f"{row['example_id']}: must_include is empty, so expected_facts is "
+            "empty and the Correctness judge will error instead of scoring"
+        )
 
 
 @_domain

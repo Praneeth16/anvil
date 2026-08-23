@@ -45,6 +45,7 @@ REQUIRED_FIELDS = [
     "n_examples",
     "mlflow_run_id",
     "scorer_fingerprint",
+    "dataset_fingerprint",
     "cost_metrics",
 ]
 

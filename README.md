@@ -225,10 +225,12 @@ about.
 ## Limitations
 
 - **Judge noise is the binding constraint.** ~0.15 of aggregate between two
-  identical runs at 8 rows. Mitigated only by preferring `standard` (12 rows)
-  over `quick`; the real fix is a paired, noise-aware gate, which is the top
-  item in `docs/plan.md`. MLflow's `evaluate()` offers no seed, no repetition
-  count and no paired mode, so that work is ANVIL's.
+  identical runs at 8 rows, and reproduced again while writing
+  `examples/pyloom-docs/`: two runs of one unchanged scaffold scored 0.875 and
+  0.917, differing on a single refusal row. Mitigated only by preferring
+  `standard` (12 rows) over `quick`; the real fix is a paired, noise-aware gate,
+  which is the top item in `docs/plan.md`. MLflow's `evaluate()` offers no seed,
+  no repetition count and no paired mode, so that work is ANVIL's.
 - **The judge is unaligned.** `Judge.align` exists and has not been used yet.
 - **50 rounds is the target; 10 is what has been run.** The shape of the curve
   past that point is unknown.

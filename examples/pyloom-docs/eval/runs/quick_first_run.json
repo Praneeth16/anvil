@@ -1,0 +1,91 @@
+{
+  "aggregate": 0.9166666666666666,
+  "per_judge": {
+    "correctness": 0.75,
+    "retrieval_groundedness": 1.0,
+    "refusal_appropriateness": 1.0
+  },
+  "per_bucket": {
+    "direct": {
+      "correctness": 0.5,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "multi_hop": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "distractor": {
+      "correctness": 0.5,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "out_of_scope": {
+      "correctness": 1.0,
+      "refusal_appropriateness": 1.0
+    }
+  },
+  "failures": [
+    {
+      "example_id": "pyloom_002",
+      "query": "Which Pyloom version should I install, and which Python versions does it support?",
+      "category": "direct",
+      "judge_failures": [
+        "correctness"
+      ],
+      "trace_id": "tr-bdef5ea3f07699b0ec3053121913d2f4"
+    },
+    {
+      "example_id": "pyloom_014",
+      "query": "Which bearer-token environment variable, header, and live prefix does a new Pyloom v2 production service use?",
+      "category": "distractor",
+      "judge_failures": [
+        "correctness"
+      ],
+      "trace_id": "tr-0dac0bcafeccf0bf3d793c87c0a8eeff"
+    }
+  ],
+  "run_id": "767da846549145dea565f6adf2363ad5",
+  "experiment_id": "3908235368477977",
+  "n_rows": 8,
+  "mode": "quick",
+  "scorers": [
+    "correctness",
+    "retrieval_groundedness",
+    "refusal_appropriateness"
+  ],
+  "evaluated_at": "2026-08-23T13:27:40+00:00",
+  "trace_ids": [
+    "tr-19673b3f17f2f3579aba8951e4b5b8d8",
+    "tr-bdef5ea3f07699b0ec3053121913d2f4",
+    "tr-851e64fe7d994cdfa86773256badc8ec",
+    "tr-e3ebd28b1662d430ac357f13cf3a69e4",
+    "tr-612ac7ae74f971cfcc692575e9d8434f",
+    "tr-0dac0bcafeccf0bf3d793c87c0a8eeff",
+    "tr-098d6056a8a15873d6b0bd89e1fb24cf",
+    "tr-8e1ec7f24db29d9c5f0032bf03b39539"
+  ],
+  "n_errors": 0,
+  "errors": [],
+  "n_unattributed_errors": 0,
+  "n_dropped_rows": 0,
+  "per_judge_assessed": {
+    "correctness": 8,
+    "retrieval_groundedness": 6,
+    "refusal_appropriateness": 8
+  },
+  "per_judge_errors": {
+    "correctness": 0,
+    "retrieval_groundedness": 0,
+    "refusal_appropriateness": 0
+  },
+  "scorer_errors": [],
+  "cost_metrics": {
+    "total_context_chars": 690.0,
+    "n_rows": 8.0
+  },
+  "scorer_fingerprint": "[{\"check_function\": null, \"name\": \"correctness\", \"type\": \"llm\", \"weight\": 1.0}, {\"check_function\": null, \"judge_domain_context\": \"Domain: pyloom, a fictional Python library. The agent has a knowledge\\nbase of pyloom documentation pages and a `search_knowledge_base` tool.\\nThe knowledge base documents the current v2 client alongside the\\ndeprecated v1 client, so a correct answer distinguishes current\\nguidance from legacy guidance. The agent should refuse questions the\\ndocumentation does not cover \\u2014 other libraries, performance\\ncomparisons the docs never make, and anything requiring the user's own\\naccount or token state \\u2014 and answer covered ones from the knowledge\\nbase.\", \"judge_domain_name\": \"pyloom\", \"name\": \"refusal_appropriateness\", \"type\": \"llm\", \"weight\": 1.0}, {\"check_function\": null, \"name\": \"retrieval_groundedness\", \"semantics\": 4, \"type\": \"llm\", \"weight\": 1.0}]",
+  "dataset_fingerprint": "sha256:deb26e6ac46af243b7495c47dfd38b83",
+  "label": "pyloom-docs example, starting scaffold"
+}

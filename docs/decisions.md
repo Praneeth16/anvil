@@ -173,8 +173,19 @@ violation is an `INFRA_FAIL` reported separately from a flaky endpoint, not a
 revert. See `SECURITY.md` for the trust boundaries and
 `src/anvil/optimizer/policy.py`.
 
+**The secret set must follow the domain.** `ToolPolicy`'s denied paths are
+matched by exact relative path, which was airtight while the domain was a
+constant and silently wrong the moment it became a parameter: a second domain
+inside the repo puts its golden set at a path the policy has never heard of, and
+the session can then read the reference answers and judge notes for every case
+it is about to be graded on. Reads leave no diff, so the post-hoc scope check
+cannot catch it. `run_round` therefore builds the secret set from the paths the
+round is actually using, keeping the built-in domain's paths alongside them so a
+typo cannot unprotect the real answer key.
+
 **Rules out.** Moving any threshold, endpoint, or judge prompt into
-`scaffold/`. Trusting scope confinement to prompt instructions alone.
+`scaffold/`. Trusting scope confinement to prompt instructions alone. Any
+hardcoded list of secret paths that does not track the active domain.
 
 ---
 
@@ -241,7 +252,18 @@ optimizes one utility-support agent. That claim is only testable if a second
 domain can be run without editing library source. `examples/pyloom-docs/` is
 that test.
 
+**A baseline records which domain it measured.** Making the domain a parameter
+created a new way for two incomparable numbers to look comparable: mode, scorer
+names, endpoints and scorer fingerprint are all identical between two domains,
+and only the questions differ. So `CachedBaseline` and `EvalReport` carry a
+content fingerprint of the knowledge base and golden set, and the gate refuses a
+cross-domain comparison the same way it refuses a changed scorer semantics
+version. It is checked twice: once before the round spends anything, from local
+files, and once after the eval against the fingerprint the eval actually
+produced. Absent on either side means unchecked, so baselines written before the
+field stay usable.
+
 **Rules out.** Hardcoding a domain name, KB path, or golden-set path in
 `src/`. Adding a flag to one entry point and not the others — the held-out
 finalization is single-use, so scoring the wrong domain there locks in a
-wrong number.
+wrong number. Comparing a round against a baseline from another domain.

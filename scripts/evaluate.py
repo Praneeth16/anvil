@@ -57,9 +57,13 @@ def _arg_parser() -> argparse.ArgumentParser:
         default=str(REPO_ROOT / "scaffold"),
         help="path to scaffold/ directory",
     )
-    # The three data paths are what make a domain. They are anchored to
-    # REPO_ROOT rather than the cwd -- matching --scaffold above -- so the
-    # documented invocations work from any directory.
+    # The three data paths are what make a domain. --kb-dir and
+    # --golden-set-path are anchored to REPO_ROOT rather than the cwd, matching
+    # --scaffold above, so the documented invocations work from any directory.
+    # --evaluator-path is NOT: it defaults to None so the scorer builder applies
+    # its own default, which is cwd-relative and only read when a programmatic
+    # scorer is configured. Pass it explicitly if you run from elsewhere with
+    # one enabled.
     p.add_argument(
         "--kb-dir",
         default=str(REPO_ROOT / "data" / "kb"),

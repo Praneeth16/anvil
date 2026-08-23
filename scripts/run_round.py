@@ -141,6 +141,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Create it first: git -C {REPO_ROOT} checkout -b {args.parent_branch} main")
         return ExitCode.ERROR
 
+    # Validate the domain before the first billed session. These paths are not
+    # touched until step 6 of the round, deep inside the try/except that records
+    # INFRA_FAIL and keeps looping -- so `--rounds 50` with a mistyped --kb-dir
+    # spends fifty optimizer sessions to produce fifty identical failures.
+    kb_dir = Path(args.kb_dir)
+    if not kb_dir.is_dir() or not any(kb_dir.glob("*.md")):
+        print(f"ERROR: --kb-dir {kb_dir} is not a directory containing *.md documents.")
+        return ExitCode.ERROR
+    golden_set_path = Path(args.golden_set_path)
+    if not golden_set_path.is_file():
+        print(f"ERROR: --golden-set-path {golden_set_path} does not exist.")
+        return ExitCode.ERROR
+    if args.evaluator_path is not None and not Path(args.evaluator_path).is_file():
+        print(f"ERROR: --evaluator-path {args.evaluator_path} does not exist.")
+        return ExitCode.ERROR
+
     next_id = args.round_id if args.round_id is not None else _next_round_id(REPO_ROOT)
 
     unjudged: list[str] = []
