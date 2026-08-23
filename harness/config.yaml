@@ -12,7 +12,7 @@
 # Anything mutation-worthy (sampling, skills, rules, tools) lives in
 # `scaffold/harness.yaml`.
 
-# Optimization mode — what FORGE mutates.
+# Optimization mode — what ANVIL mutates.
 #   prompt — prompt scaffolds (skills/rules/sampling in markdown + YAML).
 #            The default; backward compatible with all existing rounds.
 #   code   — agent Python code (MemorySystem subclasses in agents/).

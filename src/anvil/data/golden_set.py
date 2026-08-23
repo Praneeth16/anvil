@@ -1,6 +1,6 @@
-"""Loader for the synthetic NeoVolt golden evaluation set.
+"""Loader for a golden evaluation set.
 
-Reads ``data/golden_set.jsonl`` line-by-line and returns the list of
+Reads the JSONL at the given path line-by-line and returns the list of
 example dicts. The eval runner consumes them directly — every
 example is required to carry: ``example_id``, ``query``, ``category``,
 ``expected_doc_ids``, ``reference_answer``, ``should_refuse``,

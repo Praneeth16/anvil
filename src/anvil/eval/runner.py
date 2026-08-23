@@ -742,7 +742,7 @@ def _import_agent_module(module_path: str) -> ModuleType:
     A dotted path (e.g. ``anvil.agents.baseline``) is resolved via
     :func:`importlib.import_module`. A path containing a separator or
     ending in ``.py`` is loaded from disk via ``spec_from_file_location``
-    — this is how FORGE loads candidate modules the optimizer just wrote
+    — this is how ANVIL loads candidate modules the optimizer just wrote
     to ``agents/`` that are not yet installed packages.
     """
     if module_path.endswith(".py") or "/" in module_path or os.sep in module_path:

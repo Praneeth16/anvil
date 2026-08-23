@@ -1,6 +1,6 @@
 """Code-mode agent implementations.
 
-In code mode (``harness/config.yaml > mode: code``) FORGE optimizes
+In code mode (``harness/config.yaml > mode: code``) ANVIL optimizes
 agent Python code — ``MemorySystem`` subclasses with different
 retrieval algorithms, learning strategies, and memory structures —
 instead of prompt scaffolds. The eval runner imports the active agent

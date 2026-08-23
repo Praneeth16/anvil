@@ -351,7 +351,7 @@ class RuntimeYAML(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    # Optimization mode — what FORGE mutates.
+    # Optimization mode — what ANVIL mutates.
     #   prompt — prompt scaffolds (skills/rules/sampling in markdown + YAML).
     #            The default; backward compatible with all existing rounds.
     #   code   — agent Python code (MemorySystem subclasses in agents/).

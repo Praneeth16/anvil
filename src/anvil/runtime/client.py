@@ -1,4 +1,4 @@
-"""Databricks AI Gateway client — the sole LLM route for FORGE.
+"""Databricks AI Gateway client — the sole LLM route for ANVIL.
 
 All three LLM call paths (runtime agent, optimizer, judge) route through
 a single OpenAI-compatible endpoint on the Databricks workspace. The

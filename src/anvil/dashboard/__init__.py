@@ -1,4 +1,4 @@
-"""Frontier dashboard for ANVIL/FORGE.
+"""Frontier dashboard for ANVIL.
 
 Visualize the Pareto frontier of agent mutations.
 
