@@ -14,95 +14,113 @@ Two override blocks in `pyproject.toml` let the gate land green:
 Both lists are ratchets: the phase that rewrites a module fixes its errors and deletes its entry.
 Never append.
 
-## The mismatches that matter
+Last updated: 2026-08-24.
 
-### `eval/runner.py:481` — the code-mode constructor contract is unenforced
+---
+
+## Closed
+
+Measured by deleting the `disable_error_code` block and re-running: **24 errors → 12**, and the 12
+that remain are all MLflow's own typing. Four modules left the block outright —
+`anvil.eval.cache`, `anvil.optimizer.session`, `anvil.runtime.client`,
+`anvil.tools.search_knowledge_base` — and the two that stay now name only the codes they need, so a
+new mismatch of any other kind is an error again.
+
+### `GatewayClient` is not an `OpenAI` — now a `ChatClient` protocol
+
+Every annotation said `openai.OpenAI`. Nothing in `src/` has ever constructed one and passed it: the
+object is always a `GatewayClient`, a duck-typed stand-in. So the union `OpenAI | GatewayClient` was
+not describing a real choice, and silencing it took the checker off the one boundary where a swapped
+client is a genuine hazard.
+
+`anvil.runtime.client.ChatClient` is a `Protocol` describing the single call ANVIL makes, and
+`GatewayClient` satisfies it structurally. The plan called for "the protocol both satisfy" — that
+turns out to be **impossible**, and the reason is worth recording: `openai`'s `create` is overloaded
+with a narrow `Iterable[ChatCompletionMessageParam]` and no `**kwargs`, and protocol parameters are
+contravariant, so no protocol loose enough to describe a hand-written client can be satisfied by it.
+Describing what ANVIL uses is both achievable and the more useful contract.
+
+One real mismatch remained inside `GatewayClient`: caller-supplied plain dicts into `openai`'s
+narrowly-typed `messages`. That is a `cast` at the single point where the wire shape meets the SDK's
+TypedDicts, not a silenced module.
+
+### `source` is a `Literal` fed a bare `str`
+
+`SOURCE_PRODUCTION` / `SOURCE_EVAL` / `SOURCE_OPTIMIZER` are now `Final[SourceTag]` rather than bare
+`str`, so a typo is a type error at the constant rather than a trace that silently matches no
+observability query. `tests/test_provider_boundary.py` asserts the constant set and the `Literal`'s
+arguments are equal in *both* directions, so adding a tag to one and not the other is caught.
+
+### The code-mode constructor contract is unenforced
+
+`MemorySystem` now declares `__init__(self, *, llm_client: ChatClient | None = None, model: str = "")`
+— the call `anvil.eval.runner._load_memory_system` actually makes — and
+`anvil.optimizer.code_validation.check_constructor_contract` binds those arguments against the
+candidate's signature during validation. A candidate the eval could not have constructed is now
+*rejected*, which reverts the round, instead of raising a `TypeError` inside the eval, which
+judgeability reads as infrastructure and aborts it.
+
+The same check subsumes a second case that was silently identical: a candidate module with **no**
+concrete `MemorySystem` in it. `write_agent` writes the module `agent_module` resolves to, so that
+was never valid either; it just failed later and in the more expensive way. The subclass finder moved
+from `eval/runner.py` to `agents/memory_system.py` so the optimizer plane can use it without
+importing the eval plane.
+
+**A behaviour bug fell out of this.** Prompt mode resolved `runtime_client or build_gateway_client()`;
+code mode passed the unresolved *parameter*. Nobody injects a client outside tests, so an ordinary
+code-mode round constructed every candidate with `llm_client=None` — `BaselineExtractor` reads that
+as "echo the input", so the eval scored a passthrough rather than an agent, and any candidate that
+really called the LLM died on an attribute of `None` deep inside the eval.
+
+### `eval/cache.py` — sorting a union that includes `None`
+
+Already fixed before this pass: the key is `lambda s: str(s["name"])`, which is total. The entry was
+stale; `anvil.eval.cache` is now strict-clean.
+
+### `optimizer/session.py` — the permission callback bypasses the typed contract
+
+Fixed when the confinement work replaced `_allow_all_tool_calls`, as predicted. Strict-clean.
+
+### `tools/search_knowledge_base.py` — `doc_id` / `title` promise `str`
+
+Two separate `.get()` calls gave the checker nothing to narrow. Bound to locals first. This one was
+covered by *no test at all* — a revert of the narrowing passed all 586 tests — so
+`tests/test_kb_index.py` now exercises the fallbacks, including a `doc_id` that is present and
+unusable (`doc_id: 42`). The golden set references documents *by* `doc_id`, so a document indexed
+under `None` is one `expected_doc_ids` can never match.
+
+---
+
+## What is left, and why it stays
+
+All twelve are MLflow's typing rather than ANVIL's, against a moving target.
+
+### `runtime/agent.py` — `arg-type`, `attr-defined`, `override`
 
 ```
-error: Unexpected keyword argument "llm_client" for "MemorySystem"  [call-arg]
-error: Unexpected keyword argument "model" for "MemorySystem"  [call-arg]
-```
-
-`_instantiate_agent` ends in `cls(llm_client=llm_client, model=model)`, but the `MemorySystem` ABC
-(`agents/memory_system.py`) declares **no `__init__` at all**. The constructor contract that every
-optimizer-authored agent must satisfy exists only in a docstring.
-
-Consequence: in `mode: code`, the optimizer can write a `MemorySystem` subclass whose `__init__`
-takes different parameters, and the failure surfaces as a `TypeError` deep inside eval — where
-Phase 2's error handling will class it as an infrastructure error and abort the round, when it is
-really an invalid candidate that should have been rejected at validation time.
-
-Fix (Phase 5, with `optimizer/code_validation.py`): declare `__init__` on the ABC and check the
-candidate's signature against it during validation, so a bad candidate is rejected before eval.
-
-### `runtime/agent.py:59` and `eval/runner.py:745` — `source` is a `Literal` fed a bare `str`
-
-```
-error: Incompatible default for parameter "source" (default has type "str",
-       parameter has type "Literal['production', 'eval', 'optimizer']")
-```
-
-`source` tags every MLflow trace and is the field observability queries filter on. A typo produces
-traces that silently match no query. The `Literal` is the right idea; the default and the caller
-both bypass it.
-
-Fix: correct the default and narrow at the `runner.py` call site. Cheap, do it in Phase 2 while
-that file is open.
-
-### `eval/runner.py:714-715`, `797`, `runtime/agent.py:70` — `GatewayClient` is not an `OpenAI`
-
-```
-error: Incompatible types in assignment (expression has type "OpenAI | GatewayClient",
-       variable has type "OpenAI | None")
-error: Argument "judge_client" to "build_scorers" has incompatible type "OpenAI | None";
-       expected "OpenAI"
-```
-
-`GatewayClient` is a duck-typed stand-in for `OpenAI` that happens to expose the same
-`chat.completions.create` surface. It works, but the annotations claim something false, and
-`judge_client` is additionally typed non-optional while `None` reaches it.
-
-Fix (Phase 5, when the provider boundary lands): define an explicit `ChatClient` protocol both
-satisfy. This is exactly the seam that phase introduces, so the fix is free there.
-
-### `optimizer/session.py:146` — the permission callback bypasses the typed contract
-
-```
-error: Argument "can_use_tool" ... expected Callable[..., Awaitable[PermissionResultAllow
-       | PermissionResultDeny]]
-```
-
-`_allow_all_tool_calls` returns a raw `{"behavior": "allow", ...}` dict instead of the SDK's typed
-`PermissionResultAllow`. It works by accident of the SDK's coercion, and it is the very function
-Phase 1 deletes. Fixed there by construction.
-
-### `eval/cache.py:74` — sorting a union that includes `None`
-
-```
-error: Argument "key" to "sorted" has incompatible type ... expected SupportsDunderLT
-```
-
-The scorer-fingerprint sort key can return `None`, which raises `TypeError` on comparison against
-a `str` or `float`. Reachable only if a scorer entry is missing the sorted-on field. The fingerprint
-guards gate integrity — a crash here is loud and safe, but it should be impossible by construction.
-
-Fix: make the key total (coerce `None` to a sentinel) when Phase 3 touches the fingerprint.
-
-### `runtime/agent.py:114,143` and `eval/runner.py:779` — `ResponsesAgent` payload shapes
-
-```
-error: Argument "output" to "ResponsesAgentResponse" has incompatible type
-       "list[dict[str, Any]]"; expected "list[OutputItem]"
 error: Module "mlflow.pyfunc" does not explicitly export attribute "ResponsesAgent"
 error: Signature of "predict" incompatible with supertype "PythonModel"
+error: Argument "output" to "ResponsesAgentResponse" has incompatible type
+       "list[dict[str, Any]]"; expected "list[OutputItem]"
 ```
 
-Hand-built dicts passed where MLflow expects typed `OutputItem`s. MLflow accepts them today. The
-`predict` override divergence and the non-exported `ResponsesAgent` are MLflow's own typing gaps,
-so these stay silenced with a comment rather than being "fixed" against a moving target.
+`ResponsesAgent` is absent from `mlflow.pyfunc.__all__`; its `predict` signature diverges from
+`PythonModel.predict` by MLflow's own design; and `ResponsesAgentResponse(output=...)` is documented
+to accept plain dicts while being annotated `list[OutputItem]`.
 
-### `runtime/client.py:152`, `tools/search_knowledge_base.py:98-99` — minor
+### `eval/runner.py` — `assignment`, `attr-defined`, `list-item`
 
-Untyped message dicts into the OpenAI SDK, and `doc_id`/`title` typed `str` while frontmatter
-parsing can yield `None` (a KB doc missing a field produces `None` where `str` is promised).
-Low severity; fix in passing.
+`mlflow.genai.evaluation.harness` exports none of the internals the resilient eval shim must patch
+(`batch_link_traces_to_run`, `construct_eval_result_df`, `_run_predict`,
+`_get_new_expectations`), and the replacements are deliberately looser than the originals.
+`list-item` is `ResponsesAgentRequest(input=[{...}])` — the same dict-vs-typed-item gap as above.
+
+If MLflow tightens or exports these, delete the codes and re-measure. The measurement is one
+command: remove the block, run `mypy`.
+
+---
+
+## Remaining strictness relaxations
+
+The first override block (missing annotations, bare generics) still covers thirteen modules. No
+behavioural risk; each is deleted by the phase that rewrites its module.

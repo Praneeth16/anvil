@@ -12,14 +12,14 @@ from __future__ import annotations
 from typing import Any
 
 from anvil.agents.memory_system import MemorySystem
+from anvil.runtime.client import ChatClient
 
 
 class BaselineExtractor(MemorySystem):
     """Baseline: direct LLM call with no memory or retrieval."""
 
-    def __init__(self, llm_client: Any = None, model: str = "") -> None:
-        self.llm_client = llm_client
-        self.model = model
+    def __init__(self, *, llm_client: ChatClient | None = None, model: str = "") -> None:
+        super().__init__(llm_client=llm_client, model=model)
 
     def predict(self, input: str) -> tuple[str, dict[str, Any]]:
         if self.llm_client is None:

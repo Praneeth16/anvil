@@ -130,29 +130,30 @@ disallow_untyped_calls = false
 disallow_any_generics = false
 warn_return_any = false
 
-# Pre-existing type mismatches, not style debt. Each is a real signal and each
-# is itemised with its consequence in `docs/type-debt.md` -- read that before
-# touching this block. Silenced only so the gate can land green; the phase that
-# rewrites each module fixes its errors and deletes its entry.
+# What is left is MLflow's own typing, not ANVIL's. Each entry below names the
+# codes that module needs and nothing more, so a *new* mismatch of any other
+# kind is still an error. `docs/type-debt.md` itemises them.
+#
+# Four modules left this list outright when the mismatches they were carrying
+# were fixed rather than silenced: `anvil.eval.cache`, `anvil.optimizer.session`,
+# `anvil.runtime.client`, `anvil.tools.search_knowledge_base`.
 [[tool.mypy.overrides]]
-module = [
-    "anvil.eval.cache",
-    "anvil.eval.runner",
-    "anvil.optimizer.session",
-    "anvil.runtime.agent",
-    "anvil.runtime.client",
-    "anvil.tools.search_knowledge_base",
-]
-disable_error_code = [
-    "arg-type",
-    "assignment",
-    "attr-defined",
-    "call-arg",
-    "list-item",
-    "no-redef",
-    "override",
-    "return-value",
-]
+module = ["anvil.runtime.agent"]
+# `ResponsesAgent` is not in `mlflow.pyfunc.__all__`; its `predict` signature
+# diverges from `PythonModel.predict` by MLflow's own design; and
+# `ResponsesAgentResponse(output=...)` is documented to take plain dicts while
+# being annotated `list[OutputItem]`. All three are upstream, and "fixing" them
+# against a moving target would be worse than naming them.
+disable_error_code = ["arg-type", "attr-defined", "override"]
+
+[[tool.mypy.overrides]]
+module = ["anvil.eval.runner"]
+# `mlflow.genai.evaluation.harness` exports none of the internals the resilient
+# eval shim has to patch, and the patched callables are deliberately looser than
+# the originals. `list-item` is `ResponsesAgentRequest(input=[{...}])`, the same
+# MLflow dict-vs-typed-item gap as above.
+disable_error_code = ["assignment", "attr-defined", "list-item"]
+
 # Third-party packages without stubs. Narrow, per-module, never blanket.
 [[tool.mypy.overrides]]
 module = [

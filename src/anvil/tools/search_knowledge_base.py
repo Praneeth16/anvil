@@ -88,8 +88,14 @@ def _load_kb_index(kb_dir: Path) -> list[_IndexedDoc]:
     docs: list[_IndexedDoc] = []
     for path in sorted(kb_dir.glob("*.md")):
         fm, body = _strip_frontmatter(path.read_text(encoding="utf-8"))
-        doc_id = fm.get("doc_id") if isinstance(fm.get("doc_id"), str) else path.stem
-        title = fm.get("title") if isinstance(fm.get("title"), str) else doc_id
+        # Bind before narrowing: two separate ``.get`` calls give the type
+        # checker nothing to narrow, so ``doc_id``/``title`` were annotated
+        # ``str`` while a KB doc missing the frontmatter field could still put
+        # ``None`` through.
+        raw_doc_id = fm.get("doc_id")
+        doc_id = raw_doc_id if isinstance(raw_doc_id, str) else path.stem
+        raw_title = fm.get("title")
+        title = raw_title if isinstance(raw_title, str) else doc_id
         tokens = _tokenise(f"{title}\n{body}")
         if not tokens:
             continue

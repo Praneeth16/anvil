@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import inspect
 import os
 import re
 import shutil
 import tempfile
 import uuid
 from pathlib import Path
+from types import ModuleType
 from typing import Final
+
+from anvil.agents.memory_system import find_memory_system_subclass
 
 
 class CodeValidationError(Exception):
@@ -77,8 +81,12 @@ def check_ast_denylist(file_path: Path | str) -> None:
                 )
 
 
-def validate_imports(file_path: Path | str) -> None:
-    """Load a candidate from an isolated temporary working directory."""
+def validate_imports(file_path: Path | str) -> ModuleType:
+    """Load a candidate from an isolated temporary working directory.
+
+    Returns the imported module so a caller can inspect what the candidate
+    actually defines without importing it a second time.
+    """
     path = Path(file_path)
     if not path.is_file():
         raise CodeValidationError(f"code candidate is not a file: {path}")
@@ -96,6 +104,7 @@ def validate_imports(file_path: Path | str) -> None:
             module = importlib.util.module_from_spec(spec)
             # Deliberately do not register the candidate in sys.modules.
             spec.loader.exec_module(module)
+            return module
     except CodeValidationError:
         raise
     except (KeyboardInterrupt, SystemExit):
@@ -108,7 +117,43 @@ def validate_imports(file_path: Path | str) -> None:
         os.chdir(previous_cwd)
 
 
+def check_constructor_contract(module: ModuleType) -> None:
+    """Reject a candidate whose ``__init__`` the eval could not call.
+
+    ``anvil.eval.runner._load_memory_system`` instantiates every candidate as
+    ``cls(llm_client=..., model=...)``. A subclass that names those parameters
+    differently, or makes them positional-only, raises ``TypeError`` at that
+    call -- inside the eval, after the optimizer session has been paid for,
+    where judgeability reads an exception as an infrastructure failure and
+    aborts the round. An invalid candidate should be *rejected*, which is a
+    different outcome with a different consequence: the round reverts and the
+    loop keeps going.
+
+    Checked by binding the arguments rather than by comparing parameter names,
+    so a candidate that accepts them via ``**kwargs`` passes -- it can in fact
+    be constructed, which is the only thing this guards.
+    """
+    try:
+        cls = find_memory_system_subclass(module)
+    except ValueError as exc:
+        # Zero or several concrete subclasses. Same failure mode one step
+        # earlier: `write_agent` writes the module `agent_module` points at, so
+        # a candidate the eval cannot find an agent in was never valid -- it
+        # just failed later, inside the eval, as an infrastructure error.
+        raise CodeValidationError(f"invalid code candidate: {exc}") from exc
+    try:
+        inspect.signature(cls).bind(llm_client=None, model="")
+    except (TypeError, ValueError) as exc:
+        raise CodeValidationError(
+            f"{cls.__name__}.__init__ cannot be called as "
+            f"cls(llm_client=..., model=...): {exc}. Every MemorySystem "
+            f"candidate must accept those keyword arguments -- inherit "
+            f"MemorySystem.__init__ or declare a compatible signature."
+        ) from exc
+
+
 def validate_code_candidate(file_path: Path | str) -> None:
     """Run the cheap AST policy check before attempting an isolated import."""
     check_ast_denylist(file_path)
-    validate_imports(file_path)
+    module = validate_imports(file_path)
+    check_constructor_contract(module)

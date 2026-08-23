@@ -33,7 +33,10 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from openai.types.chat import ChatCompletionMessageParam
 
 
 def _get_fresh_sp_token() -> str:
@@ -112,6 +115,48 @@ def _gateway_base_url() -> str:
     return f"{host}/serving-endpoints"
 
 
+@runtime_checkable
+class _ChatCompletionsLike(Protocol):
+    """The one chat-completions call ANVIL makes."""
+
+    def create(self, *, model: str, messages: list[dict[str, Any]], **kwargs: Any) -> Any: ...
+
+
+@runtime_checkable
+class _ChatLike(Protocol):
+    @property
+    def completions(self) -> _ChatCompletionsLike: ...
+
+
+@runtime_checkable
+class ChatClient(Protocol):
+    """The LLM surface the runtime, judge, and code-mode agents depend on.
+
+    Every annotation in this project used to say ``openai.OpenAI`` while the
+    object actually passed was always a :class:`GatewayClient` — a duck-typed
+    stand-in that has never been an ``OpenAI``. The union ``OpenAI |
+    GatewayClient`` was then silenced module-wide, which took the type checker
+    off the one boundary where a swapped client is a real hazard.
+
+    The protocol is deliberately narrow: `model`, `messages`, and whatever else
+    the caller forwards. It is not "the OpenAI SDK's interface", and it cannot
+    be — ``openai``'s ``create`` is overloaded with a narrow
+    ``Iterable[ChatCompletionMessageParam]`` and no ``**kwargs``, so no
+    structural protocol loose enough to describe a hand-written client can be
+    satisfied by it. Describing what ANVIL uses is the achievable and more
+    useful contract; ``GatewayClient`` satisfies it structurally, with no
+    registration and no inheritance.
+
+    ``runtime_checkable`` so a test can assert the concrete client still has
+    the surface. That is a presence check, not a signature check -- it is
+    there to catch ``GatewayClient`` losing ``chat``, which no static check
+    would see at the call sites that take the protocol.
+    """
+
+    @property
+    def chat(self) -> _ChatLike: ...
+
+
 class GatewayClient:
     """OpenAI-compatible client backed by the Databricks AI Gateway.
 
@@ -149,7 +194,12 @@ class GatewayClient:
                 )
                 return client.chat.completions.create(
                     model=model,
-                    messages=messages,
+                    # Callers pass the OpenAI wire shape as plain dicts. The
+                    # SDK's ``ChatCompletionMessageParam`` TypedDicts describe
+                    # that same JSON more precisely than the caller can express
+                    # generically, so this is a narrowing of an already-correct
+                    # value, not a claim that the dicts were validated.
+                    messages=cast("list[ChatCompletionMessageParam]", messages),
                     **kwargs,
                 )
 

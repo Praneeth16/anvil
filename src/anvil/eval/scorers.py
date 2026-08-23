@@ -85,8 +85,8 @@ from mlflow.genai.utils.trace_utils import (
     extract_response_from_trace,
     extract_retrieval_context_from_trace,
 )
-from openai import OpenAI
 
+from anvil.runtime.client import ChatClient
 from anvil.runtime.models import ScorerConfig
 
 logger = logging.getLogger(__name__)
@@ -197,7 +197,7 @@ Output JSON ONLY (no prose, no code fences) with these keys:
 
 @dataclass(frozen=True)
 class _JudgeContext:
-    client: OpenAI
+    client: ChatClient
     model: str
     domain_name: str = DEFAULT_JUDGE_DOMAIN_NAME
     domain_context: str = DEFAULT_JUDGE_DOMAIN_CONTEXT
@@ -540,7 +540,7 @@ def build_programmatic_scorer(*, name: str, check_fn):
 
 def build_scorers(
     *,
-    judge_client: OpenAI,
+    judge_client: ChatClient,
     judge_model: str = DEFAULT_JUDGE_MODEL,
     scorer_configs: list[ScorerConfig] | None = None,
     evaluator_path: str | Path | None = None,
