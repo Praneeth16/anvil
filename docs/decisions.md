@@ -277,3 +277,61 @@ field stay usable.
 `src/`. Adding a flag to one entry point and not the others — the held-out
 finalization is single-use, so scoring the wrong domain there locks in a
 wrong number. Comparing a round against a baseline from another domain.
+
+---
+
+## D12 — Promotion requires a paired test, not a bigger threshold
+
+**Decision.** After the frontier gate says KEEP, the improvement must also clear
+a one-sided paired sign test over the **per-row** scores
+(`anvil.eval.significance`). `gate.test: paired` is the default; `none` restores
+the legacy "any delta clearing epsilon promotes". `gate.replicates` (default `1`)
+evaluates each candidate *K* times and averages the per-row scores before the
+test runs.
+
+**Why.** Two healthy runs of the *same* scaffold, the same rows and the same
+model scored `0.875` and `0.722` — about 0.15 of aggregate, from judge noise
+alone. Every per-round gain the loop has actually produced was 0.03–0.06. A gate
+that promotes on any positive delta was therefore reading noise as signal about
+as often as not, and fifty rounds of that is a random walk with a plausible story
+attached.
+
+The obvious fix is the wrong one. Raising `gate.epsilon` to 0.15 rejects every
+real gain ever observed here, trading a loop that promotes noise for a loop that
+promotes nothing. What makes the difference measurable is that both runs answer
+**the same questions**: the scores pair row by row, and a per-row difference
+cancels the row-difficulty variance that dominates the aggregate. Only the rows
+where the two runs *disagree* carry information — which is a sign test, and it
+assumes nothing about the noise distribution, the right posture when the noise
+source is an LLM judge nobody has characterised.
+
+**A veto, never a promotion.** The test runs only when the frontier already
+decided to keep. It cannot rescue a mutation the frontier rejected: direction
+("does this regress an objective") and significance ("is this distinguishable
+from noise") are different questions, and a mutation that regressed does not
+become acceptable by regressing insignificantly.
+
+**Two ways to fail to conclude, and they get different answers.** No pairable
+rows means the *test* could not run — a baseline written before per-row scores
+existed. That is the situation an empty `scorer_fingerprint` describes and it
+gets the same answer: unchecked, said out loud, frontier decision stands.
+Reverting there would be a migration disguised as a gate. Rows that paired but
+produced too few disagreements is the opposite: the test ran and reports that
+this row count cannot distinguish this mutation from noise. That reverts, and the
+reason names `gate.replicates`, which is the knob that buys the power back.
+
+**The cost is explicit, and so is the consequence.** At 12 rows most real
+mutations do not flip five rows, so `replicates: 1` will revert many rounds as
+underpowered. That is honest rather than pessimistic — the alternative is
+promoting noise — and replication is the lever, at exactly proportional spend.
+
+**Activation requires regenerating the baseline.** `eval/runs/baseline.json` as
+shipped has no `per_row`, so the gate is inert (and says so, every round) until
+`scripts/make_baseline.py` is re-run. Deliberate: back-compat that fails loudly
+beats a forced migration, but "inert" must not be quiet.
+
+**Rules out.** Tuning `epsilon` as the answer to judge noise. Treating
+"underpowered" and "not significant" as the same outcome. Letting the paired test
+promote anything. Reading `gate.replicates` from a config the round could have
+rewritten — it is read after `verify_changed_paths` has restored out-of-scope
+writes, so a round cannot buy itself statistical power.

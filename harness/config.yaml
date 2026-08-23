@@ -207,6 +207,38 @@ gate:
   # strict positive delta is required — a tie (no objective improves)
   # does not extend the frontier and is reverted.
   epsilon: 0.0
+  # Does the improvement survive contact with judge noise?
+  #
+  #   paired — (default) after the frontier says KEEP, require the improvement
+  #            to clear a one-sided paired sign test over the PER-ROW scores.
+  #   none   — legacy: any delta clearing `epsilon` promotes.
+  #
+  # Why this and not a bigger epsilon. Two healthy runs of the *same* scaffold,
+  # the same rows and the same model scored 0.875 and 0.722 -- ~0.15 of aggregate
+  # from judge noise alone. Every per-round gain the loop has actually produced
+  # was 0.03-0.06. So an epsilon large enough to exclude the noise excludes every
+  # real gain too. What makes the difference measurable is that both runs answer
+  # the SAME questions: pairing the rows cancels the row-difficulty variance that
+  # dominates the aggregate, and only the rows where the two runs disagree carry
+  # information.
+  #
+  # The test is a veto on KEEP, never a promotion -- it cannot rescue a mutation
+  # the frontier rejected for regressing. See src/anvil/eval/significance.py.
+  test: paired
+  # Significance level for the paired test. 0.05 needs at least 5 rows to
+  # disagree (a clean sweep of 4 gives p = 0.0625), so below that the round is
+  # reported as underpowered and reverted rather than promoted on evidence that
+  # could not have contradicted itself.
+  alpha: 0.05
+  # How many times to evaluate each candidate. 1 costs nothing extra.
+  #
+  # EXPECT MORE REVERTS AT 1. At 12 rows most real mutations do not flip 5 rows,
+  # so many rounds will revert as "underpowered" -- which is honest, and is the
+  # point: the alternative is promoting noise. Raising this averages the per-row
+  # scores over replicates, which shrinks the judge's own inconsistency and lets
+  # the same test see smaller effects. It costs exactly proportionally: 3 here is
+  # 3x the eval spend per round, so at 50 rounds it is a budget decision.
+  replicates: 1
   # Multi-objective optimization (only used when type: frontier). Disabled
   # preserves the single aggregate objective used by older configurations.
   pareto:

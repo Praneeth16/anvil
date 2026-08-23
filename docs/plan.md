@@ -76,6 +76,11 @@ python scripts/round_show.py 12          # inspect a round
 
 ## Current state
 
+**The gate is noise-aware.** Promotion requires the improvement to survive a
+paired sign test over the per-row scores, not merely to clear `epsilon`
+(`docs/decisions.md` D12). It is inert until the baseline is regenerated — see
+open item 2, which is one command.
+
 **Hardening complete.** The eval layer is correct as far as it has been
 pushed: failure is distinguished from error end to end, applicability is a
 first-class outcome, the gate defers to one definition of comparability
@@ -118,43 +123,34 @@ optimizer runs out of ideas — actually lives.
 
 ## Open work, in priority order
 
-### 1. A noise-aware promotion gate
+### 1. Judge alignment
 
-The largest correctness problem left. Two runs of the *same* scaffold, same
-rows, same model differed by ~0.15 of aggregate from judge noise alone
-(0.875 vs 0.722; `docs/design/failure-vs-error.md`). `gate.epsilon` is
-`0.0`, so a strict positive delta promotes — meaning noise of that size is
-read as signal roughly half the time.
-
-Mitigated today only by using `standard` (12 rows) over `quick` (8). The
-actual fix is a paired, noise-aware comparison: repeat measurement, or a
-significance test, or both. MLflow's `evaluate()` offers no `seed`, no
-repetition count, and no paired mode (`docs/verified-api-surface.md`), so
-this is ANVIL's to build.
-
-Blocks leaning on per-judge numbers for anything finer-grained than the
-aggregate.
-
-### 2. Judge alignment
-
-The unaligned LLM judge is the root cause of item 1, not merely correlated
-with it. MLflow exposes `Judge.align(traces, optimizer=None)` and
-`judges.AlignmentOptimizer` (`docs/verified-api-surface.md`). Aligning the
-judge against human labels on a handful of rows would shrink the noise floor
-that item 1 works around.
-
-### 3. Judge alignment
-
-The unaligned LLM judge is the root cause of item 1, not merely correlated with
-it. MLflow exposes `Judge.align(traces, optimizer=None)` and
-`judges.AlignmentOptimizer` (`docs/verified-api-surface.md`). Aligning the judge
-against human labels on a handful of rows would shrink the noise floor that item
-1 works around.
+The unaligned LLM judge is the root cause of the noise the paired gate now works
+around, not merely correlated with it. MLflow exposes
+`Judge.align(traces, optimizer=None)` and `judges.AlignmentOptimizer`
+(`docs/verified-api-surface.md`). Aligning the judge against human labels would
+shrink the noise floor itself, which is strictly better than compensating for it
+— a smaller floor means the paired test detects smaller real effects at
+`replicates: 1`.
 
 **Blocked on labels, not on code.** Alignment needs human verdicts on real
-traces, and there is no honest way to synthesize those — a judge aligned against
+traces, and there is no honest way to synthesize those: a judge aligned against
 labels produced by a judge measures nothing. The prerequisite is a person
 labelling a few dozen rows from a live run.
+
+### 2. Regenerate the baseline to activate the paired gate
+
+One command, but it costs a real eval and it is the difference between the gate
+running and the gate logging that it could not run:
+
+```bash
+python scripts/make_baseline.py
+```
+
+`eval/runs/baseline.json` as shipped predates `per_row`, so every round currently
+reports `paired: no rows could be paired` and the frontier decision stands
+unchecked. Until this is done, the noise-aware gate is documented rather than
+operative.
 
 ---
 

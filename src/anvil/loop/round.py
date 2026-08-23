@@ -26,6 +26,7 @@ from anvil.eval.cache import (
     scorer_incomparability_reason,
 )
 from anvil.eval.judgeability import unjudgeable_reason_for
+from anvil.eval.replication import evaluate_replicated
 from anvil.loop.builder import build_round_prompt
 from anvil.loop.decision import Decision
 from anvil.loop.frontier import (
@@ -274,13 +275,25 @@ def run_round(
             mutated_score = float(baseline.aggregate)
     else:
         try:
-            eval_report = evaluate_branch(
-                scaffold_root=scaffold_root,
-                kb_dir=kb_dir,
-                golden_set_path=golden_set_path,
-                evaluator_path=evaluator_path,
-                profile=profile,
-                mode=eval_mode,
+            # `gate.replicates` is read here rather than at the gate because it
+            # changes what is measured, not how the measurement is judged.
+            #
+            # Safe to read after the mutation because step 3.5 already ran:
+            # `verify_changed_paths` restores anything written outside scope, and
+            # a violation skips this eval entirely. So a round cannot raise its
+            # own replicate count to buy itself statistical power -- the same
+            # class of cheat D8 exists to prevent, one level down.
+            replicates = load_gate_config(scaffold_root).replicates
+            eval_report = evaluate_replicated(
+                lambda: evaluate_branch(
+                    scaffold_root=scaffold_root,
+                    kb_dir=kb_dir,
+                    golden_set_path=golden_set_path,
+                    evaluator_path=evaluator_path,
+                    profile=profile,
+                    mode=eval_mode,
+                ),
+                replicates=replicates,
             )
             mutated_score = eval_report.aggregate
             eval_run_id = eval_report.run_id
@@ -381,7 +394,7 @@ def run_round(
             if eval_report is not None
             else None
         )
-        decision, frontier = gate_decision(
+        decision, frontier, paired = gate_decision(
             repo_root=repo_root,
             gate_type=gate_cfg.type,
             epsilon=gate_cfg.epsilon,
@@ -393,7 +406,23 @@ def run_round(
             action_kind=action.action,
             eval_failed=eval_failed,
             parse_status=parse_result.parse_status,
+            gate_test=gate_cfg.test,
+            alpha=gate_cfg.alpha,
+            baseline_per_row=baseline.per_row if baseline else None,
+            mutated_per_row=eval_report.per_row if eval_report is not None else None,
+            weights=eval_report.aggregate_weights if eval_report is not None else None,
+            aggregate_scorer_names=(
+                eval_report.aggregate_scorer_names if eval_report is not None else None
+            ),
         )
+        if paired is not None:
+            # Into the round record either way. A KEEP that survived the paired
+            # test and a KEEP that was never tested are different events, and so
+            # are "reverted because it regressed" and "reverted because the gain
+            # was indistinguishable from judge noise" -- the second says try a
+            # bigger change or buy more rows, the first says try a different one.
+            notes = f"{notes}; paired: {paired.reason}" if notes else f"paired: {paired.reason}"
+            print(f"[round {round_id}] paired test: {paired.reason}")
 
     # 8. Write critique md.
     critique_path = repo_root / "scaffold" / "memory" / f"round_{round_id:03d}_critique.md"

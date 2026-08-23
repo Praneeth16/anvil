@@ -47,6 +47,7 @@ REQUIRED_FIELDS = [
     "scorer_fingerprint",
     "dataset_fingerprint",
     "cost_metrics",
+    "per_row",
 ]
 
 _SHA = "a" * 40
@@ -88,6 +89,15 @@ def _fake_report() -> EvalReport:
             '[{"check_function": null, "name": "correctness", '
             '"type": "llm", "weight": 1.0}]'
         ),
+        # Non-empty, deliberately. ``to_dict`` omits ``per_row`` when it is
+        # empty -- correct, so a pre-per_row baseline serializes unchanged -- but
+        # that also means a fake report with no per-row scores lets the
+        # exhaustive key assertion below pass while the field is being dropped.
+        # A guard that only fires on data it is not given is not a guard.
+        per_row={
+            "g1": {"correctness": 1.0, "retrieval_groundedness": 1.0},
+            "g2": {"correctness": 0.0, "refusal_appropriateness": 1.0},
+        },
     )
 
 
@@ -123,6 +133,7 @@ def test_report_to_baseline_maps_all_fields() -> None:
     assert baseline.per_bucket == report.per_bucket
     assert baseline.scorer_fingerprint == report.scorer_fingerprint
     assert baseline.cost_metrics == report.cost_metrics
+    assert baseline.per_row == report.per_row
 
     # Fields sourced from the caller (git + config), not the report.
     assert baseline.scaffold_commit_sha == _SHA
@@ -166,10 +177,12 @@ def test_report_to_baseline_copies_not_aliases() -> None:
     report.scorers.append("safety")
     report.per_judge["correctness"] = 0.0
     report.per_bucket["direct"]["correctness"] = 0.0
+    report.per_row["g1"]["correctness"] = 0.0
 
     assert "safety" not in baseline.scorers
     assert baseline.per_judge["correctness"] == 0.5
     assert baseline.per_bucket["direct"]["correctness"] == 0.5
+    assert baseline.per_row["g1"]["correctness"] == 1.0
 
 
 # ---------------------------------------------------------------------------

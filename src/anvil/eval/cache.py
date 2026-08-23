@@ -218,6 +218,13 @@ class CachedBaseline:
     # chases that two-row bar for the whole 50+-round run with nothing on disk
     # recording why. Same argument that put ``n_errors`` here.
     n_dropped_rows: int = 0
+    # Per-row scores, ``example_id`` -> {scorer: value}. What makes the paired
+    # comparison in :mod:`anvil.eval.significance` possible: the aggregate alone
+    # cannot say whether a delta is a real gain or the ~0.15 of judge noise two
+    # identical runs produced. Empty on baselines written before this field
+    # existed, and the gate treats empty as "cannot run the paired test" -- a
+    # stated reason, not a silent fall-through to promoting on any delta.
+    per_row: dict[str, dict[str, float]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -247,6 +254,11 @@ class CachedBaseline:
         # whenever the eval report supplies them.
         if self.cost_metrics:
             payload["cost_metrics"] = dict(self.cost_metrics)
+        # Also additive, and for the same reason: a baseline with no per-row
+        # scores must serialize exactly as it did before the field existed, so
+        # regenerating is a choice rather than a forced migration.
+        if self.per_row:
+            payload["per_row"] = {k: dict(v) for k, v in self.per_row.items()}
         return payload
 
     @classmethod
@@ -268,6 +280,10 @@ class CachedBaseline:
             cost_metrics={k: float(v) for k, v in raw.get("cost_metrics", {}).items()},
             n_errors=int(raw.get("n_errors", 0)),
             n_dropped_rows=int(raw.get("n_dropped_rows", 0)),
+            per_row={
+                str(k): {str(n): float(v) for n, v in scores.items()}
+                for k, scores in raw.get("per_row", {}).items()
+            },
         )
 
 
@@ -418,4 +434,5 @@ def report_to_baseline(
         cost_metrics=dict(getattr(report, "cost_metrics", {})),
         n_errors=getattr(report, "n_errors", 0),
         n_dropped_rows=getattr(report, "n_dropped_rows", 0),
+        per_row={k: dict(v) for k, v in getattr(report, "per_row", {}).items()},
     )

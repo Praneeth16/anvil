@@ -488,7 +488,15 @@ def test_round_scores_normally_when_the_error_rate_is_under_the_ceiling(
     report = round_mod.run_round(round_id=1, repo_root=anvil_repo)
 
     assert report.decision == Decision.KEEP
-    assert report.notes == ""
+    # The stray error is not in the notes -- that is what this case is about.
+    assert "eval failed" not in report.notes
+    assert "unjudgeable" not in report.notes
+    # The paired gate does say something, and it should: this fixture's report
+    # carries no per-row scores, so the noise check could not run and the
+    # frontier's decision stands unchecked. Asserting an empty notes field would
+    # require the gate to stay silent about being unchecked, which is the one
+    # thing it must not do.
+    assert "paired: no rows could be paired" in report.notes
 
 
 def test_round_records_the_error_rate_in_the_round_json(
