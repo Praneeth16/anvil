@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from anvil.eval.scorers import SCORER_SEMANTICS_VERSIONS
+from anvil.eval.scorers import REFUSAL_SCORER_NAME, SCORER_SEMANTICS_VERSIONS
 from anvil.runtime.models import ScorerConfig
 
 if TYPE_CHECKING:
@@ -48,7 +48,12 @@ if TYPE_CHECKING:
     from anvil.eval.runner import EvalReport
 
 
-def compute_scorer_fingerprint(scorer_configs: list[ScorerConfig]) -> str:
+def compute_scorer_fingerprint(
+    scorer_configs: list[ScorerConfig],
+    *,
+    judge_domain_name: str | None = None,
+    judge_domain_context: str | None = None,
+) -> str:
     """Compute a stable JSON fingerprint of the active scorer configs.
 
     Captures the full scorer specification (name, type, weight,
@@ -64,6 +69,14 @@ def compute_scorer_fingerprint(scorer_configs: list[ScorerConfig]) -> str:
     "compatible" and gone on being the bar the loop chased. Only scorers whose
     semantics have been versioned carry the key, so bumping one does not
     invalidate baselines for configs that do not use it.
+
+    ``judge_domain_name`` / ``judge_domain_context`` are folded into the refusal
+    scorer's entry for the same reason. They are the judge's own description of
+    the domain, and they are config rather than code, so a customized domain
+    context changes the verdicts that scorer returns while every field above
+    stays byte-identical. They are recorded only when set: ``None`` means the
+    shipped default is in use, so baselines cached before these keys existed
+    remain compatible.
 
     Storing the fingerprint in :class:`CachedBaseline` closes the
     comparability hole where a cached uniform-weight baseline stayed
@@ -82,6 +95,11 @@ def compute_scorer_fingerprint(scorer_configs: list[ScorerConfig]) -> str:
         semantics = SCORER_SEMANTICS_VERSIONS.get(c.name)
         if semantics is not None:
             spec["semantics"] = semantics
+        if c.name == REFUSAL_SCORER_NAME:
+            if judge_domain_name is not None:
+                spec["judge_domain_name"] = judge_domain_name
+            if judge_domain_context is not None:
+                spec["judge_domain_context"] = judge_domain_context
         specs.append(spec)
     specs.sort(key=lambda s: str(s["name"]))
     return json.dumps(specs, sort_keys=True)

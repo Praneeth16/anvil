@@ -7,6 +7,15 @@ Usage::
     uv run python scripts/evaluate.py --mode standard --profile my-workspace
     uv run python scripts/evaluate.py --mode full --include-safety
 
+To evaluate a different domain, point the three data flags at it. Nothing
+under ``src/`` needs to change::
+
+    uv run python scripts/evaluate.py \\
+        --scaffold examples/pyloom-docs/scaffold \\
+        --kb-dir examples/pyloom-docs/data/kb \\
+        --golden-set-path examples/pyloom-docs/data/golden_set.jsonl \\
+        --mode quick
+
 Persists the report to ``eval/runs/round_NNN.json`` (or to the path
 given by ``--out``).
 
@@ -48,6 +57,28 @@ def _arg_parser() -> argparse.ArgumentParser:
         default=str(REPO_ROOT / "scaffold"),
         help="path to scaffold/ directory",
     )
+    # The three data paths are what make a domain. They are anchored to
+    # REPO_ROOT rather than the cwd -- matching --scaffold above -- so the
+    # documented invocations work from any directory.
+    p.add_argument(
+        "--kb-dir",
+        default=str(REPO_ROOT / "data" / "kb"),
+        help="path to the knowledge-base directory of *.md docs",
+    )
+    p.add_argument(
+        "--golden-set-path",
+        default=str(REPO_ROOT / "data" / "golden_set.jsonl"),
+        help="path to the golden set JSONL",
+    )
+    p.add_argument(
+        "--evaluator-path",
+        default=None,
+        help=(
+            "path to the programmatic check-function module. Default: "
+            "data/evaluator.py, resolved by the scorer builder. Only read "
+            "when a programmatic scorer is configured."
+        ),
+    )
     p.add_argument(
         "--out",
         default=None,
@@ -81,6 +112,9 @@ def main(argv: list[str] | None = None) -> int:
 
     report = evaluate_branch(
         scaffold_root=args.scaffold,
+        kb_dir=args.kb_dir,
+        golden_set_path=args.golden_set_path,
+        evaluator_path=args.evaluator_path,
         profile=args.profile,
         mode=args.mode,
         include_safety=args.include_safety,

@@ -1559,7 +1559,11 @@ def evaluate_branch(
     aggregate_scorer_configs = list(cfg.scorers)
     aggregate_scorer_names = [c.name for c in aggregate_scorer_configs]
     weights = {c.name: c.weight for c in aggregate_scorer_configs}
-    scorer_fingerprint = compute_scorer_fingerprint(aggregate_scorer_configs)
+    scorer_fingerprint = compute_scorer_fingerprint(
+        aggregate_scorer_configs,
+        judge_domain_name=snapshot.config.judge_domain_name,
+        judge_domain_context=snapshot.config.judge_domain_context,
+    )
     active_scorer_configs = list(aggregate_scorer_configs)
     active_scorer_names = list(aggregate_scorer_names)
     if include_safety and "safety" not in active_scorer_names:
@@ -1571,6 +1575,8 @@ def evaluate_branch(
         judge_model=snapshot.config.judge_endpoint,
         scorer_configs=active_scorer_configs,
         evaluator_path=evaluator_path,
+        judge_domain_name=snapshot.config.judge_domain_name,
+        judge_domain_context=snapshot.config.judge_domain_context,
     )
     dataset = _build_dataset(selected)
 

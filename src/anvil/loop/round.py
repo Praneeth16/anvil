@@ -75,6 +75,9 @@ def run_round(
     round_id: int,
     repo_root: Path | str,
     scaffold_root: Path | str | None = None,
+    kb_dir: Path | str = "data/kb",
+    golden_set_path: Path | str = "data/golden_set.jsonl",
+    evaluator_path: Path | str | None = None,
     profile: str = "DEFAULT",
     parent_branch: str = "anvil/exp",
     eval_mode: str | None = None,
@@ -211,6 +214,9 @@ def run_round(
         try:
             eval_report = evaluate_branch(
                 scaffold_root=scaffold_root,
+                kb_dir=kb_dir,
+                golden_set_path=golden_set_path,
+                evaluator_path=evaluator_path,
                 profile=profile,
                 mode=eval_mode,
             )
