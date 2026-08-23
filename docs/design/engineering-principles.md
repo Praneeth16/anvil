@@ -1,3 +1,14 @@
+> **Superseded planning input, not current architecture.** This was written
+> before the code existed and proposes a layout ANVIL did not adopt: a root
+> `CONTEXT.md`, `docs/adr/`, and `src/harness/` + `src/optimizer/` +
+> `src/evaluator/`. The shipped structure is five planes under `src/anvil/`
+> (`docs/decisions.md` D6), and decisions live in `docs/decisions.md` rather
+> than one file per ADR. Its `/mattpocock-skills/...` references point at an
+> external skill library that is not vendored here.
+>
+> Kept because the reasoning is still useful. Follow `docs/decisions.md` for
+> what the project actually does.
+
 # Engineering Principles for Self-Mutating Agent Harness Rebuild
 
 Rebuilding a Python self-mutating agent harness into a world-class open-source library for Databricks.

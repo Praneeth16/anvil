@@ -47,9 +47,10 @@ next steps, read `docs/plan.md`.
 
 ## When proposing architecture changes
 
-- Cite MiniMax M2.7 (`research/minimax-m27-*.md`) if relevant — those
-  files are the authoritative reference the design is calibrated
-  against.
+- Cite MiniMax M2.7 if relevant — it is the reference the design is
+  calibrated against. The notes are **external and not vendored here**;
+  `research/` does not exist in this repo, so cite the decision in
+  `docs/decisions.md` rather than a path.
 - Call out explicitly when something would diverge from M2.7's pattern
   and why. Divergence is allowed; it just needs justification.
 

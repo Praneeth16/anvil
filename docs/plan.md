@@ -143,55 +143,59 @@ with it. MLflow exposes `Judge.align(traces, optimizer=None)` and
 judge against human labels on a handful of rows would shrink the noise floor
 that item 1 works around.
 
-### 3. A `ChatClient` protocol at the provider boundary
+### 3. Judge alignment
 
-`GatewayClient` is a duck-typed stand-in for `OpenAI`, exposed as
-`OpenAI | GatewayClient` or `OpenAI | None` and silenced in mypy
-(`docs/type-debt.md`). Define the protocol both satisfy, and the type checker
-starts seeing that boundary again. Unblocks deleting two entries from the
-`pyproject.toml` exemption ratchet.
+The unaligned LLM judge is the root cause of item 1, not merely correlated with
+it. MLflow exposes `Judge.align(traces, optimizer=None)` and
+`judges.AlignmentOptimizer` (`docs/verified-api-surface.md`). Aligning the judge
+against human labels on a handful of rows would shrink the noise floor that item
+1 works around.
 
-### 4. `MemorySystem.__init__` as a real contract
+**Blocked on labels, not on code.** Alignment needs human verdicts on real
+traces, and there is no honest way to synthesize those — a judge aligned against
+labels produced by a judge measures nothing. The prerequisite is a person
+labelling a few dozen rows from a live run.
 
-`eval/runner.py` instantiates code-mode agents as
-`cls(llm_client=..., model=...)`, but the `MemorySystem` ABC declares no
-`__init__`. A code-mode optimizer can therefore write a subclass with an
-incompatible signature, and the failure surfaces deep inside the eval as an
-infrastructure error rather than as a rejected candidate. Declare the
-constructor on the ABC and validate the candidate's signature in
-`optimizer/code_validation.py`, before the eval spends money.
+---
 
-### 5. Small, cheap type debt
+## Closed
 
-Each is itemised with its consequence in `docs/type-debt.md`:
+**Type debt (was items 3, 4, 5).** Measured rather than assumed: deleting the
+`disable_error_code` block showed 24 errors, and two were behaviour, not
+annotations. `ChatClient` is a protocol at the provider boundary — describing
+what ANVIL calls, because a protocol `openai.OpenAI` could also satisfy turns out
+to be impossible and the reason is recorded in `docs/type-debt.md`.
+`MemorySystem.__init__` is declared and checked during candidate validation, so a
+candidate the eval could not construct is rejected instead of failing inside the
+eval. The `source` constants are `Final[SourceTag]`. Four modules left the
+suppression block; the two that remain name only the codes they need, and all
+twelve remaining errors are MLflow's own typing.
 
-- `source` is `Literal["production","eval","optimizer"]` fed a bare `str`; a
-  typo in the default silently produces traces no observability query matches.
-- `eval/cache.py` sorts scorer fingerprints with a key that can return
-  `None`, which raises `TypeError` on comparison. Touches the gate.
-- `runtime/client.py` and `tools/search_knowledge_base.py` promise `str`
-  where a missing KB frontmatter field yields `None`.
+Two bugs fell out of it: code mode passed the *unresolved* client, so every
+code-mode round built its candidate with `llm_client=None` and scored a
+passthrough rather than an agent; and the KB frontmatter narrowing was covered by
+no test at all, so reverting it passed all 586.
 
-### 6. Stronger optimizer confinement
+**Optimizer confinement (was item 6).** Mostly already landed — the OS `sandbox`,
+the `allowed_tools` allowlist, `max_budget_usd` wiring the declared cost budget,
+and the typed permission result were all in place and the entry had gone stale.
+What was missing was the `PreToolUse` hook, now added as a second independent
+enforcement point for the same `ToolPolicy.decide`. Two enforcement points, one
+rule; the tests assert the two verdicts never disagree.
 
-`ClaudeAgentOptions` turns out to expose more than the current design uses:
-`sandbox: SandboxSettings` (OS-level, not policy-only), `allowed_tools` (an
-allowlist rather than a denylist), `hooks` as an independent interception
-point, and `max_budget_usd` / `task_budget` as hard ceilings
-(`docs/verified-api-surface.md`). Confinement can therefore be four
-independent layers instead of one callback plus post-hoc diff verification.
+**Licensing.** Apache-2.0, `LICENSE` verbatim. The bracketed
+`Copyright [yyyy] [name of copyright owner]` line is inside Apache's own APPENDIX
+— instructions for applying the license, not a field to fill in — so it stays as
+shipped and no owner is asserted. No `NOTICE` file: Apache-2.0 requires one only
+if the work already carries attribution notices, and nothing here does.
 
-### 7. Reusability queue
+**`CONTRIBUTING.md`.** Written.
 
-- `CONTRIBUTING.md` — not yet written.
-- Licensing is settled: Apache-2.0, `LICENSE` verbatim. The bracketed
-  `Copyright [yyyy] [name of copyright owner]` line is inside Apache's own
-  APPENDIX — instructions for applying the license, not a field to fill in —
-  so it stays as shipped, and no owner is asserted anywhere. No `NOTICE` file:
-  Apache-2.0 only requires one if the work already carries attribution
-  notices, and nothing here does.
-- `research/minimax-m27-*.md` is cited by `docs/decisions.md` D4 and
-  `CLAUDE.md` but is not in the repository.
+**The `research/minimax-m27-*.md` citations.** The files exist nowhere, so
+`docs/decisions.md` D4 and `CLAUDE.md` now say the reference is external and not
+vendored, and point at the decision instead of a dead path. Writing the files
+would have meant inventing an "authoritative reference", which is worse than a
+missing one.
 
 ---
 

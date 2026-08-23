@@ -77,7 +77,9 @@ bespoke table).
 an LLM edits well, what `git diff` renders reviewably, and what a human can
 inspect after the fact. A scaffold in Delta would give up all three for
 nothing — there is no query workload over it. Follows the MiniMax M2.7
-reference pattern (`research/minimax-m27-*.md`).
+reference pattern, which is an external reference and is **not vendored here** --
+cite this decision rather than a `research/` path, which does not exist in the
+repository.
 
 **Rules out.** A Delta table for scaffold content. Lakebase for anything in
 current scope — reconsider only if high-QPS per-conversation runtime memory
