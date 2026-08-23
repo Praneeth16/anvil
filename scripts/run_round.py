@@ -64,6 +64,25 @@ def _arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="eval mode for the post-mutation eval",
     )
+    # The domain the round is optimized against. These must match whatever
+    # eval/runs/baseline.json was generated from -- the gate compares the
+    # round's aggregate against that cached number without re-checking which
+    # domain produced it.
+    p.add_argument(
+        "--kb-dir",
+        default=str(REPO_ROOT / "data" / "kb"),
+        help="path to the knowledge-base directory of *.md docs",
+    )
+    p.add_argument(
+        "--golden-set-path",
+        default=str(REPO_ROOT / "data" / "golden_set.jsonl"),
+        help="path to the golden set JSONL",
+    )
+    p.add_argument(
+        "--evaluator-path",
+        default=None,
+        help="path to the programmatic check-function module (default: data/evaluator.py)",
+    )
     p.add_argument(
         "--max-turns",
         type=int,
@@ -122,6 +141,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Create it first: git -C {REPO_ROOT} checkout -b {args.parent_branch} main")
         return ExitCode.ERROR
 
+    # Validate the domain before the first billed session. These paths are not
+    # touched until step 6 of the round, deep inside the try/except that records
+    # INFRA_FAIL and keeps looping -- so `--rounds 50` with a mistyped --kb-dir
+    # spends fifty optimizer sessions to produce fifty identical failures.
+    kb_dir = Path(args.kb_dir)
+    if not kb_dir.is_dir() or not any(kb_dir.glob("*.md")):
+        print(f"ERROR: --kb-dir {kb_dir} is not a directory containing *.md documents.")
+        return ExitCode.ERROR
+    golden_set_path = Path(args.golden_set_path)
+    if not golden_set_path.is_file():
+        print(f"ERROR: --golden-set-path {golden_set_path} does not exist.")
+        return ExitCode.ERROR
+    if args.evaluator_path is not None and not Path(args.evaluator_path).is_file():
+        print(f"ERROR: --evaluator-path {args.evaluator_path} does not exist.")
+        return ExitCode.ERROR
+
     next_id = args.round_id if args.round_id is not None else _next_round_id(REPO_ROOT)
 
     unjudged: list[str] = []
@@ -132,6 +167,9 @@ def main(argv: list[str] | None = None) -> int:
         report = run_round(
             round_id=rid,
             repo_root=REPO_ROOT,
+            kb_dir=args.kb_dir,
+            golden_set_path=args.golden_set_path,
+            evaluator_path=args.evaluator_path,
             profile=args.profile,
             parent_branch=args.parent_branch,
             eval_mode=args.eval_mode,

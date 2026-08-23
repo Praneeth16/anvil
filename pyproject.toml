@@ -3,6 +3,8 @@ name = "anvil"
 version = "0.2.0"
 description = "ANVIL — self-mutating agent harness on Databricks. Runtime + Eval + Optimizer + Loop, 5 planes physically separated."
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "databricks-sdk>=0.40.0",
@@ -37,7 +39,11 @@ optimizer = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+# >=1.27 for PEP 639: the `license = "Apache-2.0"` SPDX string and
+# `license-files` above are only understood from that version on. Pinned so a
+# stale backend fails with a clear resolution error rather than a confusing
+# metadata one.
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 # Pin the package index to public PyPI at the *project* level, so the lockfile

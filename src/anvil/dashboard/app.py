@@ -1,4 +1,4 @@
-"""Streamlit dashboard for FORGE frontier visualization.
+"""Streamlit dashboard for ANVIL frontier visualization.
 
 Run with: streamlit run src/anvil/dashboard/app.py -- /path/to/anvil
 """
@@ -26,7 +26,7 @@ def main() -> None:
     import plotly.express as px
     import streamlit as st
 
-    st.title("FORGE Frontier Dashboard")
+    st.title("ANVIL Frontier Dashboard")
     default = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(".")
     repo_root = Path(st.sidebar.text_input("Repository root", str(default)))
     frontier = load_frontier(repo_root)

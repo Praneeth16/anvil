@@ -20,7 +20,11 @@ from pathlib import Path
 import yaml
 
 from anvil.eval import evaluate_branch, load_baseline
-from anvil.eval.cache import scorer_incomparability_reason
+from anvil.eval.cache import (
+    compute_dataset_fingerprint,
+    dataset_incomparability_reason,
+    scorer_incomparability_reason,
+)
 from anvil.eval.judgeability import unjudgeable_reason_for
 from anvil.loop.builder import build_round_prompt
 from anvil.loop.decision import Decision
@@ -46,7 +50,7 @@ from anvil.optimizer import (
     apply_action,
     run_optimizer_session,
 )
-from anvil.optimizer.policy import ToolPolicy
+from anvil.optimizer.policy import DEFAULT_SECRET_PATHS, ToolPolicy
 from anvil.runtime.loader import default_runtime_config_path, load_eval_config
 
 
@@ -70,11 +74,54 @@ class RoundReport:
     notes: str = ""
 
 
+def _secret_paths(
+    repo_root: Path,
+    golden_set_path: Path | str,
+    evaluator_path: Path | str | None,
+) -> tuple[str, ...]:
+    """The paths this round's optimizer may neither read nor write.
+
+    ``ToolPolicy``'s defaults name the built-in domain's answer key and
+    evaluator by literal relative path, and ``is_secret`` is exact-path
+    equality. That was airtight while the domain was a constant. It stopped
+    being so the moment ``--golden-set-path`` existed: a second domain inside
+    the repo -- exactly the ``examples/`` layout -- put its golden set at a path
+    the policy had never heard of, so the session could ``Read`` the
+    ``reference_answer``, ``must_include`` and ``notes_for_judge`` for every
+    case it was about to be graded on. Reward hacking cheat #1 in
+    :mod:`anvil.optimizer.policy`, and one that ``verify_changed_paths`` cannot
+    catch afterwards because a read leaves no diff.
+
+    The defaults are kept alongside the resolved paths rather than replaced:
+    protecting the built-in domain costs nothing while running another one, and
+    a typo in ``--golden-set-path`` must not silently unprotect the real answer
+    key. Paths outside the repo are dropped -- ``is_inside_root`` already denies
+    those, and a relative-path secret set cannot express them.
+    """
+    resolved_root = repo_root.resolve()
+    out: list[str] = list(DEFAULT_SECRET_PATHS)
+    for candidate in (golden_set_path, evaluator_path):
+        if candidate is None:
+            continue
+        path = Path(candidate)
+        path = path if path.is_absolute() else repo_root / path
+        try:
+            rel = path.resolve().relative_to(resolved_root).as_posix()
+        except ValueError:
+            continue
+        if rel not in out:
+            out.append(rel)
+    return tuple(out)
+
+
 def run_round(
     *,
     round_id: int,
     repo_root: Path | str,
     scaffold_root: Path | str | None = None,
+    kb_dir: Path | str = "data/kb",
+    golden_set_path: Path | str = "data/golden_set.jsonl",
+    evaluator_path: Path | str | None = None,
     profile: str = "DEFAULT",
     parent_branch: str = "anvil/exp",
     eval_mode: str | None = None,
@@ -100,7 +147,7 @@ def run_round(
     optimizer_endpoint = _read_optimizer_endpoint(scaffold_root)
     cost_budget_usd = _read_cost_budget_usd(scaffold_root)
     eval_cfg = load_eval_config(scaffold_root)
-    policy = ToolPolicy(root=repo_root)
+    policy = ToolPolicy(root=repo_root, secret_paths=_secret_paths(repo_root, golden_set_path, evaluator_path))
     print(f"[round {round_id}] mode={mode}")
 
     _starting_branch = current_branch(repo_root)
@@ -113,6 +160,24 @@ def run_round(
     # `--allow-dirty` exists and leftover round artifacts are common; blaming
     # the optimizer for a file it never touched would fail rounds at random.
     pre_session_dirt = set(changed_paths(repo_root))
+
+    # Refuse an incomparable baseline BEFORE spending anything. The same check
+    # runs again after the eval, against the fingerprint the eval actually
+    # produced, and that one is authoritative -- but reaching it costs an
+    # optimizer session and a full eval first, and the answer here is already
+    # knowable from local files. Without this, pointing a 50-round run at a new
+    # domain burns a round to learn the baseline does not apply, fifty times.
+    if baseline is not None:
+        pre_flight = dataset_incomparability_reason(
+            baseline,
+            dataset_fingerprint=compute_dataset_fingerprint(kb_dir, golden_set_path),
+        )
+        if pre_flight:
+            raise RuntimeError(
+                f"{pre_flight} — regenerate the baseline for this domain with "
+                "scripts/make_baseline.py, passing the same --kb-dir and "
+                "--golden-set-path this round will use"
+            )
 
     # 1. Branch off the parent.
     branch = create_round_branch(repo_root, round_id, parent_branch=parent_branch)
@@ -211,6 +276,9 @@ def run_round(
         try:
             eval_report = evaluate_branch(
                 scaffold_root=scaffold_root,
+                kb_dir=kb_dir,
+                golden_set_path=golden_set_path,
+                evaluator_path=evaluator_path,
                 profile=profile,
                 mode=eval_mode,
             )
@@ -272,7 +340,12 @@ def run_round(
     # fixed -- leaving the copy that actually gates keep/revert on the old
     # behaviour. One definition, consulted by both.
     if baseline is not None and eval_report is not None:
-        incomparable = scorer_incomparability_reason(
+        # Dataset first: comparing aggregates measured on different questions is
+        # a worse error than comparing ones measured by differently-weighted
+        # scorers, and its message should be the one the operator sees.
+        incomparable = dataset_incomparability_reason(
+            baseline, dataset_fingerprint=eval_report.dataset_fingerprint
+        ) or scorer_incomparability_reason(
             baseline,
             scorers=list(eval_report.scorers),
             scorer_fingerprint=eval_report.scorer_fingerprint,

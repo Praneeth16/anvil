@@ -35,6 +35,25 @@ def _arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=["test"], default="test")
     parser.add_argument("--profile", default="DEFAULT", help="Databricks CLI profile")
     parser.add_argument("--scaffold", default=str(REPO_ROOT / "scaffold"), help="path to scaffold/")
+    # The held-out score is the single highest-stakes number the harness
+    # produces and the file is single-use, so it must be possible to point it
+    # at the same domain the rounds ran against -- silently finalizing against
+    # data/ while the rounds used another domain would lock in a wrong number.
+    parser.add_argument(
+        "--kb-dir",
+        default=str(REPO_ROOT / "data" / "kb"),
+        help="path to the knowledge-base directory of *.md docs",
+    )
+    parser.add_argument(
+        "--golden-set-path",
+        default=str(REPO_ROOT / "data" / "golden_set.jsonl"),
+        help="path to the golden set JSONL",
+    )
+    parser.add_argument(
+        "--evaluator-path",
+        default=None,
+        help="path to the programmatic check-function module (default: data/evaluator.py)",
+    )
     parser.add_argument("--out", default=None, help=f"default: {DEFAULT_OUT_REL}")
     parser.add_argument("--include-safety", action="store_true")
     return parser
@@ -58,6 +77,9 @@ def finalize(
     *,
     repo_root: Path | str,
     scaffold_root: Path | str,
+    kb_dir: Path | str = "data/kb",
+    golden_set_path: Path | str = "data/golden_set.jsonl",
+    evaluator_path: Path | str | None = None,
     profile: str = "DEFAULT",
     mode: str = "test",
     include_safety: bool = False,
@@ -77,6 +99,9 @@ def finalize(
     report: EvalReport = evaluate_branch(
         scaffold_root=scaffold_root,
         runtime_config_path=config_path,
+        kb_dir=kb_dir,
+        golden_set_path=golden_set_path,
+        evaluator_path=evaluator_path,
         profile=profile,
         mode=mode,
         allow_test=True,
@@ -115,6 +140,9 @@ def main(argv: list[str] | None = None) -> int:
         payload = finalize(
             repo_root=REPO_ROOT,
             scaffold_root=args.scaffold,
+            kb_dir=args.kb_dir,
+            golden_set_path=args.golden_set_path,
+            evaluator_path=args.evaluator_path,
             profile=args.profile,
             mode=args.mode,
             include_safety=args.include_safety,

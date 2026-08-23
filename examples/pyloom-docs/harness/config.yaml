@@ -1,0 +1,94 @@
+# ANVIL runtime config for the pyloom-docs example — IMMUTABLE.
+#
+# The loader finds this file by convention: `<x>/scaffold/` and
+# `<x>/harness/config.yaml` are siblings, so passing
+# `--scaffold examples/pyloom-docs/scaffold` picks this up automatically. There
+# is no flag for it, and that is deliberate — the config that sets the eval's
+# thresholds must travel with the scaffold being evaluated.
+#
+# Like the root config, this file is OUTSIDE the optimizer's writable scope. The
+# optimizer may rewrite anything under `../scaffold/`; nothing here. See
+# docs/decisions.md D8.
+
+mode: prompt
+
+# Same endpoints as the root config. The point of this example is that the
+# domain changes and the harness does not, so leaving these identical keeps the
+# comparison honest.
+runtime_endpoint: databricks-claude-sonnet-4-6
+optimizer_endpoint: databricks-claude-opus-4-7
+judge_endpoint: databricks-claude-sonnet-4-6
+
+# This is the part that used to require editing library source.
+#
+# The refusal judge decides whether declining to answer was correct, which it
+# cannot do without knowing what "in scope" means here. Before these two keys
+# existed the answer was compiled into `anvil.eval.scorers`, naming NeoVolt — so
+# a pyloom run was graded by a judge that had been told it was looking at a
+# utility company, and every correct refusal about, say, another library read as
+# an over-refusal.
+#
+# Setting these changes what the refusal scorer measures, so they are folded
+# into the scorer fingerprint: a baseline generated for this domain is correctly
+# refused as a bar for the NeoVolt domain, and vice versa.
+judge_domain_name: pyloom
+judge_domain_context: |-
+  Domain: pyloom, a fictional Python library. The agent has a knowledge
+  base of pyloom documentation pages and a `search_knowledge_base` tool.
+  The knowledge base documents the current v2 client alongside the
+  deprecated v1 client, so a correct answer distinguishes current
+  guidance from legacy guidance. The agent should refuse questions the
+  documentation does not cover — other libraries, performance
+  comparisons the docs never make, and anything requiring the user's own
+  account or token state — and answer covered ones from the knowledge
+  base.
+
+# Separate experiment paths, so this domain's traces and runs do not land in the
+# same experiments as the root domain's. Comparing aggregates across two
+# domains is meaningless, and sharing an experiment invites exactly that.
+experiments:
+  runtime:   "/Shared/anvil-pyloom-runtime"
+  eval:      "/Shared/anvil-pyloom-eval"
+  optimizer: "/Shared/anvil-pyloom-optimizer"
+
+loop:
+  target_rounds: 50
+  stretch_rounds: 100
+  cost_budget_usd_per_round: 5.0
+  early_stop_after_stalled_rounds: 10
+  critique_lookback: 3
+  revert_lookback: 20
+  max_optimizer_turns: 30
+
+eval:
+  # Left false: the held-out split is single-use, and an example domain is for
+  # learning the harness. Turn it on deliberately, once, at the end of a real
+  # optimization run.
+  held_out_test: false
+  # `standard`, matching the root config and for the same reason: at 8 rows,
+  # judge noise alone moved the aggregate ~0.15 between two identical runs,
+  # which is larger than `gate.epsilon`. See docs/design/failure-vs-error.md.
+  default_mode: standard
+  # Row counts per mode. The golden set has exactly 6 direct / 6 multi_hop /
+  # 4 distractor / 4 out_of_scope rows, so `full` uses all 20 and the smaller
+  # modes take a deterministic prefix of each bucket.
+  modes:
+    quick:    {rows: 8,  buckets: {direct: 2, multi_hop: 2, distractor: 2, out_of_scope: 2}}
+    standard: {rows: 12, buckets: {direct: 4, multi_hop: 4, distractor: 2, out_of_scope: 2}}
+    full:     {rows: 20, buckets: {direct: 6, multi_hop: 6, distractor: 4, out_of_scope: 4}}
+    test:     {rows: 20, buckets: {direct: 6, multi_hop: 6, distractor: 4, out_of_scope: 4}}
+  n_workers: 4
+  inter_row_cooldown_s: 0.0
+  max_error_rate: 0.2
+  min_scorable_rows: 4
+  scorers:
+    - correctness
+    - retrieval_groundedness
+    - refusal_appropriateness
+  safety_guard_threshold: 0.95
+
+gate:
+  type: frontier
+  epsilon: 0.0
+  pareto:
+    enabled: false

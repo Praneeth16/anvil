@@ -60,7 +60,7 @@ except ImportError:
 
 from anvil.agents.memory_system import MemorySystem
 from anvil.data import load_golden_set, select_subset
-from anvil.eval.cache import compute_scorer_fingerprint
+from anvil.eval.cache import compute_dataset_fingerprint, compute_scorer_fingerprint
 from anvil.eval.outcome import (
     Attempt,
     CaseOutcome,
@@ -143,6 +143,12 @@ class EvalReport:
     # comparison even when scorer names are unchanged. Empty when the
     # report is built by code that predates this field.
     scorer_fingerprint: str = ""
+    # Content fingerprint of the kb + golden set this report was measured on.
+    # Carried into ``CachedBaseline`` for the same reason as the scorer
+    # fingerprint: without it a baseline from one domain compares as compatible
+    # with a round evaluated against another, because every other recorded field
+    # is identical and only the questions changed.
+    dataset_fingerprint: str = ""
 
     @property
     def error_rate(self) -> float:
@@ -486,6 +492,7 @@ def _aggregate_report(
     experiment_id: str,
     mode: str,
     scorer_fingerprint: str = "",
+    dataset_fingerprint: str = "",
     errored: dict[str, str] | None = None,
     n_dropped_rows: int = 0,
     attempted_examples: list[dict] | None = None,
@@ -728,6 +735,7 @@ def _aggregate_report(
             "n_rows": float(n_rows + n_dropped_rows),
         },
         scorer_fingerprint=scorer_fingerprint,
+        dataset_fingerprint=dataset_fingerprint,
     )
 
 
@@ -742,7 +750,7 @@ def _import_agent_module(module_path: str) -> ModuleType:
     A dotted path (e.g. ``anvil.agents.baseline``) is resolved via
     :func:`importlib.import_module`. A path containing a separator or
     ending in ``.py`` is loaded from disk via ``spec_from_file_location``
-    — this is how FORGE loads candidate modules the optimizer just wrote
+    — this is how ANVIL loads candidate modules the optimizer just wrote
     to ``agents/`` that are not yet installed packages.
     """
     if module_path.endswith(".py") or "/" in module_path or os.sep in module_path:
@@ -1559,7 +1567,12 @@ def evaluate_branch(
     aggregate_scorer_configs = list(cfg.scorers)
     aggregate_scorer_names = [c.name for c in aggregate_scorer_configs]
     weights = {c.name: c.weight for c in aggregate_scorer_configs}
-    scorer_fingerprint = compute_scorer_fingerprint(aggregate_scorer_configs)
+    scorer_fingerprint = compute_scorer_fingerprint(
+        aggregate_scorer_configs,
+        judge_domain_name=snapshot.config.judge_domain_name,
+        judge_domain_context=snapshot.config.judge_domain_context,
+    )
+    dataset_fingerprint = compute_dataset_fingerprint(kb_dir, golden_set_path)
     active_scorer_configs = list(aggregate_scorer_configs)
     active_scorer_names = list(aggregate_scorer_names)
     if include_safety and "safety" not in active_scorer_names:
@@ -1571,6 +1584,8 @@ def evaluate_branch(
         judge_model=snapshot.config.judge_endpoint,
         scorer_configs=active_scorer_configs,
         evaluator_path=evaluator_path,
+        judge_domain_name=snapshot.config.judge_domain_name,
+        judge_domain_context=snapshot.config.judge_domain_context,
     )
     dataset = _build_dataset(selected)
 
@@ -1675,6 +1690,7 @@ def evaluate_branch(
         experiment_id=experiment.experiment_id if experiment else "",
         mode=selected_mode,
         scorer_fingerprint=scorer_fingerprint,
+        dataset_fingerprint=dataset_fingerprint,
         errored=errored,
         n_dropped_rows=n_dropped,
         attempted_examples=selected,

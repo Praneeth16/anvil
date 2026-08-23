@@ -351,7 +351,7 @@ class RuntimeYAML(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    # Optimization mode — what FORGE mutates.
+    # Optimization mode — what ANVIL mutates.
     #   prompt — prompt scaffolds (skills/rules/sampling in markdown + YAML).
     #            The default; backward compatible with all existing rounds.
     #   code   — agent Python code (MemorySystem subclasses in agents/).
@@ -371,10 +371,43 @@ class RuntimeYAML(BaseModel):
     runtime_endpoint: str  # FMAPI model for the runtime agent
     optimizer_endpoint: str  # FMAPI model for the optimizer
     judge_endpoint: str  # FMAPI model for the judge
+    # The refusal judge's description of the domain it grades. ``None`` means
+    # "use the shipped NeoVolt defaults" (``anvil.eval.scorers``), which keeps
+    # every prompt and every cached baseline byte-identical. Set both to grade a
+    # different domain without editing library code -- see examples/.
+    #
+    # These live here, in the IMMUTABLE file, and not in scaffold/: the
+    # optimizer is graded by this judge and must not be able to rewrite it.
+    judge_domain_name: str | None = None
+    judge_domain_context: str | None = None
     experiments: ExperimentsConfig
     loop: LoopConfig = Field(default_factory=LoopConfig)
     eval: EvalConfig = Field(default_factory=EvalConfig)
     gate: GateConfig = Field(default_factory=GateConfig)
+
+    @model_validator(mode="after")
+    def _judge_domain_is_both_or_neither(self) -> RuntimeYAML:
+        """Reject setting one judge-domain key without the other.
+
+        They are interpolated into different parts of the same prompt, and each
+        falls back to the shipped NeoVolt default independently. So setting only
+        ``judge_domain_context`` -- the substantial one, and the one anyone
+        reaches for first -- produces a judge told it is grading a Python library
+        that still offers "I can only help with NeoVolt-related questions" as its
+        example of a refusal. Nothing downstream can detect that; the refusal
+        score simply becomes wrong.
+        """
+        name, context = self.judge_domain_name, self.judge_domain_context
+        if (name is None) != (context is None):
+            missing = "judge_domain_name" if name is None else "judge_domain_context"
+            present = "judge_domain_context" if name is None else "judge_domain_name"
+            raise ValueError(
+                f"{present} is set but {missing} is not: both are interpolated into "
+                "the refusal judge's prompt and each falls back to the shipped "
+                "default separately, so setting one leaves the other describing a "
+                f"different domain. Set {missing} too, or neither."
+            )
+        return self
 
 
 class HarnessConfig(BaseModel):
@@ -385,6 +418,8 @@ class HarnessConfig(BaseModel):
     runtime_endpoint: str
     optimizer_endpoint: str
     judge_endpoint: str
+    judge_domain_name: str | None = None
+    judge_domain_context: str | None = None
     experiments: ExperimentsConfig
     sampling: SamplingConfig = Field(default_factory=SamplingConfig)
     skills: list[SkillRef] = Field(default_factory=list)
@@ -402,6 +437,8 @@ class HarnessConfig(BaseModel):
             runtime_endpoint=runtime.runtime_endpoint,
             optimizer_endpoint=runtime.optimizer_endpoint,
             judge_endpoint=runtime.judge_endpoint,
+            judge_domain_name=runtime.judge_domain_name,
+            judge_domain_context=runtime.judge_domain_context,
             experiments=runtime.experiments,
             sampling=scaffold.sampling,
             skills=list(scaffold.skills),
@@ -423,6 +460,8 @@ RUNTIME_FIELDS: frozenset[str] = frozenset(
         "runtime_endpoint",
         "optimizer_endpoint",
         "judge_endpoint",
+        "judge_domain_name",
+        "judge_domain_context",
         "experiments",
         "loop",
         "eval",

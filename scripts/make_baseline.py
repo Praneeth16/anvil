@@ -70,6 +70,24 @@ def _arg_parser() -> argparse.ArgumentParser:
         default=str(REPO_ROOT / "scaffold"),
         help="path to scaffold/ directory",
     )
+    # Must accept the same three data paths as scripts/evaluate.py: a baseline
+    # cached from one domain is meaningless as the bar for rounds evaluated
+    # against another.
+    p.add_argument(
+        "--kb-dir",
+        default=str(REPO_ROOT / "data" / "kb"),
+        help="path to the knowledge-base directory of *.md docs",
+    )
+    p.add_argument(
+        "--golden-set-path",
+        default=str(REPO_ROOT / "data" / "golden_set.jsonl"),
+        help="path to the golden set JSONL",
+    )
+    p.add_argument(
+        "--evaluator-path",
+        default=None,
+        help="path to the programmatic check-function module (default: data/evaluator.py)",
+    )
     p.add_argument(
         "--include-safety",
         action="store_true",
@@ -116,6 +134,9 @@ def build_baseline(
     *,
     scaffold_root: Path | str,
     runtime_config_path: Path | str | None = None,
+    kb_dir: Path | str = "data/kb",
+    golden_set_path: Path | str = "data/golden_set.jsonl",
+    evaluator_path: Path | str | None = None,
     profile: str = "DEFAULT",
     mode: str | None = None,
     include_safety: bool = False,
@@ -141,6 +162,9 @@ def build_baseline(
     report = evaluate_branch(
         scaffold_root=scaffold_path,
         runtime_config_path=runtime_path,
+        kb_dir=kb_dir,
+        golden_set_path=golden_set_path,
+        evaluator_path=evaluator_path,
         profile=profile,
         mode=mode,
         include_safety=include_safety,
@@ -178,6 +202,9 @@ def main(argv: list[str] | None = None) -> int:
 
     baseline = build_baseline(
         scaffold_root=args.scaffold,
+        kb_dir=args.kb_dir,
+        golden_set_path=args.golden_set_path,
+        evaluator_path=args.evaluator_path,
         profile=args.profile,
         mode=args.mode,
         include_safety=args.include_safety,

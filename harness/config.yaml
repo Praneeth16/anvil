@@ -12,7 +12,7 @@
 # Anything mutation-worthy (sampling, skills, rules, tools) lives in
 # `scaffold/harness.yaml`.
 
-# Optimization mode — what FORGE mutates.
+# Optimization mode — what ANVIL mutates.
 #   prompt — prompt scaffolds (skills/rules/sampling in markdown + YAML).
 #            The default; backward compatible with all existing rounds.
 #   code   — agent Python code (MemorySystem subclasses in agents/).
@@ -41,6 +41,26 @@ optimizer_endpoint: databricks-claude-opus-4-7
 # client as the runtime agent. Kept separate so a future round can pin
 # a different judge model.
 judge_endpoint: databricks-claude-sonnet-4-6
+
+# The refusal judge's own description of the domain it is grading. Left unset
+# here, which means the shipped NeoVolt defaults in `anvil.eval.scorers` are
+# used and the judge prompt is byte-for-byte what it has always been.
+#
+# Set both to grade a different domain without touching library code. See
+# `examples/` for a worked case, and note the consequence: these two strings
+# change what the refusal judge measures, so they are folded into the scorer
+# fingerprint and setting them INVALIDATES `eval/runs/baseline.json` by design.
+# Regenerate the baseline with scripts/make_baseline.py after changing them.
+#
+# They live in this file, not in `scaffold/`, because the optimizer is graded by
+# this judge and must not be able to rewrite its own grader.
+#
+# judge_domain_name: NeoVolt
+# judge_domain_context: |-
+#   Domain: NeoVolt, a fictional electricity & gas utility. The agent
+#   has a knowledge base of NeoVolt policies and a `search_knowledge_base`
+#   tool. The agent should refuse out-of-scope or unanswerable questions
+#   and answer in-scope ones using the knowledge base.
 
 # MLflow experiment paths. Stable, declared here, NOT driven by
 # environment variables (which lint/format passes have historically

@@ -1,7 +1,7 @@
 """Baseline ``MemorySystem``: direct LLM call with no memory or retrieval.
 
 The simplest code-mode agent. It demonstrates the ``MemorySystem`` ABC
-and serves as the starting point that FORGE's optimizer mutates from.
+and serves as the starting point that ANVIL's optimizer mutates from.
 No retrieval, no learning — just a passthrough to the LLM (or, when no
 client is injected, a literal echo of the input, which makes it testable
 without any external service).

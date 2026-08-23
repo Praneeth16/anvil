@@ -1,0 +1,31 @@
+sampling:
+  temperature: 0.3
+  top_p: null
+  max_tokens: 2048
+  tool_choice: auto
+  max_tool_calls: 3
+skills:
+- file: identity.md
+- file: answer_with_citation.md
+- file: deprecation.md
+- file: escalation.md
+rules:
+- file: citation_discipline.md
+- file: scope_discipline.md
+tools:
+- name: search_knowledge_base
+  description: 'Search the Pyloom documentation knowledge base by natural-language
+
+    query. Returns the top-k matching documentation pages, each with doc_id,
+
+    title, and a snippet of the body. Use it for Pyloom installation, clients,
+
+    authentication, migration, retries, errors, streaming, pagination, timeouts,
+
+    logging, and version-support questions. Prefer current v2 guidance when
+
+    current and deprecated pages both match. If the result is "No matching
+
+    policy documents." say that the Pyloom docs do not cover the question.
+
+    '

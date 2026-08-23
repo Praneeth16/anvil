@@ -32,12 +32,18 @@ refreshed before producing a delta.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from anvil.eval.scorers import SCORER_SEMANTICS_VERSIONS
+from anvil.eval.scorers import (
+    DEFAULT_JUDGE_DOMAIN_CONTEXT,
+    DEFAULT_JUDGE_DOMAIN_NAME,
+    REFUSAL_SCORER_NAME,
+    SCORER_SEMANTICS_VERSIONS,
+)
 from anvil.runtime.models import ScorerConfig
 
 if TYPE_CHECKING:
@@ -48,7 +54,12 @@ if TYPE_CHECKING:
     from anvil.eval.runner import EvalReport
 
 
-def compute_scorer_fingerprint(scorer_configs: list[ScorerConfig]) -> str:
+def compute_scorer_fingerprint(
+    scorer_configs: list[ScorerConfig],
+    *,
+    judge_domain_name: str | None = None,
+    judge_domain_context: str | None = None,
+) -> str:
     """Compute a stable JSON fingerprint of the active scorer configs.
 
     Captures the full scorer specification (name, type, weight,
@@ -64,6 +75,14 @@ def compute_scorer_fingerprint(scorer_configs: list[ScorerConfig]) -> str:
     "compatible" and gone on being the bar the loop chased. Only scorers whose
     semantics have been versioned carry the key, so bumping one does not
     invalidate baselines for configs that do not use it.
+
+    ``judge_domain_name`` / ``judge_domain_context`` are folded into the refusal
+    scorer's entry for the same reason. They are the judge's own description of
+    the domain, and they are config rather than code, so a customized domain
+    context changes the verdicts that scorer returns while every field above
+    stays byte-identical. They are recorded only when set: ``None`` means the
+    shipped default is in use, so baselines cached before these keys existed
+    remain compatible.
 
     Storing the fingerprint in :class:`CachedBaseline` closes the
     comparability hole where a cached uniform-weight baseline stayed
@@ -82,9 +101,86 @@ def compute_scorer_fingerprint(scorer_configs: list[ScorerConfig]) -> str:
         semantics = SCORER_SEMANTICS_VERSIONS.get(c.name)
         if semantics is not None:
             spec["semantics"] = semantics
+        if c.name == REFUSAL_SCORER_NAME:
+            # Resolve through the same ``or`` fallback ``build_scorers`` uses, then
+            # record only what actually differs from the shipped default. Testing
+            # ``is not None`` instead would make writing the default text into
+            # harness/config.yaml -- a no-op edit that renders a byte-identical
+            # prompt -- invalidate the baseline and abort the next round after it
+            # had already paid for an optimizer session and a full eval. It would
+            # also disagree with ``build_scorers`` on the empty string.
+            effective_name = judge_domain_name or DEFAULT_JUDGE_DOMAIN_NAME
+            effective_context = judge_domain_context or DEFAULT_JUDGE_DOMAIN_CONTEXT
+            if effective_name != DEFAULT_JUDGE_DOMAIN_NAME:
+                spec["judge_domain_name"] = effective_name
+            if effective_context != DEFAULT_JUDGE_DOMAIN_CONTEXT:
+                spec["judge_domain_context"] = effective_context
         specs.append(spec)
     specs.sort(key=lambda s: str(s["name"]))
     return json.dumps(specs, sort_keys=True)
+
+
+def compute_dataset_fingerprint(
+    kb_dir: Path | str,
+    golden_set_path: Path | str,
+) -> str:
+    """Content fingerprint of the domain an eval measured.
+
+    The scorer fingerprint captures how the agent is graded. This captures *what
+    it is graded on*, which nothing recorded until the domain became a
+    parameter. Without it a baseline cached from one domain compares as
+    perfectly compatible with a round evaluated against another: the mode,
+    scorer names, endpoints and scorer fingerprint are all identical, and only
+    the questions changed. Fifty rounds would then be kept or reverted against a
+    bar measured on different data, and the highest-stakes artifact --
+    ``eval/runs/finalized.json``, single-use and write-once -- would record that
+    with nothing on disk to show it.
+
+    Content-based rather than path-based, and so machine-independent: two
+    checkouts agree, while editing a single golden row or knowledge-base
+    document correctly invalidates the baseline, because it changed what is
+    being measured.
+
+    Returns ``""`` when either path is missing, which keeps the field's
+    "absent means unchecked" contract rather than inventing a fingerprint for a
+    domain that could not be read.
+    """
+    kb_path, golden_path = Path(kb_dir), Path(golden_set_path)
+    if not kb_path.is_dir() or not golden_path.is_file():
+        return ""
+    digest = hashlib.sha256()
+    digest.update(golden_path.read_bytes())
+    # Sorted by name so filesystem ordering cannot change the fingerprint.
+    for doc in sorted(kb_path.glob("*.md")):
+        digest.update(b"\0")
+        digest.update(doc.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(doc.read_bytes())
+    return f"sha256:{digest.hexdigest()[:32]}"
+
+
+def dataset_incomparability_reason(
+    cached: CachedBaseline,
+    *,
+    dataset_fingerprint: str = "",
+) -> str:
+    """Why ``cached`` was measured on a different domain, or ``""``.
+
+    Absent on either side means unchecked, exactly as
+    :func:`scorer_incomparability_reason` treats an absent scorer fingerprint:
+    every baseline written before this field existed stays usable, and no
+    live re-run is forced by adding it.
+    """
+    if not cached.dataset_fingerprint or not dataset_fingerprint:
+        return ""
+    if cached.dataset_fingerprint != dataset_fingerprint:
+        return (
+            "the cached baseline was measured on a different dataset "
+            f"({cached.dataset_fingerprint} vs {dataset_fingerprint}) — its aggregate "
+            "answers different questions, so comparing them decides keep/revert on "
+            "evidence about another domain"
+        )
+    return ""
 
 
 @dataclass(frozen=True)
@@ -105,6 +201,10 @@ class CachedBaseline:
     # before this field existed — :func:`is_compatible` treats an empty
     # fingerprint on either side as "not checked" for backward compat.
     scorer_fingerprint: str = ""
+    # Content fingerprint of the kb + golden set this baseline was measured on
+    # (see :func:`compute_dataset_fingerprint`). Empty on baselines written
+    # before the domain was a parameter; empty on either side means unchecked.
+    dataset_fingerprint: str = ""
     cost_metrics: dict[str, float] = field(default_factory=dict)
     # How many of ``n_examples`` were never assessed. The gate compares every
     # round against this aggregate, so a baseline measured on two of eight rows
@@ -133,6 +233,7 @@ class CachedBaseline:
             "n_examples": self.n_examples,
             "mlflow_run_id": self.mlflow_run_id,
             "scorer_fingerprint": self.scorer_fingerprint,
+            "dataset_fingerprint": self.dataset_fingerprint,
         }
         # Additive: keep the historical on-disk schema byte-for-byte identical
         # for a clean baseline, which is every baseline written before the
@@ -163,6 +264,7 @@ class CachedBaseline:
             n_examples=int(raw.get("n_examples", 0)),
             mlflow_run_id=raw.get("mlflow_run_id"),
             scorer_fingerprint=raw.get("scorer_fingerprint", ""),
+            dataset_fingerprint=raw.get("dataset_fingerprint", ""),
             cost_metrics={k: float(v) for k, v in raw.get("cost_metrics", {}).items()},
             n_errors=int(raw.get("n_errors", 0)),
             n_dropped_rows=int(raw.get("n_dropped_rows", 0)),
@@ -247,11 +349,13 @@ def is_compatible(
     runtime_endpoint: str,
     judge_endpoint: str,
     scorer_fingerprint: str = "",
+    dataset_fingerprint: str = "",
 ) -> bool:
     """Return True if ``cached`` is comparable with the requesting context.
 
     Mode, scorer names and both endpoints must match exactly; the scorer
-    configuration is delegated to :func:`scorer_incomparability_reason`.
+    configuration is delegated to :func:`scorer_incomparability_reason` and the
+    domain to :func:`dataset_incomparability_reason`.
     """
     if (
         cached.mode != mode
@@ -259,6 +363,8 @@ def is_compatible(
         or cached.runtime_endpoint != runtime_endpoint
         or cached.judge_endpoint != judge_endpoint
     ):
+        return False
+    if dataset_incomparability_reason(cached, dataset_fingerprint=dataset_fingerprint):
         return False
     return not scorer_incomparability_reason(
         cached, scorers=scorers, scorer_fingerprint=scorer_fingerprint
@@ -308,6 +414,7 @@ def report_to_baseline(
         n_examples=report.n_rows,
         mlflow_run_id=report.run_id,
         scorer_fingerprint=getattr(report, "scorer_fingerprint", ""),
+        dataset_fingerprint=getattr(report, "dataset_fingerprint", ""),
         cost_metrics=dict(getattr(report, "cost_metrics", {})),
         n_errors=getattr(report, "n_errors", 0),
         n_dropped_rows=getattr(report, "n_dropped_rows", 0),

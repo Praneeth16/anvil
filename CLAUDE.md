@@ -55,9 +55,9 @@ next steps, read `docs/plan.md`.
 
 ## What not to auto-create
 
-- Do **not** create a `README.md`, `LICENSE`, or `CONTRIBUTING.md` on
-  your own. These are queued as "Reusability queue" items in
-  `docs/plan.md` and should be written deliberately when the user is
-  ready to share the repo.
+- `README.md` and `LICENSE` (Apache-2.0) now exist, written on explicit
+  request. `CONTRIBUTING.md` still does not: do **not** create it on
+  your own. It stays queued under "Reusability queue" in
+  `docs/plan.md`, to be written deliberately when the user is ready.
 - Do **not** create executive briefs, demo scripts, or blog posts
   unless the user explicitly asks via the matching skill.

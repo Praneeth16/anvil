@@ -1,7 +1,7 @@
 """Abstract base class for code-mode agent implementations.
 
 A code-mode candidate is a full Python module that implements this ABC.
-FORGE's optimizer writes new subclasses (different retrieval algorithms,
+ANVIL's optimizer writes new subclasses (different retrieval algorithms,
 learning strategies, memory structures) and the benchmark scores them.
 
 The contract separates **prediction** (before ground truth) from
@@ -24,7 +24,7 @@ class MemorySystem(ABC):
     """Base class for code-mode agent implementations.
 
     A code-mode candidate is a full Python module that implements this
-    ABC. FORGE's optimizer writes new subclasses (different retrieval
+    ABC. ANVIL's optimizer writes new subclasses (different retrieval
     algorithms, learning strategies, memory structures) and the
     benchmark scores them.
 
