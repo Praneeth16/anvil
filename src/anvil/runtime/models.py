@@ -124,6 +124,38 @@ class GateConfig(BaseModel):
     type: Literal["frontier", "delta"] = "frontier"
     epsilon: float = 0.0
     pareto: ParetoConfig = Field(default_factory=ParetoConfig)
+    # ``paired`` requires the improvement to survive a paired sign test over the
+    # per-row scores before the frontier decision counts. ``none`` is the legacy
+    # behaviour: any delta clearing ``epsilon`` promotes.
+    #
+    # Why this exists rather than a bigger epsilon: two healthy runs of the same
+    # scaffold differed by ~0.15 of aggregate from judge noise, while every gain
+    # the loop has actually produced was 0.03-0.06. An epsilon large enough to
+    # exclude the noise excludes every real gain too. The rows are the same
+    # questions in both runs, so pairing them cancels the row-difficulty variance
+    # that dominates the aggregate. See :mod:`anvil.eval.significance`.
+    test: Literal["paired", "none"] = "paired"
+    alpha: float = 0.05
+    # How many times to evaluate each candidate. ``1`` costs nothing extra and is
+    # the default. Raising it tightens the per-row estimates so the same test can
+    # detect smaller effects -- at a directly proportional increase in eval spend
+    # per round, which is why it is opt-in rather than a default.
+    replicates: int = 1
+
+    @field_validator("alpha")
+    @classmethod
+    def _alpha_must_be_a_probability(cls, v: float) -> float:
+        if not math.isfinite(v) or not (0.0 < v < 1.0):
+            raise ValueError(f"gate.alpha must be a finite probability in (0, 1), got {v!r}")
+        return v
+
+    @field_validator("replicates")
+    @classmethod
+    def _replicates_must_be_positive(cls, v: int) -> int:
+        """Zero replicates would mean gating on no measurement at all."""
+        if v < 1:
+            raise ValueError(f"gate.replicates must be at least 1, got {v!r}")
+        return v
 
     @model_validator(mode="before")
     @classmethod

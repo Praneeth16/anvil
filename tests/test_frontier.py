@@ -334,8 +334,19 @@ def _gate(
     action_kind: str = "add_rule",
     eval_failed: bool = False,
     parse_status: str = "ok",
+    gate_test: str = "none",
+    **paired_kwargs,
 ) -> tuple[Decision, Frontier | None]:
-    return gate_decision(
+    """Drive the gate and drop the paired result.
+
+    ``gate_test`` defaults to ``"none"`` *here* while the production default is
+    ``"paired"``, so these cases keep testing the frontier rule in isolation.
+    The paired veto has its own tests in ``tests/test_noise_aware_gate.py``,
+    including one that asserts the production default is in fact ``paired`` --
+    otherwise this helper's convenience would be indistinguishable from the
+    feature being off.
+    """
+    decision, frontier, _paired = gate_decision(
         repo_root=repo_root,
         gate_type=gate_type,
         epsilon=epsilon,
@@ -347,7 +358,10 @@ def _gate(
         action_kind=action_kind,
         eval_failed=eval_failed,
         parse_status=parse_status,
+        gate_test=gate_test,
+        **paired_kwargs,
     )
+    return decision, frontier
 
 
 def test_gate_frontier_first_round_inits_from_baseline_then_decides(tmp_path: Path) -> None:

@@ -12,45 +12,54 @@ decides which rewrites survive.
 
 ## Why this exists
 
-An agent's behaviour lives in its prompt scaffold — its skills, its rules, its
+An agent's behaviour lives in its prompt scaffold: its skills, its rules, its
 sampling settings, the descriptions of its tools. That scaffold is normally
 tuned by a human editing text and forming an impression of whether it got
-better.
+better. ANVIL replaces the impression with a measurement.
 
-ANVIL replaces the impression with a measurement. Each round, an optimizer LLM
-reads the agent's traces and failures, proposes one change, and commits it to a
-git branch. The change is then evaluated against a frozen golden set, and kept
-only if the numbers support it. Rejected rounds are `git branch -D`; accepted
-rounds are fast-forward merges. The mutation history is a git log, and every
-change the optimizer ever made is a reviewable diff.
+Each round, an optimizer LLM reads the agent's traces and failures, proposes one
+change, and commits it to a git branch. The change is evaluated against a frozen
+golden set and kept only if the numbers support it. Accepted rounds are
+fast-forward merges, rejected rounds are `git branch -D`, and every change the
+optimizer ever made is a reviewable diff.
 
-The design constraint that follows from this, and that shapes everything else:
-**the thing being optimized must stay legible to the thing doing the
-optimizing.** That is why the runtime is plain Python with no agent framework,
-and why the scaffold is markdown and YAML rather than rows in a table. An
-optimizer cannot rewrite what it cannot read.
+What makes that work in practice:
 
-## Does it work?
+- **The agent is text you can read.** Skills, rules, sampling and the tool
+  registry are markdown and YAML under `scaffold/`. An optimizer cannot rewrite
+  what it cannot read, which is also why the runtime is plain Python with no
+  agent framework hiding behaviour in library internals.
+- **The optimizer cannot edit its own grader.** Endpoints, thresholds, the gate
+  and the judge's prompt live in a file outside its writable scope, and its
+  writes are verified against that scope after the fact.
+- **A bad score and a broken run are different outcomes.** A throttled endpoint
+  produces `INFRA_FAIL`, which never discards a mutation. Exit codes carry the
+  same distinction, so any script can gate CI.
+- **Promotion survives judge noise.** A candidate has to beat the baseline
+  row by row, on a paired sign test, not merely post a higher average.
+- **A scorer that does not apply reports nothing.** Groundedness returns no
+  score on a refusal row rather than `0.0`, so per-judge means move when the
+  agent changes and not when the bucket mix does.
+- **Any domain, no library changes.** A knowledge base, a golden set, a scaffold
+  and an optional evaluator module are all paths passed at the boundary.
 
-Ten rounds on the built-in support domain — 7 kept, 3 no-op:
+## What it has done
+
+Ten rounds on the built-in support domain, 7 kept and 3 no-op:
 
 | Round | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
 |---|---|---|---|---|---|---|---|---|---|---|
-| Aggregate | 0.750 | 0.778 | 0.833 | 0.819 | — | **0.875** | — | **0.875** | — | 0.819 |
+| Aggregate | 0.750 | 0.778 | 0.833 | 0.819 | — | 0.875 | — | 0.875 | — | 0.819 |
 | Decision | keep | keep | keep | keep | noop | keep | noop | keep | noop | keep |
 
-> **Read this as machinery, not as a benchmark.** Those rounds ran under scorer
-> semantics v1–v3. v4 changed which buckets a scorer applies to, so these
-> numbers are **not comparable** to the current baseline (0.828 on `standard`,
-> 12 rows), and a rerun would not reproduce them. They are the record of a real
-> run that moved the agent end to end. The run also stops well short of the
-> 50-round target, which is where the interesting question lives — whether
-> gains keep coming, or the optimizer runs out of ideas.
-
-And the honest limitation, up front: two runs of the *same* scaffold on the
-same rows differed by **~0.15 of aggregate from judge noise alone**. The gate's
-`epsilon` is `0.0`, so noise of that size is sometimes read as signal. See
-[Limitations](#limitations).
+Three things to know before reading anything into those numbers. They ran under
+scorer semantics v1–v3, and v4 changed which buckets a scorer applies to, so they
+are incomparable to the current baseline of 0.828 on `standard` and a rerun would
+not reproduce them. Ten rounds is a fifth of the 50-round target, and the
+interesting question lives past that point: whether gains keep coming, or the
+optimizer runs out of ideas. And two runs of the *same* scaffold on the same rows
+differed by about 0.15 of aggregate from judge noise alone, which is larger than
+most of the per-round gains in the table. See [Limitations](#limitations).
 
 ## How a round works
 
@@ -72,35 +81,20 @@ same rows differed by **~0.15 of aggregate from judge noise alone**. The gate's
               ├─ 5. JUDGEABLE?  enough rows actually scored? baseline still
               │                 comparable?  no → INFRA_FAIL, never a revert
               │
-              ├─ 6. GATE     improves ≥1 objective, regresses none → KEEP
+              ├─ 6. GATE     improves ≥1 objective, regresses none, AND the
+              │              improvement clears a paired sign test → KEEP
               │
               └─ 7. RECORD   round JSON · critique · mutations log
                              KEEP → ff-merge      REVERT → branch -D
 ```
 
-Four outcomes, and the distinctions carry weight. **KEEP** and **REVERT** are
-results about the agent. **NOOP** means the optimizer produced no usable
-action. **INFRA_FAIL** means the round produced no measurement at all — so it
-says nothing about the agent, and is never allowed to discard a mutation. A
-throttled endpoint used to look exactly like a quality regression; making these
-four distinct is most of what `docs/design/failure-vs-error.md` argues.
-
-## Architecture
-
-Five planes, physically separated, with a one-way import rule:
-
-| Plane | Path | Knows about | Produces |
-|---|---|---|---|
-| Runtime | `src/anvil/runtime/` | composing a prompt and answering | trace + response |
-| Eval | `src/anvil/eval/` | running `mlflow.genai.evaluate` | `EvalReport` + JSON |
-| Optimizer | `src/anvil/optimizer/` | proposing a mutation | `OptimizerAction` + critique |
-| Loop | `src/anvil/loop/` | git, branches, baselines, decisions | round artifacts + Delta row |
-| Observability | `src/anvil/observability.py` | autolog + a standard tag set | tagged traces |
-
-The runtime never imports the optimizer. The eval never imports git. The loop
-is the only orchestrator. Each plane has a different reason to change and a
-different blast radius; collapsing any two makes it impossible to say what a
-round actually changed.
+Four outcomes, and each one licenses a different next step. KEEP and REVERT are
+results about the agent. NOOP means the optimizer produced no usable action.
+INFRA_FAIL means the round produced no measurement at all, so it says nothing
+about the agent and is never allowed to discard a mutation. A throttled endpoint
+used to look exactly like a quality regression; making these four distinct is
+most of what [`docs/design/failure-vs-error.md`](docs/design/failure-vs-error.md)
+argues.
 
 ## Quickstart
 
@@ -114,17 +108,18 @@ uv sync --extra dev --extra optimizer
 <details>
 <summary>Behind a corporate package index?</summary>
 
-`pyproject.toml` pins PyPI at the project level so `uv.lock` stays portable —
-a lock regenerated behind an internal proxy records that host in every wheel
-URL, which breaks CI and external contributors. If your machine only resolves
-through a proxy, set `UV_INDEX` for a single run rather than re-locking. The
-full reasoning is in the comment in `pyproject.toml`. External users need
-nothing extra.
+`pyproject.toml` pins PyPI at the project level so `uv.lock` stays portable. A
+lock regenerated behind an internal proxy records that host in every wheel URL,
+which breaks CI and external contributors. If your machine only resolves through
+a proxy, set `UV_INDEX` for a single run rather than re-locking. The full
+reasoning is in the comment in `pyproject.toml`. External users need nothing
+extra.
 
 </details>
 
-The test suite needs no credentials and no network — that is enforced, not
-merely intended, so this works with the wifi off:
+The test suite needs no credentials and no network. A socket guard in
+`tests/conftest.py` refuses off-machine connections for every test not marked
+`live`, so the suite runs with the wifi off:
 
 ```bash
 uv run pytest
@@ -133,60 +128,60 @@ uv run pytest
 Then, against a real workspace:
 
 ```bash
-# what is configured right now: scaffold, endpoints, cached baseline.
-# Reads files only -- no LLM call, no cost.
+# What is configured right now: scaffold, endpoints, cached baseline.
+# Reads files only, so no LLM call and no cost.
 uv run python scripts/round_show.py
 
-# smallest real eval (8 rows, 3 judges)
+# Smallest real eval (8 rows, 3 judges)
 uv run python scripts/evaluate.py --mode quick
 
-# the mode the gate actually uses (12 rows, ~3-5 min)
+# The mode the gate actually uses (12 rows, ~3-5 min)
 uv run python scripts/evaluate.py --mode standard
 
-# establish the bar, then optimize
+# Establish the bar, then optimize
 uv run python scripts/make_baseline.py
 uv run python scripts/run_round.py --rounds 1     # ~15-20 min
 
-# inspect what happened
+# Inspect what happened
 uv run python scripts/round_show.py 1
 uv run streamlit run scripts/round_dashboard.py
 ```
 
-Credentials come from `DATABRICKS_HOST` + `DATABRICKS_TOKEN`, or from a
+Credentials come from `DATABRICKS_HOST` plus `DATABRICKS_TOKEN`, or from a
 `~/.databrickscfg` profile named with `--profile`. Model choice is
 configuration, in `harness/config.yaml`.
 
 Every script exits `0` when it measured the agent, `1` when it measured and the
-agent fell short, `2` when it could not measure at all, and `130` on
-interrupt — so any of them can gate CI. A revert is not a failure: a 50-round
-run that keeps two mutations exits `0`.
+agent fell short, `2` when it could not measure at all, and `130` on interrupt.
+Reverting a bad mutation is the loop working, so a 50-round run that keeps only
+two of them still exits `0`.
 
 ## Bring your own domain
 
-A domain is four things, all supplied at the boundary. Nothing in `src/` names
-a domain, and pointing ANVIL at your own problem requires no library changes:
+A domain is four things, all supplied at the boundary. Nothing in `src/` names a
+domain, and pointing ANVIL at your own problem requires no library changes:
 
 ```bash
 uv run python scripts/evaluate.py \
-  --scaffold      examples/pyloom-docs/scaffold \
-  --kb-dir        examples/pyloom-docs/data/kb \
+  --scaffold        examples/pyloom-docs/scaffold \
+  --kb-dir          examples/pyloom-docs/data/kb \
   --golden-set-path examples/pyloom-docs/data/golden_set.jsonl \
   --mode quick
 ```
 
-**[`examples/pyloom-docs/`](examples/pyloom-docs/)** is a complete worked
-example: a documentation-support agent for a fictional Python library, with 14
+[`examples/pyloom-docs/`](examples/pyloom-docs/) is a complete worked example: a
+documentation-support agent for a fictional Python library, with 14
 knowledge-base pages, a 20-row golden set, and a starting scaffold with real
 headroom left in it.
 
 Its golden set is built around traps, because a golden set without traps proves
-nothing. The knowledge base documents a deprecated v1 client *and* the current
-v2 one, so "how do I construct a client?" has a plausible wrong answer sitting
-right next to the right one. Rows record the wrong values in
+nothing. The knowledge base documents a deprecated v1 client alongside the
+current v2 one, so "how do I construct a client?" has a plausible wrong answer
+sitting right next to the right one. Rows record the wrong values in
 `must_not_include`, and `tests/test_example_domains.py` asserts that each of
-those strings really does appear in some other document — a forbidden string
-that appears nowhere is a trap with nothing to catch, and would let the row
-pass unconditionally.
+those strings really does appear in some other document. A forbidden string that
+appears nowhere is a trap with nothing to catch, and would let the row pass
+unconditionally.
 
 To build your own, copy that directory's shape:
 
@@ -194,55 +189,83 @@ To build your own, copy that directory's shape:
 |---|---|
 | `data/kb/*.md` | knowledge base; YAML frontmatter with `doc_id`, then prose |
 | `data/golden_set.jsonl` | one row per case, bucketed `direct` / `multi_hop` / `distractor` / `out_of_scope` |
-| `scaffold/` | the starting agent: `harness.yaml`, `skills/`, `rules/` — this is what the optimizer rewrites |
+| `scaffold/` | the starting agent: `harness.yaml`, `skills/`, `rules/`. This is what the optimizer rewrites |
 | `harness/config.yaml` | endpoints, thresholds, gate, and the judge's domain description |
 | `data/evaluator.py` | optional deterministic check functions, for programmatic scorers |
 
-## Configuration: what the optimizer may touch
+## What the optimizer may touch
 
-The split is the load-bearing safety property, not a filing convention:
+The split between these two directories is a safety property, and it is the
+reason the numbers mean anything:
 
 | | `scaffold/` | `harness/config.yaml` |
 |---|---|---|
-| **Optimizer may write** | yes | **no** |
+| Optimizer may write | yes | no |
 | Holds | skills, rules, sampling, tool registry, memory | endpoints, eval thresholds, gate, judge domain |
 
-The optimizer is *scored* by the eval and rewarded for the score rising.
-Anything it can write that affects the score is a shortcut it will eventually
-find, and the cheapest shortcut is never "write a better agent". So the
-endpoints stay out of its reach (rewriting `runtime_endpoint` mid-run
-invalidates every comparison), the loop's own lookback stays out (that is the
-loop editing its own recursion depth), and the judge's prompt stays out — that
-one is editing the grader directly.
+The optimizer is scored by the eval and rewarded for the score rising. Anything
+it can write that affects the score is a shortcut it will eventually find, and
+the cheapest shortcut is never "write a better agent". So the endpoints stay out
+of its reach, because rewriting `runtime_endpoint` mid-run invalidates every
+comparison. The loop's own lookback stays out, because that is the loop editing
+its own recursion depth. The judge's prompt stays out, because that is editing
+the grader directly.
 
-This is enforced, not requested: writes are verified against the scope after
-the fact, and an escape is reported as a containment failure distinct from a
-flaky endpoint. See [`SECURITY.md`](SECURITY.md), and note what it says
-plainly — ANVIL runs a language model whose job is to write code this
-repository then executes. Read it before pointing this at anything you care
-about.
+Four independent layers enforce it: an OS-level sandbox, a tool allowlist, and
+two policy interception points, followed by a diff check that holds even if the
+SDK stops honouring the other four.
+
+Read [`SECURITY.md`](SECURITY.md) before pointing this at anything you care
+about. ANVIL runs a language model whose job is to write code this repository
+then executes.
+
+## Architecture
+
+Five planes, physically separated, with a one-way import rule:
+
+| Plane | Path | Knows about | Produces |
+|---|---|---|---|
+| Runtime | `src/anvil/runtime/` | composing a prompt and answering | trace + response |
+| Eval | `src/anvil/eval/` | running `mlflow.genai.evaluate` | `EvalReport` + JSON |
+| Optimizer | `src/anvil/optimizer/` | proposing a mutation | `OptimizerAction` + critique |
+| Loop | `src/anvil/loop/` | git, branches, baselines, decisions | round artifacts + Delta row |
+| Observability | `src/anvil/observability.py` | autolog + a standard tag set | tagged traces |
+
+The runtime never imports the optimizer. The eval never imports git. The loop is
+the only orchestrator. Each plane has a different reason to change and a
+different blast radius; collapsing any two makes it impossible to say what a
+round actually changed.
 
 ## Limitations
 
-- **Judge noise is the binding constraint.** ~0.15 of aggregate between two
-  identical runs at 8 rows, and reproduced again while writing
-  `examples/pyloom-docs/`: two runs of one unchanged scaffold scored 0.875 and
-  0.917, differing on a single refusal row. Mitigated only by preferring
-  `standard` (12 rows) over `quick`; the real fix is a paired, noise-aware gate,
-  which is the top item in `docs/plan.md`. MLflow's `evaluate()` offers no seed,
-  no repetition count and no paired mode, so that work is ANVIL's.
-- **The judge is unaligned.** `Judge.align` exists and has not been used yet.
-- **50 rounds is the target; 10 is what has been run.** The shape of the curve
+- **Judge noise is the binding constraint.** About 0.15 of aggregate between two
+  identical runs at 8 rows, reproduced again while building
+  `examples/pyloom-docs/`, where two runs of one unchanged scaffold scored 0.875
+  and 0.917 and differed on a single refusal row. The gate now requires a paired
+  sign test over the per-row scores, which is what makes a real gain
+  distinguishable from that noise. At 12 rows the test is weak: expect rounds to
+  revert as underpowered, and raise `gate.replicates` to buy the power back at
+  proportional cost.
+- **The paired gate is inert until you regenerate the baseline.**
+  `eval/runs/baseline.json` as shipped carries no per-row scores, so every round
+  reports that it could not run the test and the frontier decision stands
+  unchecked. One command fixes it: `scripts/make_baseline.py`.
+- **The judge is unaligned.** `Judge.align` exists and has not been used. It
+  would shrink the noise floor itself, which beats compensating for it, but it
+  needs human labels on real traces and there is no honest way to synthesize
+  those.
+- **50 rounds is the target and 10 is what has been run.** The shape of the curve
   past that point is unknown.
-- **`mode: code`** — where the optimizer rewrites agent Python rather than
-  prompts — works, but the `MemorySystem` constructor is not yet a validated
-  contract, so a bad candidate fails inside the eval instead of being rejected
-  before it costs anything.
+- **`mode: code` is the less-travelled path.** The optimizer rewriting agent
+  Python works, and a candidate the eval could not construct is now rejected
+  during validation rather than failing inside the eval. It has had far less live
+  exercise than `mode: prompt`.
 
 ## Documentation
 
 | | |
 |---|---|
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | setup, the checks, and what a change needs beyond a passing suite |
 | [`docs/decisions.md`](docs/decisions.md) | the architectural decisions, and what each rules out |
 | [`docs/plan.md`](docs/plan.md) | loop design, current state, prioritized open work |
 | [`docs/design/failure-vs-error.md`](docs/design/failure-vs-error.md) | why a bad score and a broken run must not look alike |

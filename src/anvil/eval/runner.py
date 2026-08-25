@@ -134,6 +134,30 @@ class EvalReport:
     # supplied by MLflow traces; context characters and row count do not
     # require another service call.
     cost_metrics: dict[str, float] = field(default_factory=dict)
+    # Per-row scores, keyed by ``example_id`` -> {scorer_name: value}. Only rows
+    # and scorers that actually produced a value appear: a row whose prediction
+    # errored is absent entirely, and a scorer that did not apply to a row is
+    # absent from that row -- the same "not applicable is not zero" rule the
+    # means already follow (D10).
+    #
+    # The aggregates alone cannot support a paired comparison, and a paired
+    # comparison is the only way to tell a real gain from judge noise: two
+    # healthy runs of the *same* scaffold differed by ~0.15 of aggregate, which
+    # is larger than any per-round gain observed. Because the rows are the same
+    # questions in the same deterministic order, baseline and candidate scores
+    # pair row by row, and the per-row difference cancels the row-difficulty
+    # variance that swamps the aggregate.
+    per_row: dict[str, dict[str, float]] = field(default_factory=dict)
+    # The scorers and weights that produced ``aggregate``, carried so the paired
+    # comparison recomputes per-row aggregates exactly the way this run computed
+    # its own -- rather than re-reading harness/config.yaml at gate time and
+    # risking weighting the rows differently from the number they add up to.
+    #
+    # Applying these weights to the *baseline's* rows is only sound because a
+    # weight change alters ``scorer_fingerprint``, and an incompatible
+    # fingerprint already refuses the comparison outright.
+    aggregate_scorer_names: list[str] = field(default_factory=list)
+    aggregate_weights: dict[str, float] = field(default_factory=dict)
     # JSON fingerprint of the aggregate scorer configs (name, type,
     # weight, check_function) that produced this report's aggregate.
     # Carried into ``CachedBaseline`` so the frontier gate can detect a
@@ -654,6 +678,25 @@ def _aggregate_report(
         }
         per_bucket[bucket] = scored
 
+    # Per-row scores keyed by example_id. Keyed rather than positional because a
+    # positional list pairs correctly only while the row order is identical, and
+    # a silent misalignment would compare one question's score against another's
+    # -- the exact failure the dataset fingerprint exists to make loud.
+    per_row: dict[str, dict[str, float]] = {}
+    for i in range(n_rows):
+        if i in errored_rows or i >= len(examples):
+            continue
+        example_id = examples[i].get("example_id")
+        if not isinstance(example_id, str) or not example_id:
+            continue
+        scored_row = {
+            name: value
+            for name in scorer_names
+            if (value := per_judge_rows[name][i]) is not None
+        }
+        if scored_row:
+            per_row[example_id] = scored_row
+
     failures: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     trace_ids: list[str] = []
@@ -707,6 +750,9 @@ def _aggregate_report(
         aggregate=aggregate,
         per_judge=per_judge,
         per_bucket=per_bucket,
+        per_row=per_row,
+        aggregate_scorer_names=list(aggregate_scorer_names),
+        aggregate_weights={n: weights.get(n, 1.0) for n in aggregate_scorer_names},
         failures=failures,
         run_id=run_id,
         experiment_id=experiment_id,

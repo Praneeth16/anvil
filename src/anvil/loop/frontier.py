@@ -33,15 +33,19 @@ Public surface:
 from __future__ import annotations
 
 import json
+import logging
 import math
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from anvil.eval.significance import PairedResult, paired_sign_test
 from anvil.loop.decision import Decision, decide
 from anvil.runtime.loader import default_runtime_config_path
 from anvil.runtime.models import GateConfig, ParetoConfig, ParetoObjective
+
+logger = logging.getLogger(__name__)
 
 # Key under which the aggregate score is tracked alongside the per-judge
 # scores. The objectives of the frontier are the per-judge keys plus this.
@@ -421,12 +425,25 @@ def gate_decision(
     action_kind: str,
     eval_failed: bool,
     parse_status: str,
-) -> tuple[Decision, Frontier | None]:
+    gate_test: str = "paired",
+    alpha: float = 0.05,
+    baseline_per_row: dict[str, dict[str, float]] | None = None,
+    mutated_per_row: dict[str, dict[str, float]] | None = None,
+    weights: dict[str, float] | None = None,
+    aggregate_scorer_names: list[str] | None = None,
+) -> tuple[Decision, Frontier | None, PairedResult | None]:
     """Compute the round's terminal decision via the configured gate.
 
-    Returns ``(decision, frontier)`` where ``frontier`` is the
+    Returns ``(decision, frontier, paired)`` where ``frontier`` is the
     (possibly updated) :class:`Frontier` for the ``frontier`` gate, or
-    ``None`` for the ``delta`` gate / noop / infra-fail paths.
+    ``None`` for the ``delta`` gate / noop / infra-fail paths, and ``paired`` is
+    the paired-comparison result when ``gate_test="paired"`` ran, else ``None``.
+
+    ``paired`` is returned rather than folded into the decision so the round
+    record can say *why*. "Reverted because it regressed" and "reverted because
+    the improvement was indistinguishable from judge noise" call for different
+    next mutations, and six rounds later the difference is only recoverable if it
+    was written down.
 
     Ordering mirrors :func:`anvil.loop.decision.decide`:
 
@@ -450,14 +467,14 @@ def gate_decision(
     """
     # 1. noop wins over everything.
     if action_kind == "noop":
-        return Decision.NOOP, None
+        return Decision.NOOP, None, None
 
     # 2. eval failure / missing aggregate → infra fail (no gate, no frontier
     #    I/O). Only mutated_aggregate is checked here: the delta gate needs
     #    only the aggregate, so per-objective scores are validated later for
     #    the frontier gate specifically.
     if eval_failed or mutated_aggregate is None:
-        return Decision.INFRA_FAIL, None
+        return Decision.INFRA_FAIL, None, None
 
     # 3a. Legacy frozen-baseline gate — preserved verbatim for backward compat.
     #     Placed before the mutated_scores check: the delta gate needs only
@@ -472,12 +489,12 @@ def gate_decision(
             parse_status=parse_status,
             eval_failed=False,
         )
-        return decision, None
+        return decision, None, None
 
     # 3b. Pareto frontier gate (default).
     #     Per-objective scores are required for the frontier gate.
     if mutated_scores is None:
-        return Decision.INFRA_FAIL, None
+        return Decision.INFRA_FAIL, None, None
 
     if isinstance(pareto, bool):
         pareto_enabled = pareto
@@ -511,7 +528,7 @@ def gate_decision(
             # No baseline to seed from and no existing frontier — we cannot
             # make a comparative decision. Treat as an infra failure rather
             # than silently keeping or reverting.
-            return Decision.INFRA_FAIL, None
+            return Decision.INFRA_FAIL, None, None
         frontier = Frontier.from_scores(
             baseline_scores,
             pareto=pareto_enabled,
@@ -533,4 +550,51 @@ def gate_decision(
     # Persist after every scored round (KEEP updates the best-so-far; REVERT
     # rewrites the unchanged frontier so the file is present + fresh).
     save_frontier(repo_root, frontier)
-    return (Decision.KEEP if kept else Decision.REVERT), frontier
+
+    # The paired test is a veto on KEEP, never a promotion.
+    #
+    # It runs only when the frontier already decided to keep, for two reasons.
+    # It cannot rescue a mutation the frontier rejected -- the frontier's job is
+    # "does this regress an objective", which is a question about direction, not
+    # about significance. And a mutation that regressed does not become
+    # acceptable by regressing insignificantly.
+    #
+    # A frontier update has already been persisted at this point, which is
+    # deliberate: the frontier records the best score *observed*, and the score
+    # was observed. The paired test governs whether the round's diff is merged,
+    # not what the measurement was.
+    paired: PairedResult | None = None
+    if kept and gate_test == "paired":
+        paired = paired_sign_test(
+            baseline_per_row or {},
+            mutated_per_row or {},
+            weights=weights or {},
+            aggregate_scorer_names=aggregate_scorer_names or [],
+            alpha=alpha,
+        )
+        # Two different "cannot conclude" cases, and collapsing them would be
+        # the bug.
+        #
+        # No pairable rows at all means the *test* could not run -- a baseline
+        # written before per-row scores existed, or a mode whose rows all
+        # errored. That is the same situation an empty ``scorer_fingerprint``
+        # describes, and it gets the same answer: unchecked, stated out loud,
+        # and the frontier's decision stands. Reverting instead would brick the
+        # loop on any pre-existing baseline, which is a migration disguised as a
+        # gate.
+        #
+        # Rows that *did* pair but produced too few disagreements is the opposite
+        # situation: the test ran and reports that this row count cannot
+        # distinguish this mutation from noise. Promoting on that is precisely
+        # the behaviour being fixed, so it reverts -- and the reason names
+        # ``gate.replicates``, which is the knob that buys the power back.
+        if paired.n_pairs == 0:
+            logger.warning(
+                "paired gate requested but no rows could be paired, so the "
+                "frontier decision stands unchecked: %s",
+                paired.reason,
+            )
+        elif not paired.significant:
+            return Decision.REVERT, frontier, paired
+
+    return (Decision.KEEP if kept else Decision.REVERT), frontier, paired
