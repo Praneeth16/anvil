@@ -25,16 +25,20 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
-from typing import Literal
+from typing import Final, Literal
 
 import mlflow
 import mlflow.openai
 from mlflow.exceptions import MlflowException
 
-SOURCE_PRODUCTION = "production"
-SOURCE_EVAL = "eval"
-SOURCE_OPTIMIZER = "optimizer"
+# The tag every trace carries, and the field observability queries filter on.
+# The constants are annotated with the Literal rather than left as bare ``str``
+# so a typo is a type error at the call site: an unrecognised source produces
+# traces that match no query, and nothing else in the system notices.
 SourceTag = Literal["production", "eval", "optimizer"]
+SOURCE_PRODUCTION: Final[SourceTag] = "production"
+SOURCE_EVAL: Final[SourceTag] = "eval"
+SOURCE_OPTIMIZER: Final[SourceTag] = "optimizer"
 
 _DETACHED_HEAD_LITERAL = "HEAD"
 

@@ -378,7 +378,8 @@ def test_load_memory_system_missing_file_raises(tmp_path: Path) -> None:
 def test_find_subclass_ignores_imported_base_class(tmp_path: Path) -> None:
     """_find_memory_system_subclass ignores the MemorySystem base class
     itself (which is imported, not defined, in the agent module)."""
-    from anvil.eval.runner import _find_memory_system_subclass, _import_agent_module
+    from anvil.agents.memory_system import find_memory_system_subclass
+    from anvil.eval.runner import _import_agent_module
 
     agent_file = tmp_path / "agent.py"
     agent_file.write_text(
@@ -396,7 +397,7 @@ def test_find_subclass_ignores_imported_base_class(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     module = _import_agent_module(str(agent_file))
-    cls = _find_memory_system_subclass(module)
+    cls = find_memory_system_subclass(module)
     assert cls.__name__ == "MyAgent"
 
 
@@ -439,7 +440,8 @@ def test_find_subclass_ignores_abstract_helpers(tmp_path: Path) -> None:
     should find only the concrete class — abstract helpers are filtered
     out via inspect.isabstract so they don't trigger the 'multiple
     subclasses' error."""
-    from anvil.eval.runner import _find_memory_system_subclass, _import_agent_module
+    from anvil.agents.memory_system import find_memory_system_subclass
+    from anvil.eval.runner import _import_agent_module
 
     agent_file = tmp_path / "abstract_agent.py"
     agent_file.write_text(
@@ -465,14 +467,15 @@ def test_find_subclass_ignores_abstract_helpers(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     module = _import_agent_module(str(agent_file))
-    cls = _find_memory_system_subclass(module)
+    cls = find_memory_system_subclass(module)
     assert cls.__name__ == "ConcreteAgent"
 
 
 def test_find_subclass_all_abstract_raises(tmp_path: Path) -> None:
     """A module with only abstract subclasses should raise a clear
     ValueError, not an opaque TypeError at instantiation time."""
-    from anvil.eval.runner import _find_memory_system_subclass, _import_agent_module
+    from anvil.agents.memory_system import find_memory_system_subclass
+    from anvil.eval.runner import _import_agent_module
 
     agent_file = tmp_path / "only_abstract.py"
     agent_file.write_text(
@@ -491,7 +494,7 @@ def test_find_subclass_all_abstract_raises(tmp_path: Path) -> None:
     )
     module = _import_agent_module(str(agent_file))
     with pytest.raises(ValueError, match="no concrete MemorySystem subclass"):
-        _find_memory_system_subclass(module)
+        find_memory_system_subclass(module)
 
 
 # ---------------------------------------------------------------------------

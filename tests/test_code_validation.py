@@ -147,5 +147,52 @@ def test_validate_code_candidate_runs_ast_check_before_import(tmp_path: Path) ->
         validate_code_candidate(path)
 
 
+_CLEAN_CANDIDATE = """\
+from anvil.agents.memory_system import MemorySystem
+
+
+class Remember(MemorySystem):
+    def predict(self, input):
+        return input, {}
+
+    def learn_from_batch(self, batch_results):
+        pass
+"""
+
+
 def test_validate_code_candidate_accepts_clean_candidate(tmp_path: Path) -> None:
-    validate_code_candidate(_candidate(tmp_path, "def remember(value):\n    return value\n"))
+    validate_code_candidate(_candidate(tmp_path, _CLEAN_CANDIDATE))
+
+
+def test_candidate_with_no_memory_system_is_rejected(tmp_path: Path) -> None:
+    """A module with no agent in it is not a valid candidate.
+
+    ``write_agent`` writes the module ``agent_module`` resolves to, so a
+    candidate the eval cannot find a ``MemorySystem`` in has always been
+    invalid. Before the constructor contract landed it passed validation and
+    failed inside the eval instead, where judgeability reads it as an
+    infrastructure failure and aborts the round rather than reverting it.
+    """
+    with pytest.raises(CodeValidationError, match="no concrete MemorySystem subclass"):
+        validate_code_candidate(_candidate(tmp_path, "def remember(value):\n    return value\n"))
+
+
+def test_candidate_with_uncallable_constructor_is_rejected(tmp_path: Path) -> None:
+    """The eval calls ``cls(llm_client=..., model=...)``; this one cannot be."""
+    source = _CLEAN_CANDIDATE.replace(
+        "class Remember(MemorySystem):",
+        "class Remember(MemorySystem):\n    def __init__(self, client, name):\n"
+        "        super().__init__()\n        self.client = client",
+    )
+    with pytest.raises(CodeValidationError, match="cannot be called as"):
+        validate_code_candidate(_candidate(tmp_path, source))
+
+
+def test_candidate_absorbing_kwargs_is_accepted(tmp_path: Path) -> None:
+    """Checked by binding, not by parameter names -- ``**kwargs`` can be called."""
+    source = _CLEAN_CANDIDATE.replace(
+        "class Remember(MemorySystem):",
+        "class Remember(MemorySystem):\n    def __init__(self, **kwargs):\n"
+        "        super().__init__(**kwargs)",
+    )
+    validate_code_candidate(_candidate(tmp_path, source))

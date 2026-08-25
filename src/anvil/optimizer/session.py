@@ -32,9 +32,14 @@ from typing import Any
 import mlflow
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 from claude_agent_sdk.types import (
+    HookCallback,
+    HookContext,
+    HookMatcher,
     PermissionResultAllow,
     PermissionResultDeny,
+    PreToolUseHookSpecificOutput,
     SandboxSettings,
+    SyncHookJSONOutput,
 )
 
 from anvil.optimizer.actions import OptimizerAction
@@ -182,6 +187,8 @@ async def run_optimizer_session(
         # loop declared and never applied.
         max_budget_usd=max_budget_usd,
         can_use_tool=_permission_callback(policy),
+        # The same policy at a second, independent SDK interception point.
+        hooks={"PreToolUse": [HookMatcher(hooks=[_pre_tool_use_hook(policy)])]},
     )
 
     async def _drain_session() -> str:
@@ -252,6 +259,49 @@ def extract_message_text(message) -> str:
                 parts.append(text)
 
     return "\n".join(parts)
+
+
+def _pre_tool_use_hook(policy: ToolPolicy) -> HookCallback:
+    """A second, independent enforcement point for the same policy.
+
+    ``can_use_tool`` and ``PreToolUse`` are different code paths inside the SDK,
+    and the permission callback is documented as version-dependent and
+    best-effort. Two paths mean a change in either one does not silently
+    unprotect the round.
+
+    Both call :meth:`ToolPolicy.decide`. That is deliberate and it is the whole
+    design: defence in depth means two *enforcement points* for one rule, never
+    two copies of the rule. The gate once kept its own copy of the comparability
+    rule and kept the bug after the eval's copy was fixed.
+
+    A hook that raises would be the worst outcome -- the SDK may treat a broken
+    hook as no hook -- so an unexpected failure denies rather than propagates.
+    The permission callback still stands behind it either way.
+    """
+
+    async def _hook(
+        input_data: Any, _tool_use_id: str | None, _ctx: HookContext
+    ) -> SyncHookJSONOutput:
+        try:
+            tool_name = str(input_data.get("tool_name", ""))
+            tool_input = input_data.get("tool_input") or {}
+            decision = policy.decide(tool_name, tool_input)
+            allowed, reason = decision.allowed, decision.reason
+        except Exception as exc:  # noqa: BLE001 - a broken hook must not open the door
+            logger.warning("PreToolUse hook failed, denying: %s", exc)
+            allowed, reason = False, f"policy hook error: {exc}"
+        if allowed:
+            return SyncHookJSONOutput()
+        logger.warning("optimizer tool call denied by hook: %s", reason)
+        return SyncHookJSONOutput(
+            hookSpecificOutput=PreToolUseHookSpecificOutput(
+                hookEventName="PreToolUse",
+                permissionDecision="deny",
+                permissionDecisionReason=reason,
+            )
+        )
+
+    return _hook
 
 
 def _permission_callback(

@@ -26,10 +26,9 @@ from typing import Any, Protocol
 
 from mlflow.pyfunc import ResponsesAgent
 from mlflow.types.responses import ResponsesAgentRequest, ResponsesAgentResponse
-from openai import OpenAI
 
 from anvil.observability import SOURCE_PRODUCTION, SourceTag, tag_current_trace
-from anvil.runtime.client import build_gateway_client
+from anvil.runtime.client import ChatClient, build_gateway_client
 from anvil.runtime.loader import HarnessSnapshot, default_runtime_config_path, load_harness
 from anvil.runtime.models import ToolRef
 
@@ -57,7 +56,7 @@ class AnvilAgent(ResponsesAgent):
         *,
         runtime_config_path: Path | str | None = None,
         source: SourceTag = SOURCE_PRODUCTION,
-        client: OpenAI | None = None,
+        client: ChatClient | None = None,
         tool_executor: ToolExecutor | None = None,
     ) -> None:
         self._scaffold_root: Path = Path(scaffold_root).resolve()
@@ -67,7 +66,7 @@ class AnvilAgent(ResponsesAgent):
             else default_runtime_config_path(self._scaffold_root)
         )
         self._snapshot: HarnessSnapshot = load_harness(self._scaffold_root, resolved_runtime_config)
-        self._client: OpenAI = client if client is not None else build_gateway_client()
+        self._client: ChatClient = client if client is not None else build_gateway_client()
         self._tool_executor: ToolExecutor = tool_executor or _no_tools_executor
         self._source: SourceTag = source
 
