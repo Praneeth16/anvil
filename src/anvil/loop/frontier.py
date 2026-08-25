@@ -99,9 +99,7 @@ class Frontier:
         else:
             self._objectives = []
         self.pareto = pareto
-        self.directions = {
-            obj: (directions or {}).get(obj, "maximize") for obj in self._objectives
-        }
+        self.directions = {obj: (directions or {}).get(obj, "maximize") for obj in self._objectives}
         self.sources = {obj: (sources or {}).get(obj, obj) for obj in self._objectives}
         self.epsilon = float(epsilon)
 
@@ -546,10 +544,11 @@ def gate_decision(
             frontier.directions = directions
             frontier.sources = sources
 
+    # Snapshot before the update so a paired-test veto can roll the frontier
+    # back to exactly what it was. ``Frontier`` is pure (no I/O, no handles),
+    # so a dict round-trip is a complete copy.
+    pre_update = Frontier.from_dict(frontier.to_dict())
     kept = frontier.update(mutated_scores)
-    # Persist after every scored round (KEEP updates the best-so-far; REVERT
-    # rewrites the unchanged frontier so the file is present + fresh).
-    save_frontier(repo_root, frontier)
 
     # The paired test is a veto on KEEP, never a promotion.
     #
@@ -558,11 +557,6 @@ def gate_decision(
     # "does this regress an objective", which is a question about direction, not
     # about significance. And a mutation that regressed does not become
     # acceptable by regressing insignificantly.
-    #
-    # A frontier update has already been persisted at this point, which is
-    # deliberate: the frontier records the best score *observed*, and the score
-    # was observed. The paired test governs whether the round's diff is merged,
-    # not what the measurement was.
     paired: PairedResult | None = None
     if kept and gate_test == "paired":
         paired = paired_sign_test(
@@ -595,6 +589,16 @@ def gate_decision(
                 paired.reason,
             )
         elif not paired.significant:
-            return Decision.REVERT, frontier, paired
+            # Veto. Roll back the frontier update that assumed a keep: the
+            # frontier is the bar the *next* candidate must clear, and a
+            # vetoed score is a noise-lucky ghost whose branch is about to be
+            # deleted. Persisting it would force every later honest candidate
+            # to beat a measurement no surviving agent produced.
+            save_frontier(repo_root, pre_update)
+            return Decision.REVERT, pre_update, paired
 
+    # Persist after every scored round whose decision stands (KEEP updates the
+    # best-so-far; REVERT rewrites the unchanged frontier so the file is
+    # present + fresh).
+    save_frontier(repo_root, frontier)
     return (Decision.KEEP if kept else Decision.REVERT), frontier, paired
