@@ -1,0 +1,46 @@
+sampling:
+  temperature: 0.3
+  top_p: null
+  max_tokens: 2048
+  tool_choice: auto
+  max_tool_calls: 3
+skills:
+- file: identity.md
+- file: greeting.md
+- file: classification.md
+- file: escalation.md
+- file: refund.md
+rules:
+- file: no_repeat_failed_mutations.md
+- file: answer_scope_discipline.md
+- file: answer_specificity.md
+tools:
+- name: search_knowledge_base
+  description: 'Search the NeoVolt policy knowledge base by natural-language
+
+    query. Returns the top-k matching policy documents, each with
+
+    doc_id, title, and a snippet of the body. Use whenever the user
+
+    asks about NeoVolt policies — billing, outages, tariffs,
+
+    payments, meters, account, safety, connections, regulatory
+
+    rights, or emergency contacts. If the result is "No matching
+
+    policy documents." the question is out of scope for this
+
+    knowledge base and you should say so.
+
+    '
+  parameters:
+    type: object
+    properties:
+      query:
+        type: string
+        description: Natural-language search query over the NeoVolt policy knowledge base.
+      k:
+        type: integer
+        description: Maximum number of policy documents to return (default 3).
+    required:
+    - query

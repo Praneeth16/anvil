@@ -85,22 +85,30 @@ def test_split_enabled_routes_dev_modes_to_dev_and_test_mode_to_test(
 
 
 def test_split_modes_run_against_shipped_golden_set() -> None:
+    """The shipped config must run its modes over the split partitions.
+
+    The split is enabled in the shipped config (issue #21), so this loads it
+    unmodified rather than forcing the flag. quick scales its declared buckets
+    by dev_ratio (0.4167): {5,7,5,5} -> {2,3,2,2}. test mode returns the whole
+    test partition, whose size the vendoring script pinned at 30.
+    """
     examples = load_golden_set(REPO_ROOT / "data" / "golden_set.jsonl")
-    cfg = load_harness(REPO_ROOT / "scaffold").config.eval.model_copy(
-        update={"split": SplitConfig(enabled=True)}
-    )
+    cfg = load_harness(REPO_ROOT / "scaffold").config.eval
+    assert cfg.split.enabled, "shipped config must enable the anti-overfit split (#21)"
 
     with pytest.warns(UserWarning, match="scaled 'quick' bucket counts"):
         quick = runner._select_mode_examples(examples, cfg=cfg, selected_mode="quick")
     test = runner._select_mode_examples(examples, cfg=cfg, selected_mode="test")
 
     assert Counter(row["category"] for row in quick) == {
-        "direct": 1,
-        "multi_hop": 1,
-        "distractor": 1,
-        "out_of_scope": 1,
+        "direct": 2,
+        "multi_hop": 3,
+        "distractor": 2,
+        "out_of_scope": 2,
     }
-    assert len(test) == 5
+    _, _, test_partition = runner.partition_dataset(examples, cfg.split)
+    assert list(test) == test_partition[: cfg.modes["test"].rows]
+    assert len(test) == 30
 
 
 def test_split_disabled_preserves_full_dataset_selection(
@@ -115,7 +123,9 @@ def test_split_disabled_preserves_full_dataset_selection(
         "partition_dataset",
         lambda *_args: pytest.fail("disabled split must not partition the golden set"),
     )
-    selected = runner._select_mode_examples(examples, cfg=_config(enabled=False), selected_mode="quick")
+    selected = runner._select_mode_examples(
+        examples, cfg=_config(enabled=False), selected_mode="quick"
+    )
     assert selected == examples[:1]
 
 

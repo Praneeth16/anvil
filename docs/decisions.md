@@ -330,6 +330,14 @@ shipped has no `per_row`, so the gate is inert (and says so, every round) until
 `scripts/make_baseline.py` is re-run. Deliberate: back-compat that fails loudly
 beats a forced migration, but "inert" must not be quiet.
 
+**Postscript (issues #10/#15).** The baseline has since been regenerated twice
+— once on the repaired scorer semantics (2026-08-26), once on the MultiHopRAG
+domain — so the gate is operative. And the 12-row constraint above was the
+dataset's, not the test's: the golden set had 20 rows and `standard` read 12
+of them. The MultiHopRAG migration raised the dev partition to 50 rows, so
+`replicates: 1` now detects q=0.65–0.70 effects with power ~0.5–0.7 before
+replication enters the picture.
+
 **Rules out.** Tuning `epsilon` as the answer to judge noise. Treating
 "underpowered" and "not significant" as the same outcome. Letting the paired test
 promote anything. Reading `gate.replicates` from a config the round could have

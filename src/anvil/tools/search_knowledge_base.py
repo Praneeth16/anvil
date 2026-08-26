@@ -29,7 +29,14 @@ from anvil.runtime.agent import ToolExecutor
 
 SEARCH_TOOL_NAME = "search_knowledge_base"
 DEFAULT_K = 3
-SNIPPET_CHAR_LIMIT = 500
+# Sized for the MultiHopRAG news corpus: articles average ~10k chars and the
+# answer-bearing passage rarely sits in the lede, so a 500-char snippet hid
+# the fact the row was graded on (measured: direct rows failing correctness
+# while groundedness passed). 3000 chars covers the lede plus the first
+# sections without letting k=3 results swamp the context. NeoVolt and pyloom
+# docs are shorter than either limit and see no change. The proper fix —
+# chunk-level retrieval — is tracked separately.
+SNIPPET_CHAR_LIMIT = 3000
 EMPTY_RESULT_TEXT = "No matching policy documents."
 
 _BM25_K1 = 1.5

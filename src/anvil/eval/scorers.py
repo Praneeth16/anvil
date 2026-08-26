@@ -166,18 +166,23 @@ def _judge_model_uri(endpoint: str) -> str:
 # ``scaffold/``: the optimizer is graded by this judge, and PR #1 removed its
 # ability to edit its own grader. See docs/decisions.md D8.
 #
-# ``None`` at every call site means "use these defaults", and the defaults
-# reproduce the shipped NeoVolt prompt byte-for-byte -- so every baseline cached
-# before this field existed stays valid and no semantics bump is needed.
-DEFAULT_JUDGE_DOMAIN_NAME = "NeoVolt"
+# ``None`` at every call site means "use these defaults". The defaults describe
+# the shipped primary domain -- MultiHopRAG since issue #15; NeoVolt, the
+# previous primary, now lives in examples/ and sets ``judge_domain_name`` /
+# ``judge_domain_context`` explicitly, which keeps its shipped baselines
+# scorer-comparable (the fingerprint records these strings only when they
+# differ from the defaults).
+DEFAULT_JUDGE_DOMAIN_NAME = "MultiHopRAG"
 DEFAULT_JUDGE_DOMAIN_CONTEXT = """\
-Domain: NeoVolt, a fictional electricity & gas utility. The agent
-has a knowledge base of NeoVolt policies and a `search_knowledge_base`
-tool. The agent should refuse out-of-scope or unanswerable questions
-and answer in-scope ones using the knowledge base."""
+Domain: MultiHopRAG, a multi-hop question-answering benchmark over a
+news-article corpus. The agent has a knowledge base of news articles
+and a `search_knowledge_base` tool. Many questions require combining
+facts from several articles. The agent should refuse questions the
+articles do not answer and answer covered ones using the knowledge
+base."""
 
 _JUDGE_PROMPT_TEMPLATE = """\
-You are an evaluator grading a customer-support agent's response.
+You are an evaluator grading an agent's response.
 
 {domain_context}
 

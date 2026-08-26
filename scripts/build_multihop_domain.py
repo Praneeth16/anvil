@@ -226,7 +226,7 @@ DIRECT_ROWS: list[dict[str, Any]] = [
         "decisions on what incoming data say about the economy, so postponements of key "
         "reports could complicate those decisions — a worry as Wall Street closed "
         "September with more losses.",
-        "must_include": ["Fed", "postponements"],
+        "must_include": ["Fed", "complicate"],
         "must_not_include": ["$A rises", "keep its overnight rate higher"],
         "notes_for_judge": "Authored direct row. The SMH and The Age ASX wraps are "
         "near-identical in topic; only the SMH one discusses data postponements. The "
@@ -540,8 +540,70 @@ _TOPIC_STOPWORDS = {
     "Mashable",
     "CNBC",
     "Fox",
+    "Does",
+    "Do",
+    "Did",
+    "Is",
+    "Are",
+    "Was",
+    "Were",
+    "Has",
+    "Have",
+    "Had",
+    "In",
+    "On",
+    "At",
+    "As",
+    "It",
+    "Its",
+    "This",
+    "That",
+    "These",
+    "Those",
+    "From",
 }
-_YESNO_ANSWER = re.compile(r"^(yes|no|agree|disagree)\.?$", re.IGNORECASE)
+
+
+def _capitalized_phrases(query: str) -> list[str]:
+    """All stopword-filtered capitalized phrases, deduplicated, longest first.
+
+    "The" heads are kept — "The Age" is the outlet's name, where trimming
+    leaves the useless "Age". Other stopword heads are trimmed off the front.
+    """
+    phrases: list[str] = []
+    for match in _TOPIC_RE.finditer(query):
+        phrase = match.group(0).strip()
+        head = phrase.split()[0]
+        if head in _TOPIC_STOPWORDS and len(phrase.split()) == 1:
+            continue
+        if head in _TOPIC_STOPWORDS and head != "The":
+            phrase = " ".join(phrase.split()[1:])
+        # A refusal that says "Gemini Ultra" must satisfy the expected fact;
+        # demanding the possessive "Gemini Ultra's" would fail it unfairly.
+        phrase = phrase.removesuffix("'s")
+        if phrase and phrase not in phrases:
+            phrases.append(phrase)
+    phrases.sort(key=len, reverse=True)
+    return phrases
+
+
+def must_include_for(q: dict[str, Any], cited_text: str) -> list[str]:
+    """The strings a correct response must contain, verified retrievable.
+
+    Entity answers demand the answer itself. Verdict answers ("Consistent",
+    "Yes") are not document content, so the row demands the entities being
+    compared instead — the judge grades the verdict against reference_answer.
+    Multi-token phrases are preferred: "The Age" guides a judge where "Age"
+    cannot.
+    """
+    answer = q["answer"].strip().rstrip(".")
+    if len(answer) >= 4 and answer in cited_text:
+        return [answer]
+    derived = [p for p in _capitalized_phrases(q["query"]) if p in cited_text]
+    multi = [p for p in derived if " " in p]
+    return (multi or derived)[:2]
+
+
 _TOPIC_RE = re.compile(r"\b[A-Z][\w'&.-]*(?:\s+[A-Z][\w'&.-]*)*")
 
 
@@ -611,18 +673,24 @@ def assign_ids(
     return out
 
 
-def pick_topic(query: str) -> str | None:
-    """Longest capitalized phrase in the query — a refusal should name its topic."""
+def pick_topic(query: str, source_names: set[str]) -> str | None:
+    """Longest capitalized phrase in the query — a refusal should name its
+    topic. Publication names are excluded: "the knowledge base does not cover
+    Bloomberg" is not a topic, and the Correctness judge's expected_facts must
+    be strings a good refusal would actually say."""
     best: str | None = None
     for match in _TOPIC_RE.finditer(query):
         phrase = match.group(0).strip()
         head = phrase.split()[0]
         if head in _TOPIC_STOPWORDS and len(phrase.split()) == 1:
             continue
-        if head in _TOPIC_STOPWORDS:
+        if head in _TOPIC_STOPWORDS and head != "The":
             phrase = " ".join(phrase.split()[1:])
             if not phrase:
                 continue
+        lowered = phrase.lower()
+        if any(lowered in src or src in lowered for src in source_names):
+            continue
         if best is None or len(phrase) > len(best):
             best = phrase
     return best
@@ -651,7 +719,10 @@ def render_doc(doc_id: str, raw: dict[str, Any]) -> str:
 
 
 def _doc_text(raw: dict[str, Any]) -> str:
-    return f"{raw['title']}\n{raw['body']}"
+    # Frontmatter fields included: the integrity checks (and
+    # tests/test_primary_domain.py) search the full rendered file, and outlet
+    # or category names are legitimate row content.
+    return f"{raw['title']}\n{raw['source']}\n{raw['category']}\n{raw['body']}"
 
 
 def build(
@@ -662,6 +733,8 @@ def build(
     by_url = {d["url"]: d for d in corpus}
     if len(by_url) != len(corpus):
         _fail("corpus urls are not unique")
+    # Lowercased outlet names, for refusal-topic filtering (pick_topic).
+    source_names = {str(d["source"]).lower() for d in corpus}
 
     for q in queries:
         for e in q["evidence_list"]:
@@ -671,13 +744,17 @@ def build(
     answerable = [q for q in queries if q["question_type"] != "null_query"]
     null_rows = [q for q in queries if q["question_type"] == "null_query"]
 
-    def short_enough(q: dict[str, Any]) -> bool:
-        # yes/no answers give degenerate must_include strings and leave the
-        # correctness judge a one-word reference to grade against
-        return len(q["answer"]) <= SHORT_ANSWER_MAX and not _YESNO_ANSWER.match(q["answer"].strip())
+    def evidence_text(q: dict[str, Any]) -> str:
+        return "\n".join(_doc_text(by_url[e["url"]]) for e in q["evidence_list"])
+
+    def viable(q: dict[str, Any]) -> bool:
+        # Long answers make poor must_include strings; a row whose demanded
+        # strings (answer or derived entities) are absent from its own evidence
+        # docs is ungradeable — test_primary_domain.py forbids it offline.
+        return len(q["answer"]) <= SHORT_ANSWER_MAX and bool(must_include_for(q, evidence_text(q)))
 
     # --- distractor: answerable rows with same-category confusables available
-    distractor_pool = [q for q in answerable if short_enough(q)]
+    distractor_pool = [q for q in answerable if viable(q)]
     rng.shuffle(distractor_pool)
     distractor_rows: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
     used_queries: set[int] = set()
@@ -703,7 +780,7 @@ def build(
         pool = [
             q
             for q in answerable
-            if q["question_type"] == qtype and short_enough(q) and id(q) not in used_queries
+            if q["question_type"] == qtype and viable(q) and id(q) not in used_queries
         ]
         rng.shuffle(pool)
         take = pool[:want]
@@ -796,6 +873,7 @@ def build(
     for q in multi_rows:
         cited = [doc_ids[e["url"]] for e in q["evidence_list"]]
         titles = "; ".join(dict.fromkeys(docs_by_id[d]["title"] for d in cited))
+        cited_text = "\n".join(doc_text(d) for d in cited)
         golden["multi_hop"].append(
             {
                 "query": q["query"],
@@ -804,7 +882,7 @@ def build(
                 "reference_answer": q["answer"],
                 "should_refuse": False,
                 "expected_citations": cited,
-                "must_include": [q["answer"]],
+                "must_include": must_include_for(q, cited_text),
                 "must_not_include": trap_strings(cited, q["answer"]),
                 "notes_for_judge": f"Multi-hop ({q['question_type'].removesuffix('_query')}). "
                 f"Requires combining facts from {len(cited)} articles: {titles}. "
@@ -817,9 +895,9 @@ def build(
         cited = [doc_ids[e["url"]] for e in q["evidence_list"]]
         conf_ids = [doc_ids[d["url"]] for d in conf]
         conf_titles = [docs_by_id[d]["title"] for d in conf_ids]
+        cited_text = "\n".join(doc_text(d) for d in cited)
         traps: list[str] = []
         for title in conf_titles:
-            cited_text = "\n".join(doc_text(d) for d in cited)
             if title not in cited_text and title not in traps:
                 traps.append(title)
             if len(traps) >= 3:
@@ -833,7 +911,7 @@ def build(
                 "reference_answer": q["answer"],
                 "should_refuse": False,
                 "expected_citations": cited,
-                "must_include": [q["answer"]],
+                "must_include": must_include_for(q, cited_text),
                 "must_not_include": traps[:4],
                 "notes_for_judge": "Distractor: same-category articles surface on "
                 f"retrieval ({'; '.join(conf_titles[:3])}). Do not attribute their "
@@ -842,7 +920,7 @@ def build(
         )
 
     for q in oos_rows:
-        topic = pick_topic(q["query"])
+        topic = pick_topic(q["query"], source_names)
         must_include = ["knowledge base"] + ([topic] if topic else [])
         golden["out_of_scope"].append(
             {
@@ -897,8 +975,15 @@ def check_golden(
             problems.append(f"{eid}: empty must_include")
         cited_text = "\n".join(doc_text(d) for d in cited)
         for s in row["must_include"]:
-            if s not in row["reference_answer"] and s not in cited_text and s not in row["query"]:
-                problems.append(f"{eid}: must_include {s!r} in neither answer, cited docs, query")
+            # Answer rows: the demanded string must be retrievable, i.e. present
+            # in a cited doc — matching test_primary_domain.py. Refusal rows cite
+            # no docs; their expected facts describe the refusal's shape, so they
+            # are checked against the reference answer and the query's topic.
+            if refusal:
+                if s not in row["reference_answer"] and s not in row["query"]:
+                    problems.append(f"{eid}: refusal must_include {s!r} in neither answer, query")
+            elif s not in cited_text:
+                problems.append(f"{eid}: must_include {s!r} absent from cited docs")
         if not refusal:
             if not row["must_not_include"]:
                 problems.append(f"{eid}: empty must_not_include on non-refusal row")
