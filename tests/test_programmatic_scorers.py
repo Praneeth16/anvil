@@ -467,6 +467,30 @@ def test_build_scorers_unknown_llm_name_raises() -> None:
         build_scorers(judge_client=None, scorer_configs=[ScorerConfig(name="bogus")])
 
 
+def test_build_scorers_wires_the_configured_endpoint_into_the_builtin_judges() -> None:
+    """Issue #13: the built-ins used to resolve a model implicitly.
+
+    Only the refusal judge read ``judge_endpoint``; correctness (and safety,
+    when enabled) graded on whatever mlflow's default resolution picked --
+    three judges, two models, one misleading knob.
+    """
+    from mlflow.genai.scorers import Correctness
+
+    from anvil.eval.scorers import build_scorers
+
+    scorers = build_scorers(judge_client=None, judge_model="my-judge-endpoint")
+
+    correctness = next(s for s in scorers if isinstance(s, Correctness))
+    assert correctness.model == "databricks:/my-judge-endpoint"
+
+
+def test_judge_model_uri_passes_a_schemed_value_through() -> None:
+    from anvil.eval.scorers import _judge_model_uri
+
+    assert _judge_model_uri("my-endpoint") == "databricks:/my-endpoint"
+    assert _judge_model_uri("databricks:/already") == "databricks:/already"
+
+
 def test_build_scorers_programmatic_missing_function_raises(tmp_path: Path) -> None:
     from anvil.eval.scorers import build_scorers
     from anvil.runtime.models import ScorerConfig
@@ -788,7 +812,12 @@ def test_eval_config_allows_unique_scorer_names() -> None:
     cfg = EvalConfig(
         scorers=[
             {"name": "correctness", "type": "llm", "weight": 0.4},
-            {"name": "exact_match", "type": "programmatic", "check_function": "exact_match", "weight": 0.6},
+            {
+                "name": "exact_match",
+                "type": "programmatic",
+                "check_function": "exact_match",
+                "weight": 0.6,
+            },
         ]
     )
     assert len(cfg.scorers) == 2

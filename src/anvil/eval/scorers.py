@@ -119,8 +119,16 @@ SYNTHESIZED_TRACE_TAG = "anvil.synthesized_trace"
 #        verdict per span collapsed last-wins.
 #   v4 — a row whose trace was lost and replaced by a synthesized stand-in is
 #        not applicable rather than ungrounded.
+#   v5 — the judge model is the configured ``judge_endpoint``, not mlflow's
+#        implicit default. The config string does not change, so the version
+#        has to: a v4 baseline was measured by a different model.
+# correctness:
+#   v1 — same change as groundedness v5: explicit configured model instead of
+#        mlflow's default resolution. Versioned from this change because no
+#        earlier semantics shift touched it.
 SCORER_SEMANTICS_VERSIONS: dict[str, int] = {
-    GROUNDEDNESS_SCORER_NAME: 4,
+    GROUNDEDNESS_SCORER_NAME: 5,
+    "correctness": 1,
 }
 
 # Default location of the programmatic check-function module, relative
@@ -136,6 +144,19 @@ _BUILTIN_SCORERS = {
     "correctness": Correctness,
     "safety": Safety,
 }
+
+
+def _judge_model_uri(endpoint: str) -> str:
+    """Model URI for mlflow's built-in judges.
+
+    ``judge_endpoint`` is a bare serving-endpoint name: the refusal judge
+    calls it through the OpenAI-compatible gateway client, which wants
+    exactly that. mlflow's built-in judges resolve ``model`` as a provider
+    URI instead, so the same endpoint needs the ``databricks:/`` prefix.
+    A value that already carries a scheme passes through untouched.
+    """
+    return endpoint if ":/" in endpoint else f"databricks:/{endpoint}"
+
 
 # The refusal judge's description of the domain it is grading. This is the only
 # domain-specific text left in the eval plane, and it used to be a literal in
@@ -355,7 +376,7 @@ def _is_synthesized_trace(trace: Any) -> bool:
     return bool(tags) and str(tags.get(SYNTHESIZED_TRACE_TAG, "")).lower() == "true"
 
 
-def _build_groundedness_scorer(*, name: str = GROUNDEDNESS_SCORER_NAME):
+def _build_groundedness_scorer(*, name: str = GROUNDEDNESS_SCORER_NAME, model: str | None = None):
     """Return a ``@scorer`` wrapping ``RetrievalGroundedness`` with an
     applicability rule.
 
@@ -440,6 +461,7 @@ def _build_groundedness_scorer(*, name: str = GROUNDEDNESS_SCORER_NAME):
             response=extract_response_from_trace(trace),
             context=chunks,
             name=name,
+            model=model,
         )
 
     return retrieval_groundedness
@@ -553,7 +575,9 @@ def build_scorers(
         judge_client: OpenAI-compatible client for the custom
             ``refusal_appropriateness`` judge. Not invoked for
             programmatic scorers.
-        judge_model: Endpoint name for the custom judge.
+        judge_model: Endpoint name every LLM judge grades with. The refusal
+            judge calls it through the gateway client as-is; mlflow's
+            built-in judges receive it as a provider URI.
         scorer_configs: The configured scorers (LLM + programmatic).
             Defaults to the three built-in LLM judges. Each
             ``type: llm`` scorer maps to its MLflow factory (or the
@@ -582,6 +606,11 @@ def build_scorers(
         domain_name=judge_domain_name or DEFAULT_JUDGE_DOMAIN_NAME,
         domain_context=judge_domain_context or DEFAULT_JUDGE_DOMAIN_CONTEXT,
     )
+    # Every LLM judge grades with the configured endpoint. The built-ins used
+    # to fall through to mlflow's implicit default model, so the three judges
+    # could silently run on different models -- and a config change of
+    # ``judge_endpoint`` moved only one of them.
+    model_uri = _judge_model_uri(judge_model)
     out: list = []
     for cfg in scorer_configs:
         if cfg.type == "programmatic":
@@ -591,9 +620,9 @@ def build_scorers(
             if cfg.name == REFUSAL_SCORER_NAME:
                 out.append(_build_refusal_scorer(ctx))
             elif cfg.name == GROUNDEDNESS_SCORER_NAME:
-                out.append(_build_groundedness_scorer())
+                out.append(_build_groundedness_scorer(model=model_uri))
             elif cfg.name in _BUILTIN_SCORERS:
-                out.append(_BUILTIN_SCORERS[cfg.name]())
+                out.append(_BUILTIN_SCORERS[cfg.name](model=model_uri))
             else:
                 raise ValueError(f"unknown llm scorer name: {cfg.name!r}")
     return out

@@ -150,6 +150,41 @@ def test_groundedness_defers_to_the_real_judge_when_retrieval_happened(
     assert seen["context"] == ["chunk"]
 
 
+def test_groundedness_grades_with_the_configured_judge_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #13: the wrapper called ``is_grounded`` with no model.
+
+    Groundedness graded on mlflow's implicit default while the refusal judge
+    used the configured endpoint -- one config knob, two models, and a
+    ``judge_endpoint`` change that moved only one judge.
+    """
+    from mlflow.entities import Feedback
+
+    import anvil.eval.scorers as scorers_mod
+
+    sentinel = Feedback(name="retrieval_groundedness", value="yes", rationale="from mlflow")
+    monkeypatch.setattr(
+        scorers_mod, "extract_retrieval_context_from_trace", lambda trace: {"span-1": ["chunk"]}
+    )
+    monkeypatch.setattr(scorers_mod, "extract_request_from_trace", lambda trace: "q")
+    monkeypatch.setattr(scorers_mod, "extract_response_from_trace", lambda trace: "a")
+    monkeypatch.setattr(
+        scorers_mod.judges, "is_grounded", lambda **kwargs: (seen.update(kwargs), sentinel)[1]
+    )
+    seen: dict[str, Any] = {}
+
+    scorer = scorers_mod._build_groundedness_scorer(model="databricks:/my-judge-endpoint")
+    result = scorer.run(
+        inputs={"query": "q"},
+        outputs="a",
+        expectations={"expected_doc_ids": ["doc-1"]},
+        trace=object(),
+    )
+    assert result is sentinel
+    assert seen["model"] == "databricks:/my-judge-endpoint"
+
+
 def test_groundedness_judges_the_union_of_every_retrieval_span(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -454,9 +489,7 @@ def _report_with_groundedness(rows: list[dict[str, Any]]):
         elif row["groundedness"] is None:
             ground_values.append(None)
         else:
-            row_assessments.append(
-                _value_assessment("retrieval_groundedness", row["groundedness"])
-            )
+            row_assessments.append(_value_assessment("retrieval_groundedness", row["groundedness"]))
             ground_values.append(row["groundedness"])
         assessments.append(row_assessments)
 
@@ -777,11 +810,11 @@ def test_a_fingerprintless_baseline_still_works_for_unversioned_scorers() -> Non
     from anvil.eval.cache import compute_scorer_fingerprint, is_compatible
     from anvil.runtime.models import ScorerConfig
 
-    fingerprint = compute_scorer_fingerprint([ScorerConfig(name="correctness")])
+    fingerprint = compute_scorer_fingerprint([ScorerConfig(name="refusal_appropriateness")])
     assert is_compatible(
-        _cached(scorers=["correctness"], scorer_fingerprint=""),
+        _cached(scorers=["refusal_appropriateness"], scorer_fingerprint=""),
         mode="quick",
-        scorers=["correctness"],
+        scorers=["refusal_appropriateness"],
         runtime_endpoint="databricks-claude-sonnet-4-6",
         judge_endpoint="databricks-claude-sonnet-4-6",
         scorer_fingerprint=fingerprint,
@@ -818,5 +851,23 @@ def test_unversioned_scorers_keep_their_old_fingerprint() -> None:
     from anvil.eval.cache import compute_scorer_fingerprint
     from anvil.runtime.models import ScorerConfig
 
-    fp = json.loads(compute_scorer_fingerprint([ScorerConfig(name="correctness")]))
+    fp = json.loads(compute_scorer_fingerprint([ScorerConfig(name="refusal_appropriateness")]))
     assert "semantics" not in fp[0]
+
+
+def test_the_judge_model_change_is_versioned_into_the_fingerprint() -> None:
+    """Issue #13 moved correctness and groundedness onto the configured endpoint.
+
+    The config string did not change, so only a semantics bump stops a
+    baseline measured by the old implicit model from silently becoming the
+    bar a 50-round run chases.
+    """
+    import json
+
+    from anvil.eval.cache import compute_scorer_fingerprint
+    from anvil.runtime.models import ScorerConfig
+
+    fp = json.loads(compute_scorer_fingerprint([ScorerConfig(name="correctness")]))
+    assert fp[0]["semantics"] == 1
+    fp = json.loads(compute_scorer_fingerprint([ScorerConfig(name="retrieval_groundedness")]))
+    assert fp[0]["semantics"] == 5
