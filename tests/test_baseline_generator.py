@@ -86,8 +86,7 @@ def _fake_report() -> EvalReport:
         trace_ids=["t0", "t1"],
         cost_metrics={"total_context_chars": 128.0, "n_rows": 8.0},
         scorer_fingerprint=(
-            '[{"check_function": null, "name": "correctness", '
-            '"type": "llm", "weight": 1.0}]'
+            '[{"check_function": null, "name": "correctness", "type": "llm", "weight": 1.0}]'
         ),
         # Non-empty, deliberately. ``to_dict`` omits ``per_row`` when it is
         # empty -- correct, so a pre-per_row baseline serializes unchanged -- but
@@ -504,14 +503,16 @@ def test_is_compatible_accepts_matching_fingerprint() -> None:
 
 def test_is_compatible_skips_fingerprint_when_cached_empty() -> None:
     """A baseline with an empty fingerprint (written before the field
-    existed) skips the fingerprint check for backward compat."""
+    existed) skips the fingerprint check for backward compat — but only for a
+    scorer whose semantics have never been versioned, which is why this uses
+    the refusal judge and not correctness."""
     from anvil.eval.cache import CachedBaseline, is_compatible
 
     baseline = CachedBaseline(
         scaffold_commit_sha=_SHA,
         evaluated_at="2026-01-01T00:00:00+00:00",
         mode="quick",
-        scorers=["correctness"],
+        scorers=["refusal_appropriateness"],
         runtime_endpoint=_RUNTIME,
         judge_endpoint=_JUDGE,
         aggregate=0.8,
@@ -520,10 +521,10 @@ def test_is_compatible_skips_fingerprint_when_cached_empty() -> None:
     assert is_compatible(
         baseline,
         mode="quick",
-        scorers=["correctness"],
+        scorers=["refusal_appropriateness"],
         runtime_endpoint=_RUNTIME,
         judge_endpoint=_JUDGE,
-        scorer_fingerprint='[{"name": "correctness", "type": "llm", "weight": 0.5, "check_function": null}]',
+        scorer_fingerprint='[{"name": "refusal_appropriateness", "type": "llm", "weight": 0.5, "check_function": null}]',
     )
 
 

@@ -365,7 +365,8 @@ def _git(repo: Path, *args: str) -> str:
 @pytest.fixture
 def anvil_repo(tmp_path: Path) -> Path:
     """A committed ANVIL repo on ``anvil/exp``, ready for ``run_round``."""
-    from anvil.eval.cache import CachedBaseline, save_baseline
+    from anvil.eval.cache import CachedBaseline, compute_scorer_fingerprint, save_baseline
+    from anvil.runtime.models import ScorerConfig
 
     repo = tmp_path
     _git(repo, "init", "-q")
@@ -393,6 +394,10 @@ def anvil_repo(tmp_path: Path) -> Path:
             per_judge={"correctness": 0.5},
             per_bucket={"direct": {"correctness": 0.5}},
             n_examples=10,
+            # Computed, not hard-coded: correctness is semantics-versioned, so
+            # a fingerprintless baseline is rejected at the gate before the
+            # error-ceiling logic these tests exercise ever runs.
+            scorer_fingerprint=compute_scorer_fingerprint([ScorerConfig(name="correctness")]),
         ),
     )
 
@@ -654,9 +659,7 @@ def test_round_refuses_a_round_measured_on_too_few_cases(
     _git(anvil_repo, "commit", "-qam", "open the rate guard")
 
     monkeypatch.setattr(round_mod, "run_optimizer_session", _mutating_session(anvil_repo))
-    monkeypatch.setattr(
-        round_mod, "evaluate_branch", lambda **_kw: _report_with_error_rate(0.875)
-    )
+    monkeypatch.setattr(round_mod, "evaluate_branch", lambda **_kw: _report_with_error_rate(0.875))
 
     report = round_mod.run_round(round_id=1, repo_root=anvil_repo)
 
@@ -768,9 +771,7 @@ def test_baseline_gate_reads_the_config_the_eval_ran_under(
         module, "evaluate_branch", lambda **_kw: _report_with_error_rate(0.75, aggregate=0.9)
     )
 
-    baseline = module.build_baseline(
-        scaffold_root=repo / "scaffold", runtime_config_path=custom
-    )
+    baseline = module.build_baseline(scaffold_root=repo / "scaffold", runtime_config_path=custom)
     assert baseline.aggregate == 0.9
 
     # And the strict default config still rejects the same report, proving the
