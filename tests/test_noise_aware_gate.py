@@ -27,7 +27,7 @@ from anvil.eval.significance import (
     row_aggregate,
 )
 from anvil.loop.decision import Decision
-from anvil.loop.frontier import AGGREGATE_KEY, gate_decision
+from anvil.loop.frontier import AGGREGATE_KEY, gate_decision, load_frontier
 
 _W = {"correctness": 1.0}
 _NAMES = ["correctness"]
@@ -209,6 +209,47 @@ def test_an_aggregate_gain_that_is_only_noise_is_reverted(tmp_path: Path):
     assert paired is not None
     assert not paired.significant
     assert (paired.n_improved, paired.n_regressed) == (3, 2)
+
+
+@pytest.mark.unit
+def test_a_vetoed_candidate_does_not_raise_the_frontier(tmp_path: Path):
+    """The veto must roll back the frontier update, or the loop stalls.
+
+    The frontier said keep (0.72 > 0.50), the rows said coin flip (3v2), so
+    the round reverts and its branch is deleted. If the raised bar were
+    persisted anyway, every later candidate would have to beat a score no
+    surviving agent produced -- a ghost set by judge noise.
+    """
+    base = _rows({"a": 0.0, "b": 0.0, "c": 0.0, "d": 1.0, "e": 1.0, "f": 1.0, "g": 1.0})
+    cand = _rows({"a": 1.0, "b": 1.0, "c": 1.0, "d": 0.0, "e": 0.0, "f": 1.0, "g": 1.0})
+
+    decision, frontier, paired = _gate(tmp_path, mutated=0.72, base_rows=base, cand_rows=cand)
+
+    assert decision == Decision.REVERT
+    assert paired is not None and not paired.significant
+    assert frontier.best[AGGREGATE_KEY] == pytest.approx(0.50)
+    persisted = load_frontier(tmp_path)
+    assert persisted is not None
+    assert persisted.best[AGGREGATE_KEY] == pytest.approx(0.50)
+
+
+@pytest.mark.unit
+def test_an_honest_gain_after_a_veto_is_not_stalled_by_the_ghost(tmp_path: Path):
+    """The failure mode end to end: veto at 0.72, then a real 0.6 arrives.
+
+    Against a rolled-back frontier the 0.6 is a keep; against a poisoned one
+    it reverts and the loop can never advance past the ghost.
+    """
+    base = _rows({"a": 0.0, "b": 0.0, "c": 0.0, "d": 0.5, "e": 0.5, "f": 0.5})
+    noise = _rows({"a": 1.0, "b": 1.0, "c": 1.0, "d": 0.0, "e": 0.0, "f": 0.0})
+    decision, _f, _p = _gate(tmp_path, mutated=0.72, base_rows=base, cand_rows=noise)
+    assert decision == Decision.REVERT
+
+    improved = _rows({k: 1.0 for k in ("a", "b", "c", "d", "e", "f")})
+    decision, _f, paired = _gate(tmp_path, mutated=0.60, base_rows=base, cand_rows=improved)
+
+    assert decision == Decision.KEEP
+    assert paired is not None and paired.significant
 
 
 @pytest.mark.unit
@@ -425,6 +466,7 @@ def test_replicates_config_drives_the_number_of_evals():
 
     evaluate_replicated(_evaluate, replicates=3)
     assert len(calls) == 3
+
 
 @pytest.mark.unit
 def test_replication_averages_the_judge_and_bucket_columns():
