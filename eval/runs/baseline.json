@@ -1,6 +1,6 @@
 {
-  "scaffold_commit_sha": "bc0430add927ce6cb26c48d594f9df68e4b2a5c5",
-  "evaluated_at": "2026-08-22T21:11:51+00:00",
+  "scaffold_commit_sha": "136a358c040b3c266e71116e36fdbfdfab6ef4b3",
+  "evaluated_at": "2026-08-26T15:31:10+00:00",
   "mode": "standard",
   "scorers": [
     "correctness",
@@ -9,21 +9,21 @@
   ],
   "runtime_endpoint": "databricks-claude-sonnet-4-6",
   "judge_endpoint": "databricks-claude-sonnet-4-6",
-  "aggregate": 0.8277777777777778,
+  "aggregate": 0.8166666666666668,
   "per_judge": {
-    "correctness": 0.5833333333333334,
-    "retrieval_groundedness": 0.9,
+    "correctness": 0.75,
+    "retrieval_groundedness": 0.7,
     "refusal_appropriateness": 1.0
   },
   "per_bucket": {
     "direct": {
-      "correctness": 0.75,
-      "retrieval_groundedness": 0.75,
+      "correctness": 1.0,
+      "retrieval_groundedness": 0.5,
       "refusal_appropriateness": 1.0
     },
     "multi_hop": {
       "correctness": 0.75,
-      "retrieval_groundedness": 1.0,
+      "retrieval_groundedness": 0.75,
       "refusal_appropriateness": 1.0
     },
     "distractor": {
@@ -32,15 +32,76 @@
       "refusal_appropriateness": 1.0
     },
     "out_of_scope": {
-      "correctness": 0.0,
+      "correctness": 0.5,
       "refusal_appropriateness": 1.0
     }
   },
   "n_examples": 12,
-  "mlflow_run_id": "aabbcb6a39674ef38e49f62c2ec3dc89",
-  "scorer_fingerprint": "[{\"check_function\": null, \"name\": \"correctness\", \"type\": \"llm\", \"weight\": 1.0}, {\"check_function\": null, \"name\": \"refusal_appropriateness\", \"type\": \"llm\", \"weight\": 1.0}, {\"check_function\": null, \"name\": \"retrieval_groundedness\", \"semantics\": 4, \"type\": \"llm\", \"weight\": 1.0}]",
+  "mlflow_run_id": "e6dcc5d09c2445079b106008fb271632",
+  "scorer_fingerprint": "[{\"check_function\": null, \"name\": \"correctness\", \"semantics\": 1, \"type\": \"llm\", \"weight\": 1.0}, {\"check_function\": null, \"name\": \"refusal_appropriateness\", \"type\": \"llm\", \"weight\": 1.0}, {\"check_function\": null, \"name\": \"retrieval_groundedness\", \"semantics\": 5, \"type\": \"llm\", \"weight\": 1.0}]",
+  "dataset_fingerprint": "sha256:50ded8896337b0bb7aa20735384ff456",
   "cost_metrics": {
     "total_context_chars": 1042.0,
     "n_rows": 12.0
+  },
+  "per_row": {
+    "golden_001": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "golden_002": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "golden_003": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 0.0,
+      "refusal_appropriateness": 1.0
+    },
+    "golden_004": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 0.0,
+      "refusal_appropriateness": 1.0
+    },
+    "golden_007": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "golden_008": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 0.0,
+      "refusal_appropriateness": 1.0
+    },
+    "golden_009": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "golden_010": {
+      "correctness": 0.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "golden_013": {
+      "correctness": 0.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "golden_014": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "golden_017": {
+      "correctness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "golden_018": {
+      "correctness": 0.0,
+      "refusal_appropriateness": 1.0
+    }
   }
 }
