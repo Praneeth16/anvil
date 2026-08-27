@@ -141,16 +141,19 @@ traces, and there is no honest way to synthesize those: a judge aligned against
 labels produced by a judge measures nothing. The prerequisite is a person
 labelling a few dozen rows from a live run.
 
-### 2. Chunk-level retrieval (#26)
+### 2. Chunk-level retrieval (#26) — DONE
 
-`search_knowledge_base` ranks whole documents but returns a prefix snippet.
-That fit NeoVolt's short policy pages; MultiHopRAG articles average ~10.3k
-chars with the answer mid-body, and the migration's live probe measured rows
-failing correctness while groundedness passed — the fact sat past the prefix.
-The migration ships a stopgap (500 → 3000 chars). The proper fix is chunk-level
-retrieval: BM25 over deterministic ~1-2k chunks, results labeled with their
-parent `doc_id` so the citation contract is unchanged. Land it before a
-campaign — snippet shape changes what a baseline measures.
+Retrieval is chunk-level: docs index as deterministic <=1500-char
+paragraph-packed chunks, BM25 ranks chunks, and a hit's snippet is the
+document's best chunks within a 3000-char budget — the old prefix's volume
+spent where the query points. `k` still counts documents and the trace keeps
+the `doc_uri`/`page_content` keys, so golden rows, the citation contract,
+and the groundedness judge are unchanged. Measured over the golden set's
+159 must-include facts: 66.7% visible under the 3000-char prefix, 71.7%
+under this, 54.1% under the rejected single-best-chunk design. The baseline
+must be regenerated before a campaign — the committed one was measured
+under prefix retrieval, and pairing chunk-retrieval candidates against it
+would confound the tool change with the mutation.
 
 ### 3. Regenerate the baseline to activate the paired gate — DONE
 

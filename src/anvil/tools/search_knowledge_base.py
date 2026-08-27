@@ -1,10 +1,19 @@
-"""``search_knowledge_base`` tool: BM25 in-memory retriever over ``data/kb/``.
+"""``search_knowledge_base`` tool: chunk-level BM25 retriever over ``data/kb/``.
 
 Schema (locked, must stay identical when a UC Function + Vector
 Search backend swaps in for Phase 4)::
 
     search_knowledge_base(query: str, k: int = 3)
         -> list[{doc_id, title, snippet}]
+
+Retrieval is **chunk-level**: documents are split into deterministic
+<=1500-char chunks at index time, BM25 ranks chunks, and each hit's
+``snippet`` is the document's best-scoring chunk. ``k`` counts DOCUMENTS —
+doc score is its best chunk's score — so one article cannot monopolize the
+result set and starve the second source a multi-hop question needs. The
+doc-level shape is what keeps golden rows (``expected_doc_ids``), the
+citation contract, and the groundedness judge's trace extraction
+(``metadata.doc_uri``) unchanged.
 
 Backend = ``"bm25"`` for the demo: zero dependencies, fully offline,
 deterministic. ``"vector_search"`` raises ``NotImplementedError`` and
@@ -17,9 +26,10 @@ import json
 import math
 import re
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
 import mlflow
 import yaml
@@ -29,14 +39,26 @@ from anvil.runtime.agent import ToolExecutor
 
 SEARCH_TOOL_NAME = "search_knowledge_base"
 DEFAULT_K = 3
-# Sized for the MultiHopRAG news corpus: articles average ~10k chars and the
-# answer-bearing passage rarely sits in the lede, so a 500-char snippet hid
-# the fact the row was graded on (measured: direct rows failing correctness
-# while groundedness passed). 3000 chars covers the lede plus the first
-# sections without letting k=3 results swamp the context. NeoVolt and pyloom
-# docs are shorter than either limit and see no change. The proper fix —
-# chunk-level retrieval — is tracked separately.
-SNIPPET_CHAR_LIMIT = 3000
+# Whole-document ranking used to return body[:SNIPPET_CHAR_LIMIT] — 500, then
+# 3000 chars — a prefix of an article whose answer routinely sits mid-body
+# (every MultiHopRAG doc is 5.2k-61k chars, median 8.4k; measured live: rows
+# failed correctness with groundedness 1.0 because the fact was past the
+# prefix). Retrieval is chunk-level now: docs split into <=1500-char
+# paragraph-packed chunks at index time, BM25 ranks chunks, and a hit's
+# snippet is the document's best chunks, accumulated in score order up to
+# SNIPPET_CHAR_BUDGET and presented in document order. The budget is the old
+# prefix's size, spent where the query points instead of where the article
+# starts: measured over the golden set's 159 must-include facts, visibility
+# from the expected doc's snippet went 66.7% (3000 prefix) -> 71.7% (this),
+# while a single best chunk — the other candidate design — DROPS to 54.1%
+# because prefix volume was doing real work. NeoVolt and pyloom docs are
+# shorter than one chunk, so they index as exactly one chunk per doc and
+# their results change only in that the snippet is whitespace-normalized.
+CHUNK_CHAR_LIMIT = 1500
+# Per-document snippet cap: the most context a hit may occupy, filled with
+# the document's best chunks rather than its prefix. Same number as the old
+# prefix limit, so the context cost of a k=3 search is unchanged.
+SNIPPET_CHAR_BUDGET = 3000
 EMPTY_RESULT_TEXT = "No matching policy documents."
 
 _BM25_K1 = 1.5
@@ -54,16 +76,39 @@ class KbHit:
     title: str
     snippet: str
     score: float
+    chunk_index: int
+
+
+@dataclass(frozen=True)
+class _IndexedChunk:
+    """One passage of a document, ranked as a unit by BM25."""
+
+    text: str
+    chunk_index: int
+    token_counts: Counter[str]
+    length: int
 
 
 @dataclass(frozen=True)
 class _IndexedDoc:
     doc_id: str
     title: str
-    body: str
-    tokens: list[str]
-    token_counts: Counter[str]
-    length: int
+    chunks: list[_IndexedChunk]
+
+
+class _Scorable(Protocol):
+    """What ``_bm25_scores`` needs of a ranked unit (a chunk).
+
+    Property declarations, not attributes: the ranked units are frozen
+    dataclasses, and a frozen attribute is read-only, which a settable
+    protocol member would reject.
+    """
+
+    @property
+    def token_counts(self) -> Counter[str]: ...
+
+    @property
+    def length(self) -> int: ...
 
 
 def _strip_frontmatter(text: str) -> tuple[dict, str]:
@@ -88,6 +133,53 @@ def _tokenise(text: str) -> list[str]:
     return [tok for tok in _TOKEN_RE.findall(text.lower()) if len(tok) >= _MIN_TOKEN_LEN]
 
 
+def _hard_split(text: str, limit: int) -> list[str]:
+    """Split an over-``limit`` paragraph at the last whitespace before the limit.
+
+    Falls back to a mid-word cut when no whitespace is in reach — the
+    alternative is an unbounded loop or an over-limit chunk, and a rare ugly
+    cut beats both.
+    """
+    pieces: list[str] = []
+    rest = text
+    while len(rest) > limit:
+        cut = rest.rfind(" ", 0, limit + 1)
+        if cut <= 0:
+            cut = limit
+        pieces.append(rest[:cut])
+        rest = rest[cut:].lstrip()
+    if rest:
+        pieces.append(rest)
+    return pieces
+
+
+def _chunk_body(body: str, limit: int = CHUNK_CHAR_LIMIT) -> list[str]:
+    """Split ``body`` into deterministic <=``limit``-char chunks.
+
+    Paragraphs (blank-line separated) are packed greedily; a paragraph that
+    exceeds the limit on its own is hard-split (see :func:`_hard_split`). No
+    overlap: MultiHopRAG evidence is sentence-scale, and every chunk boundary
+    is a pure function of the file bytes — the tool re-indexes per process,
+    so anything less deterministic would make a round's retrieval depend on
+    process history.
+    """
+    paragraphs = [p.strip() for p in body.split("\n\n") if p.strip()]
+    chunks: list[str] = []
+    current = ""
+    for para in paragraphs:
+        for piece in _hard_split(para, limit):
+            candidate = f"{current}\n\n{piece}" if current else piece
+            if len(candidate) <= limit:
+                current = candidate
+            else:
+                if current:
+                    chunks.append(current)
+                current = piece
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def _load_kb_index(kb_dir: Path) -> list[_IndexedDoc]:
     if not kb_dir.is_dir():
         raise FileNotFoundError(f"KB directory not found: {kb_dir}")
@@ -103,34 +195,38 @@ def _load_kb_index(kb_dir: Path) -> list[_IndexedDoc]:
         doc_id = raw_doc_id if isinstance(raw_doc_id, str) else path.stem
         raw_title = fm.get("title")
         title = raw_title if isinstance(raw_title, str) else doc_id
-        tokens = _tokenise(f"{title}\n{body}")
-        if not tokens:
-            continue
-        docs.append(
-            _IndexedDoc(
-                doc_id=doc_id,
-                title=title,
-                body=body.strip(),
-                tokens=tokens,
-                token_counts=Counter(tokens),
-                length=len(tokens),
+        chunks: list[_IndexedChunk] = []
+        for i, text in enumerate(_chunk_body(body.strip())):
+            # The title ranks with every chunk, exactly as it ranked with the
+            # whole document before chunking — title terms boost all of a
+            # doc's chunks equally, so the weighting's effect is unchanged.
+            tokens = _tokenise(f"{title}\n{text}")
+            chunks.append(
+                _IndexedChunk(
+                    text=text,
+                    chunk_index=i,
+                    token_counts=Counter(tokens),
+                    length=len(tokens),
+                )
             )
-        )
+        if not any(c.length for c in chunks):
+            continue
+        docs.append(_IndexedDoc(doc_id=doc_id, title=title, chunks=chunks))
     if not docs:
         raise ValueError(f"KB directory has no usable markdown docs: {kb_dir}")
     return docs
 
 
-def _bm25_scores(query_tokens: list[str], docs: list[_IndexedDoc]) -> list[float]:
-    n_docs = len(docs)
-    avgdl = sum(d.length for d in docs) / n_docs
+def _bm25_scores(query_tokens: list[str], items: Sequence[_Scorable]) -> list[float]:
+    n_docs = len(items)
+    avgdl = sum(d.length for d in items) / n_docs
 
     df: dict[str, int] = {}
     for term in set(query_tokens):
-        df[term] = sum(1 for d in docs if term in d.token_counts)
+        df[term] = sum(1 for d in items if term in d.token_counts)
 
     scores: list[float] = []
-    for d in docs:
+    for d in items:
         score = 0.0
         norm = 1 - _BM25_B + _BM25_B * d.length / avgdl
         for term in query_tokens:
@@ -143,34 +239,73 @@ def _bm25_scores(query_tokens: list[str], docs: list[_IndexedDoc]) -> list[float
     return scores
 
 
-def _make_snippet(body: str) -> str:
-    body = body.strip()
-    if len(body) <= SNIPPET_CHAR_LIMIT:
-        return body
-    return body[:SNIPPET_CHAR_LIMIT].rstrip() + "..."
+def _assemble_snippet(scored_chunks: list[tuple[float, _IndexedChunk]]) -> str:
+    """The document's best chunks within ``SNIPPET_CHAR_BUDGET``, in document order.
+
+    ``scored_chunks`` is the doc's positive-scoring chunks, best first. The
+    best chunk is always included; each further chunk joins only while the
+    budget holds, separators included, so the result never exceeds
+    ``SNIPPET_CHAR_BUDGET``. Selection is by score but presentation follows
+    the article (``chunk_index`` order), so the model reads passages as the
+    author wrote them; non-contiguous chunks are joined with an elision
+    marker.
+    """
+    picked: list[_IndexedChunk] = []
+    spent = 0
+    for _, chunk in scored_chunks:
+        # Budget the separator too (worst case is the gap marker), so the
+        # assembled snippet provably stays within SNIPPET_CHAR_BUDGET.
+        cost = len(chunk.text) if not picked else len(chunk.text) + len("\n\n[...]\n\n")
+        if picked and spent + cost > SNIPPET_CHAR_BUDGET:
+            break
+        picked.append(chunk)
+        spent += cost
+    picked.sort(key=lambda c: c.chunk_index)
+    parts: list[str] = []
+    for i, chunk in enumerate(picked):
+        if i > 0 and chunk.chunk_index != picked[i - 1].chunk_index + 1:
+            parts.append("[...]")
+        parts.append(chunk.text)
+    return "\n\n".join(parts)
 
 
 def _search(docs: list[_IndexedDoc], query: str, k: int) -> list[KbHit]:
+    """Rank documents by their best chunk; return the top ``k`` documents.
+
+    Chunk-level scoring with doc-level results: the snippet holds the chunks
+    the answer is likeliest in (see :func:`_assemble_snippet`), but ``k``
+    still counts documents, so a single article cannot fill the result set
+    and starve the second source a multi-hop question needs.
+    """
     query_tokens = _tokenise(query)
     if not query_tokens:
         return []
-    scores = _bm25_scores(query_tokens, docs)
+    flat = [(chunk, doc) for doc in docs for chunk in doc.chunks]
+    scores = _bm25_scores(query_tokens, [chunk for chunk, _ in flat])
+    per_doc: dict[str, list[tuple[float, _IndexedChunk]]] = {}
+    doc_by_id: dict[str, _IndexedDoc] = {}
+    for score, (chunk, doc) in zip(scores, flat, strict=True):
+        if score <= 0:
+            continue
+        per_doc.setdefault(doc.doc_id, []).append((score, chunk))
+        doc_by_id[doc.doc_id] = doc
+    for hits in per_doc.values():
+        hits.sort(key=lambda entry: entry[0], reverse=True)
     ranked = sorted(
-        ((score, doc) for score, doc in zip(scores, docs, strict=False) if score > 0),
-        key=lambda pair: pair[0],
+        per_doc.items(),
+        key=lambda item: item[1][0][0],  # doc score = its best chunk's score
         reverse=True,
     )
-    hits: list[KbHit] = []
-    for score, doc in ranked[:k]:
-        hits.append(
-            KbHit(
-                doc_id=doc.doc_id,
-                title=doc.title,
-                snippet=_make_snippet(doc.body),
-                score=score,
-            )
+    return [
+        KbHit(
+            doc_id=doc_by_id[doc_id].doc_id,
+            title=doc_by_id[doc_id].title,
+            snippet=_assemble_snippet(scored_chunks),
+            score=scored_chunks[0][0],
+            chunk_index=scored_chunks[0][1].chunk_index,
         )
-    return hits
+        for doc_id, scored_chunks in ranked[:k]
+    ]
 
 
 def format_hits(hits: list[KbHit]) -> str:
@@ -227,6 +362,7 @@ class _KbToolExecutor:
                             "doc_uri": h.doc_id,
                             "title": h.title,
                             "score": h.score,
+                            "chunk_index": h.chunk_index,
                         },
                     }
                     for h in hits
