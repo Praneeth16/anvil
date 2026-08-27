@@ -425,7 +425,7 @@ def gate_decision(
     parse_status: str,
     gate_test: str = "paired",
     alpha: float = 0.05,
-    baseline_per_row: dict[str, dict[str, float]] | None = None,
+    comparator_per_row: dict[str, dict[str, float]] | None = None,
     mutated_per_row: dict[str, dict[str, float]] | None = None,
     weights: dict[str, float] | None = None,
     aggregate_scorer_names: list[str] | None = None,
@@ -560,7 +560,7 @@ def gate_decision(
     paired: PairedResult | None = None
     if kept and gate_test == "paired":
         paired = paired_sign_test(
-            baseline_per_row or {},
+            comparator_per_row or {},
             mutated_per_row or {},
             weights=weights or {},
             aggregate_scorer_names=aggregate_scorer_names or [],
@@ -569,12 +569,15 @@ def gate_decision(
         # Two different "cannot conclude" cases, and collapsing them would be
         # the bug.
         #
-        # No pairable rows at all means the *test* could not run -- a baseline
-        # written before per-row scores existed, or a mode whose rows all
-        # errored. That is the same situation an empty ``scorer_fingerprint``
-        # describes, and it gets the same answer: unchecked, stated out loud,
-        # and the frontier's decision stands. Reverting instead would brick the
-        # loop on any pre-existing baseline, which is a migration disguised as a
+        # No pairable rows at all means the *test* could not run -- a
+        # comparator written before per-row scores existed, or a mode whose
+        # rows all errored. (The comparator is the current parent's per-row
+        # draw -- eval/runs/parent.json, refreshed on every KEEP -- or the
+        # frozen baseline before the first KEEP; see docs/decisions.md.) That
+        # is the same situation an empty ``scorer_fingerprint`` describes, and
+        # it gets the same answer: unchecked, stated out loud, and the
+        # frontier's decision stands. Reverting instead would brick the loop
+        # on any pre-existing baseline, which is a migration disguised as a
         # gate.
         #
         # Rows that *did* pair but produced too few disagreements is the opposite

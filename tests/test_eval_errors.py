@@ -378,7 +378,17 @@ def anvil_repo(tmp_path: Path) -> Path:
     (repo / "scaffold" / "skills").mkdir()
     (repo / "scaffold" / "harness.yaml").write_text("skills: []\ntools: []\n")
     (repo / "harness").mkdir()
-    (repo / "harness" / "config.yaml").write_text("mode: prompt\neval:\n  max_error_rate: 0.25\n")
+    # Endpoints + experiments are required RuntimeYAML fields: the KEEP path
+    # persists the parent comparator with the endpoints the eval ran under, so
+    # a config that could never validate is no longer tolerated here.
+    (repo / "harness" / "config.yaml").write_text(
+        "mode: prompt\n"
+        "runtime_endpoint: runtime\n"
+        "optimizer_endpoint: optimizer\n"
+        "judge_endpoint: judge\n"
+        "experiments: {runtime: r, eval: e, optimizer: o}\n"
+        "eval:\n  max_error_rate: 0.25\n"
+    )
     (repo / "eval" / "runs").mkdir(parents=True)
 
     save_baseline(

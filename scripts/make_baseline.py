@@ -34,14 +34,15 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-import yaml  # noqa: E402
-
 from anvil.cli import ExitCode, run_cli  # noqa: E402
-from anvil.eval.cache import CachedBaseline, report_to_baseline  # noqa: E402
+from anvil.eval.cache import CachedBaseline, parent_path, report_to_baseline  # noqa: E402
 from anvil.eval.judgeability import unjudgeable_reason_for  # noqa: E402
 from anvil.eval.runner import evaluate_branch  # noqa: E402
-from anvil.runtime.loader import default_runtime_config_path, load_eval_config  # noqa: E402
-from anvil.runtime.models import RuntimeYAML  # noqa: E402
+from anvil.runtime.loader import (  # noqa: E402
+    default_runtime_config_path,
+    load_endpoints,
+    load_eval_config,
+)
 
 # Default cache location the loop's gate reads. Relative to the repo
 # root so ``--help`` shows a stable, machine-independent string.
@@ -96,19 +97,6 @@ def _arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _load_endpoints(runtime_config_path: Path) -> tuple[str, str]:
-    """Read ``runtime_endpoint`` + ``judge_endpoint`` from harness/config.yaml.
-
-    Uses the same :class:`RuntimeYAML` schema the loader validates
-    against, so a malformed config fails the same way ``evaluate.py``
-    would — but without composing the runtime prompt, since the
-    baseline only needs the two endpoint strings.
-    """
-    raw = yaml.safe_load(runtime_config_path.read_text(encoding="utf-8")) or {}
-    runtime = RuntimeYAML.model_validate(raw)
-    return runtime.runtime_endpoint, runtime.judge_endpoint
-
-
 def _git_head_sha(scaffold_root: Path) -> str:
     """``git rev-parse HEAD`` of the scaffold's repo (full 40-char SHA).
 
@@ -152,7 +140,7 @@ def build_baseline(
         if runtime_config_path is not None
         else default_runtime_config_path(scaffold_path)
     )
-    runtime_endpoint, judge_endpoint = _load_endpoints(runtime_path)
+    runtime_endpoint, judge_endpoint = load_endpoints(runtime_path)
 
     # Forward the resolved config path so the eval runs against the SAME
     # harness/config.yaml the endpoints above were read from. Without this
@@ -213,6 +201,16 @@ def main(argv: list[str] | None = None) -> int:
     out_path = Path(args.out) if args.out else REPO_ROOT / DEFAULT_OUT_REL
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(baseline.to_dict(), indent=2) + "\n", encoding="utf-8")
+
+    # Re-anchor the paired test's comparator: whatever parent.json holds was
+    # drawn against the OLD baseline's world, and after a regen the parent of
+    # the next round is the scaffold this baseline just measured. Deleting
+    # (not overwriting) is what makes the next round fall back to the fresh
+    # baseline rather than pairing against a draw from a superseded domain.
+    stale_parent = parent_path(REPO_ROOT)
+    if stale_parent.is_file():
+        stale_parent.unlink()
+        print("Cleared eval/runs/parent.json — the next round pairs against this baseline.")
 
     print(
         f"Baseline written to {out_path}. Aggregate: {baseline.aggregate:.4f}. "

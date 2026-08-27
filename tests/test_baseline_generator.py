@@ -288,7 +288,7 @@ def test_make_baseline_cli_writes_loadable_file(
 ) -> None:
     make_baseline = _import_make_baseline()
 
-    # Minimal harness/config.yaml so _load_endpoints validates via RuntimeYAML.
+    # Minimal harness/config.yaml so load_endpoints validates via RuntimeYAML.
     (tmp_path / "harness").mkdir(parents=True)
     (tmp_path / "harness" / "config.yaml").write_text(_MIN_CONFIG_YAML, encoding="utf-8")
     (tmp_path / "scaffold").mkdir()

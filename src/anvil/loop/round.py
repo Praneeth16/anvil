@@ -19,10 +19,12 @@ from pathlib import Path
 
 import yaml
 
-from anvil.eval import evaluate_branch, load_baseline
+from anvil.eval import evaluate_branch, load_baseline, report_to_baseline
 from anvil.eval.cache import (
     compute_dataset_fingerprint,
     dataset_incomparability_reason,
+    load_parent,
+    save_parent,
     scorer_incomparability_reason,
 )
 from anvil.eval.judgeability import unjudgeable_reason_for
@@ -52,7 +54,11 @@ from anvil.optimizer import (
     run_optimizer_session,
 )
 from anvil.optimizer.policy import DEFAULT_SECRET_PATHS, ToolPolicy
-from anvil.runtime.loader import default_runtime_config_path, load_eval_config
+from anvil.runtime.loader import (
+    default_runtime_config_path,
+    load_endpoints,
+    load_eval_config,
+)
 
 
 @dataclass
@@ -155,6 +161,15 @@ def run_round(
     parent_sha = current_sha(repo_root)
     baseline = load_baseline(repo_root)
 
+    # The comparator is what the paired test, the score delta, and the
+    # optimizer prompt all mean by "the parent": the most recent KEPT round's
+    # draw while one exists, else the frozen baseline (the parent of the first
+    # candidate by definition). Pairing against the frozen baseline after a
+    # KEEP answers "does the candidate differ from the original scaffold" --
+    # not the question the gate is asking (#19).
+    parent = load_parent(repo_root)
+    comparator = parent if parent is not None else baseline
+
     # Snapshot the tree's existing dirt so the scope check in step 3b can
     # attribute writes to *this round* rather than to whatever was already
     # lying around. Runs are normally started on a clean tree, but
@@ -168,10 +183,11 @@ def run_round(
     # optimizer session and a full eval first, and the answer here is already
     # knowable from local files. Without this, pointing a 50-round run at a new
     # domain burns a round to learn the baseline does not apply, fifty times.
+    dataset_fingerprint = compute_dataset_fingerprint(kb_dir, golden_set_path)
     if baseline is not None:
         pre_flight = dataset_incomparability_reason(
             baseline,
-            dataset_fingerprint=compute_dataset_fingerprint(kb_dir, golden_set_path),
+            dataset_fingerprint=dataset_fingerprint,
         )
         if pre_flight:
             raise RuntimeError(
@@ -180,14 +196,38 @@ def run_round(
                 "--golden-set-path this round will use"
             )
 
+    # The same refusal for the parent comparator. It cannot normally trigger:
+    # a KEEP is only written after the round's eval report was itself checked
+    # against the baseline, so parent.json always agrees with it. What it
+    # catches is the out-of-band case -- a baseline regenerated mid-campaign,
+    # or a hand-edited parent.json -- which would otherwise shrink the paired
+    # test to zero shared rows and let the frontier stand unchecked.
+    if parent is not None:
+        parent_pre_flight = dataset_incomparability_reason(
+            parent,
+            dataset_fingerprint=dataset_fingerprint,
+        )
+        if parent_pre_flight:
+            raise RuntimeError(
+                f"the parent comparator is stale: {parent_pre_flight} — "
+                "re-anchor by regenerating the baseline with "
+                "scripts/make_baseline.py (which clears eval/runs/parent.json)"
+            )
+
     # 1. Branch off the parent.
     branch = create_round_branch(repo_root, round_id, parent_branch=parent_branch)
 
-    # 2. Build prompt and run the optimizer session.
+    # 2. Build prompt and run the optimizer session. The prompt's "cached
+    # parent baseline" is the comparator -- the kept parent's draw once one
+    # exists -- so the mutation target the optimizer reads is the score the
+    # gate will actually pair its candidate against.
     prompt = build_round_prompt(
         repo_root=repo_root,
         round_id=round_id,
-        baseline=asdict_baseline(baseline) if baseline else None,
+        baseline=asdict_baseline(comparator) if comparator else None,
+        baseline_path=(
+            "eval/runs/parent.json" if parent is not None else "eval/runs/baseline.json"
+        ),
     )
 
     # NOTE: optimizer-side MLflow tracing is intentionally disabled for
@@ -271,8 +311,8 @@ def run_round(
         notes = "scope violation: " + ", ".join(scope_violations)
     elif isinstance(action, NoopAction):
         # No need to evaluate for a noop; the score is the parent's.
-        if baseline:
-            mutated_score = float(baseline.aggregate)
+        if comparator:
+            mutated_score = float(comparator.aggregate)
     else:
         try:
             # `gate.replicates` is read here rather than at the gate because it
@@ -323,10 +363,11 @@ def run_round(
 
     # 7. Compute score delta + decision.
     #
-    # ``score_delta`` is reported vs the cached (frozen) baseline for the
-    # human-facing artifacts (round JSON, mutations log) — it shows how the
-    # mutation compares to the *original* baseline. The keep/revert DECISION
-    # is delegated to the configured gate (``harness/config.yaml > gate``):
+    # ``score_delta`` is reported vs the COMPARATOR — the kept parent's draw
+    # once one exists, else the frozen baseline — matching the field name the
+    # round JSON has always written (``score_delta_vs_parent``) and the
+    # comparison the paired test makes. The keep/revert DECISION is delegated
+    # to the configured gate (``harness/config.yaml > gate``):
     #
     # * ``gate.type: frontier`` (default) — Pareto frontier. The decision
     #   compares the mutation against the best-so-far per objective
@@ -339,10 +380,13 @@ def run_round(
     # * ``gate.type: delta`` — legacy frozen-baseline behavior (kept for
     #   backward compatibility); the decision reproduces the old
     #   ``score_delta > 0`` check exactly and does not touch the frontier.
+    #   It reads ``baseline_aggregate`` — the frozen baseline, deliberately:
+    #   legacy semantics are preserved verbatim, not re-anchored.
     baseline_aggregate = float(baseline.aggregate) if baseline else None
+    comparator_aggregate = float(comparator.aggregate) if comparator else None
     score_delta = (
-        (mutated_score - baseline_aggregate)
-        if (mutated_score is not None and baseline_aggregate is not None)
+        (mutated_score - comparator_aggregate)
+        if (mutated_score is not None and comparator_aggregate is not None)
         else None
     )
 
@@ -408,7 +452,7 @@ def run_round(
             parse_status=parse_result.parse_status,
             gate_test=gate_cfg.test,
             alpha=gate_cfg.alpha,
-            baseline_per_row=baseline.per_row if baseline else None,
+            comparator_per_row=comparator.per_row if comparator else None,
             mutated_per_row=eval_report.per_row if eval_report is not None else None,
             weights=eval_report.aggregate_weights if eval_report is not None else None,
             aggregate_scorer_names=(
@@ -435,6 +479,7 @@ def run_round(
             apply_summary=apply_result.action_summary,
             rationale=action.rationale,
             baseline_score=baseline_aggregate,
+            parent_score=comparator_aggregate,
             mutated_score=mutated_score,
             score_delta=score_delta,
             parse_status=parse_result.parse_status,
@@ -456,6 +501,7 @@ def run_round(
                 action_kind=action.action,
                 eval_report=eval_report,
                 baseline_score=baseline_aggregate,
+                parent_score=comparator_aggregate,
                 score_delta=score_delta,
                 parse_status=parse_result.parse_status,
                 notes=notes,
@@ -486,6 +532,32 @@ def run_round(
         parse_status=parse_result.parse_status,
     )
     append_mutation(repo_root, record)
+
+    # 10c. On KEEP the candidate becomes the parent of every later round, so
+    # its draw replaces the paired test's comparator (eval/runs/parent.json).
+    # Any other decision writes nothing: the parent did not change, and a
+    # vetoed or failed candidate must not become the bar anything is paired
+    # against. Persistence matches frontier.json exactly -- an uncommitted
+    # working-tree file that branch operations carry over; ``commit_all``
+    # stages only scaffold/ and agents/, and nothing here needs durability
+    # beyond what the next round's load_parent requires.
+    if decision == Decision.KEEP:
+        # A KEEP is only reachable with a scored report: the frontier gate
+        # returns INFRA_FAIL when mutated scores are missing. The assert is
+        # for the type checker, which cannot see across the gate boundary.
+        assert eval_report is not None
+        runtime_endpoint, judge_endpoint = load_endpoints(
+            default_runtime_config_path(scaffold_root)
+        )
+        save_parent(
+            repo_root,
+            report_to_baseline(
+                eval_report,
+                scaffold_commit_sha=commit_sha,
+                runtime_endpoint=runtime_endpoint,
+                judge_endpoint=judge_endpoint,
+            ),
+        )
 
     # 10b. Commit the round artifacts (critique md, transcript md,
     # round JSON) onto the round branch BEFORE we ff-merge or delete
@@ -618,11 +690,13 @@ def _build_critique_md(
     apply_summary: str,
     rationale: str,
     baseline_score: float | None,
+    parent_score: float | None,
     mutated_score: float | None,
     score_delta: float | None,
     parse_status: str,
 ) -> str:
     bs = f"{baseline_score:.4f}" if baseline_score is not None else "null"
+    ps = f"{parent_score:.4f}" if parent_score is not None else "null"
     ms = f"{mutated_score:.4f}" if mutated_score is not None else "null"
     sd = f"{score_delta:+.4f}" if score_delta is not None else "null"
     return f"""---
@@ -632,6 +706,7 @@ decision: {decision}
 action_kind: {action_kind}
 parse_status: {parse_status}
 baseline_score: {bs}
+parent_score: {ps}
 mutated_score: {ms}
 score_delta: {sd}
 ---
@@ -645,7 +720,7 @@ score_delta: {sd}
 {rationale}
 
 ## Outcome
-Decision: **{str(decision).upper()}**. Score delta vs cached baseline:
+Decision: **{str(decision).upper()}**. Score delta vs parent:
 {sd}.
 """
 
@@ -660,6 +735,7 @@ def _build_round_json(
     action_kind: str,
     eval_report,
     baseline_score: float | None,
+    parent_score: float | None,
     score_delta: float | None,
     parse_status: str,
     notes: str,
@@ -674,6 +750,10 @@ def _build_round_json(
         "action_kind": action_kind,
         "parse_status": parse_status,
         "baseline_score": baseline_score,
+        # The comparator the delta below is measured against: the kept
+        # parent's draw once a KEEP exists, else the frozen baseline (in
+        # which case parent_score == baseline_score).
+        "parent_score": parent_score,
         "score_delta_vs_parent": score_delta,
         "notes": notes,
         # Best-so-far per objective after this round's decision (frontier

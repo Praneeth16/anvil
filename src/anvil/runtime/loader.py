@@ -83,6 +83,19 @@ def load_eval_config(
     return EvalConfig.model_validate(raw.get("eval") or {})
 
 
+def load_endpoints(runtime_config_path: Path | str) -> tuple[str, str]:
+    """Read ``runtime_endpoint`` + ``judge_endpoint`` from a harness config.
+
+    Validated through :class:`RuntimeYAML` like everything else, but without
+    composing the runtime prompt — the round loop's KEEP path and
+    ``scripts/make_baseline.py`` both need exactly these two strings, and two
+    copies of the read would drift the way the duplicated comparability rule
+    did.
+    """
+    runtime = _load_runtime_yaml(Path(runtime_config_path))
+    return runtime.runtime_endpoint, runtime.judge_endpoint
+
+
 def load_harness(
     scaffold_root: Path | str,
     runtime_config_path: Path | str | None = None,
