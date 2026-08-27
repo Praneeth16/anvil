@@ -163,7 +163,7 @@ def _gate(tmp_path: Path, *, mutated: float, base_rows, cand_rows, **kw):
         action_kind="add_rule",
         eval_failed=False,
         parse_status="ok",
-        baseline_per_row=base_rows,
+        comparator_per_row=base_rows,
         mutated_per_row=cand_rows,
         weights=_W,
         aggregate_scorer_names=_NAMES,

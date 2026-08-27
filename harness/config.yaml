@@ -225,6 +225,13 @@ gate:
   #            to clear a one-sided paired sign test over the PER-ROW scores.
   #   none   — legacy: any delta clearing `epsilon` promotes.
   #
+  # The comparator is the CURRENT PARENT's per-row draw: eval/runs/parent.json,
+  # rewritten from the kept candidate's eval report on every KEEP. Before the
+  # first KEEP (or right after scripts/make_baseline.py re-anchors) the frozen
+  # baseline stands in — it is the parent of the first candidate by definition.
+  # Pairing against the frozen baseline forever answered "does the candidate
+  # differ from the original scaffold", not "does it improve on its parent".
+  #
   # Why this and not a bigger epsilon. Two healthy runs of the *same* scaffold,
   # the same rows and the same model scored 0.875 and 0.722 -- ~0.15 of aggregate
   # from judge noise alone. Every per-round gain the loop has actually produced
@@ -232,7 +239,9 @@ gate:
   # real gain too. What makes the difference measurable is that both runs answer
   # the SAME questions: pairing the rows cancels the row-difficulty variance that
   # dominates the aggregate, and only the rows where the two runs disagree carry
-  # information.
+  # information. It does NOT cancel cross-session judge drift (the parent's draw
+  # is from an earlier judge session) — the accepted trade for not re-evaluating
+  # the parent every round, which would double eval spend. See docs/decisions.md.
   #
   # The test is a veto on KEEP, never a promotion -- it cannot rescue a mutation
   # the frontier rejected for regressing. See src/anvil/eval/significance.py.

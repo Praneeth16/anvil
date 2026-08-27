@@ -343,3 +343,54 @@ replication enters the picture.
 promote anything. Reading `gate.replicates` from a config the round could have
 rewritten — it is read after `verify_changed_paths` has restored out-of-scope
 writes, so a round cannot buy itself statistical power.
+
+## D13 — The paired test compares against the kept parent, not the frozen baseline
+
+**Decision.** The paired sign test's comparator is the **current parent
+scaffold's most recent eval draw**, persisted to `eval/runs/parent.json` on
+every KEEP and loaded by the next round (`anvil.eval.cache.load_parent`).
+Before the first KEEP — or right after `scripts/make_baseline.py` re-anchors,
+which deletes `parent.json` — the frozen baseline stands in, because it is the
+parent of the first candidate by definition. The frozen baseline itself is
+never overwritten: it stays the round-1 anchor and the frontier's seed.
+
+**Why.** D12 made promotion require a paired test, but the test paired each
+candidate against the frozen original baseline forever (`save_baseline` ran
+only from `scripts/make_baseline.py`). After A→B was kept, candidate C was
+paired against A while the frontier judged C against B — so from round two on
+the veto answered "does the candidate differ from the original scaffold", not
+"does it improve on its parent". Those are different questions, and the loop
+was being graded on the one nobody asked (issue #19).
+
+**Why persist-on-KEEP and not contemporaneous re-eval.** The statistically
+cleanest design re-evaluates parent and candidate in the same judge session
+each round, controlling cross-session judge drift by construction. It also
+doubles eval spend per round — at 50 dev rows × 50+ rounds, that is the
+difference between an affordable campaign and an unaffordable one. The cheaper
+design accepts that the parent's draw comes from an earlier judge session:
+pairing cancels row difficulty, not session drift. That risk is already borne
+by the frontier gate, which compares best-so-far scores measured across many
+sessions, so the veto is no weaker than the gate it vetoes. The gate-validation
+harness (#8) will measure the drift empirically rather than assume it away.
+
+**Why a new file.** `baseline.json` is git-tracked reference data with a
+comparability contract (mode, endpoints, fingerprints) that tests and tooling
+depend on. `parent.json` is round state: rewritten wholesale on every KEEP,
+written by nothing else. A superseded parent's draw is never consulted again,
+and reuse across a revert streak is correct by construction — the parent is
+genuinely still that scaffold. `parent.json` follows `frontier.json`'s
+persistence pattern exactly: an uncommitted working-tree file that branch
+operations carry over.
+
+**Enforced by.** `round.py` loads `load_parent() or load_baseline()` as the
+single comparator for the prompt, the score delta, and the gate call; the KEEP
+path writes it via `save_parent(report_to_baseline(...))` before the git
+verdict; a pre-flight `dataset_incomparability_reason` check on `parent.json`
+raises before any spend if the comparator went stale out-of-band (mid-campaign
+baseline regen, hand edit); `make_baseline.py` deletes `parent.json` whenever
+it writes a new baseline.
+
+**Rules out.** Pairing against the frozen baseline once a KEEP exists.
+Persisting a vetoed or reverted candidate's draw as anyone's comparator.
+Overwriting `baseline.json` from the round loop. Failing open when the parent
+comparator is dataset-incompatible (the pre-flight raises instead).

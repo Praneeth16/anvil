@@ -159,6 +159,16 @@ again on the new primary domain: the MultiHopRAG migration regenerates the
 baseline on the 50-row dev partition as part of the same change. The paired
 gate is operative, not documented.
 
+### 4. Parent-anchored paired test (#19) — DONE
+
+The paired test now compares each candidate against its actual parent:
+`eval/runs/parent.json` is rewritten from the kept candidate's eval report on
+every KEEP, with the frozen baseline standing in only until the first KEEP.
+The contemporaneous alternative (re-evaluate the parent every round) was
+rejected on cost — the trade and its drift caveat are recorded as D13 in
+`docs/decisions.md`. #8's A/A harness remains the empirical check on
+cross-session judge drift.
+
 ---
 
 ## Closed

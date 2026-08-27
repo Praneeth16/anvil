@@ -43,7 +43,7 @@ The most-failed examples in the parent run (read the full list in
 ## What you must do
 
 1. Read ``prompts/anvil-round.md`` — the action contract.
-2. Read ``eval/runs/baseline.json`` and the failure traces it points to.
+2. Read ``{baseline_path}`` and the failure traces it points to.
 3. Read every active rule + skill from ``scaffold/harness.yaml`` (and
    the most recent ~3 critiques in ``scaffold/memory/``) so your
    mutation does not clash with what's already there.
@@ -64,6 +64,7 @@ def build_round_prompt(
     repo_root: Path | str,
     round_id: int,
     baseline: dict | None,
+    baseline_path: str = "eval/runs/baseline.json",
     critique_lookback: int = 3,
 ) -> str:
     repo_root = Path(repo_root)
@@ -89,7 +90,7 @@ def build_round_prompt(
             f"{bucket}={scores.get('correctness', 0.0):.2f}"
             for bucket, scores in baseline.get("per_bucket", {}).items()
         )
-        baseline_failures_path = "eval/runs/baseline.json"
+        baseline_failures_path = baseline_path
         # The baseline cache itself doesn't carry per-row failures
         # (it has aggregate + per_bucket only); point at the
         # underlying eval JSON via the mlflow_run_id, and at the
@@ -106,6 +107,7 @@ def build_round_prompt(
         scorers=scorers_str,
         per_judge=per_judge_str,
         per_bucket_correctness=per_bucket_str,
+        baseline_path=baseline_path,
         baseline_failures_path=baseline_failures_path,
         failures_summary=failures_summary,
         critique_lookback=critique_lookback,

@@ -21,17 +21,32 @@ almost nothing — no normality, no equal variances, no known noise scale — wh
 is the right posture when the noise source is an LLM judge whose distribution
 nobody has characterised.
 
+**What the two runs are.** The candidate's draw, and the *current parent*
+scaffold's most recent draw — ``eval/runs/parent.json``, rewritten on every
+KEEP, with the frozen baseline standing in only until the first KEEP. The
+comparison used to be against the frozen original baseline forever, which
+from round two on answered "does the candidate differ from the original
+scaffold" rather than "does it improve on its parent" (issue #19). Pairing
+cancels row difficulty because both runs answer the same questions; it does
+**not** cancel cross-session judge drift, because the parent's draw comes
+from an earlier judge session. That limitation is accepted and recorded in
+``docs/decisions.md``: the contemporaneous alternative (re-evaluate the
+parent every round) doubles eval spend to control a drift the frontier gate
+already tolerates by comparing best-so-far scores across sessions.
+
 **One-sided, deliberately.** The question the gate asks is "is this better",
 not "is this different". A two-sided test would spend half its significance
 budget on the possibility that the mutation made things worse, which is not a
 hypothesis the gate needs to distinguish from "no change" — both revert.
 
-**What this cannot do.** At 12 rows a sign test has little power: it will not
-detect a small real improvement, and it will say "not significant" for many
-mutations that did help slightly. That is the honest trade, and it is why
-``gate.replicates`` exists — replication tightens the per-row estimates so the
-same test can see smaller effects. A test that cannot detect an effect reports
-exactly that, rather than a verdict it has not earned.
+**What this cannot do.** On the 50-row dev partition a typical round yields
+~30 discordant pairs, which detects a q=0.65–0.70 mutation with power
+0.5–0.7 — and still misses smaller effects. On a smaller mode the test will
+say "not significant" for many mutations that did help slightly. That is the
+honest trade, and it is why ``gate.replicates`` exists — replication tightens
+the per-row estimates so the same test can see smaller effects. A test that
+cannot detect an effect reports exactly that, rather than a verdict it has
+not earned.
 
 ``mlflow.genai.evaluate`` offers no ``seed``, no repetition count and no paired
 mode (`docs/verified-api-surface.md`), so this is ANVIL's to build. It is pure,

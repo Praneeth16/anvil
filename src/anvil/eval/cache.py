@@ -306,6 +306,53 @@ def save_baseline(repo_root: Path | str, baseline: CachedBaseline) -> Path:
     return path
 
 
+def parent_path(repo_root: Path | str) -> Path:
+    return Path(repo_root) / "eval" / "runs" / "parent.json"
+
+
+def load_parent(repo_root: Path | str) -> CachedBaseline | None:
+    """Load the current parent scaffold's most recent eval draw, or ``None``.
+
+    ``parent.json`` is the paired test's comparator once the loop has KEPT at
+    least one round: the kept candidate becomes the parent of everything that
+    follows, so its per-row scores — not the frozen baseline's — are what the
+    next candidate must beat row by row. Absent means no KEEP has happened
+    (or the baseline was just regenerated), and the caller falls back to the
+    frozen baseline, which is the correct comparator for exactly that case.
+
+    The schema is :class:`CachedBaseline` unchanged, so
+    :func:`report_to_baseline` writes it and the ``*_incomparability_reason``
+    helpers check it with no special cases.
+    """
+    path = parent_path(repo_root)
+    if not path.is_file():
+        return None
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    return CachedBaseline.from_dict(raw)
+
+
+def save_parent(repo_root: Path | str, parent: CachedBaseline) -> Path:
+    """Persist ``parent`` to ``eval/runs/parent.json``. Returns the path.
+
+    Called by the round loop on KEEP and nowhere else: a KEEP replaces the
+    parent, so the file is replaced wholesale — a superseded parent's draw is
+    never consulted again. A REVERT writes nothing, because the parent did
+    not change; reusing the existing draw across a revert streak is correct
+    by construction, not the frozen-control bug this file exists to fix.
+
+    One honest limitation, recorded in docs/decisions.md: the parent's draw
+    comes from an earlier judge session, so the paired test cancels row
+    difficulty but not cross-session judge drift. The contemporaneous
+    alternative (re-evaluate the parent every round) was rejected — it
+    doubles eval spend to control a drift the frontier gate already tolerates
+    by comparing best-so-far scores across sessions.
+    """
+    path = parent_path(repo_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(parent.to_dict(), indent=2) + "\n", encoding="utf-8")
+    return path
+
+
 def scorer_incomparability_reason(
     cached: CachedBaseline,
     *,
