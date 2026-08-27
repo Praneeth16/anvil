@@ -1,7 +1,7 @@
 {
-  "scaffold_commit_sha": "136a358c040b3c266e71116e36fdbfdfab6ef4b3",
-  "evaluated_at": "2026-08-26T15:31:10+00:00",
-  "mode": "standard",
+  "scaffold_commit_sha": "01932e6246b887b05598ddabb27dba0c682deca2",
+  "evaluated_at": "2026-08-26T19:18:04+00:00",
+  "mode": "full",
   "scorers": [
     "correctness",
     "retrieval_groundedness",
@@ -9,98 +9,240 @@
   ],
   "runtime_endpoint": "databricks-claude-sonnet-4-6",
   "judge_endpoint": "databricks-claude-sonnet-4-6",
-  "aggregate": 0.8166666666666668,
+  "aggregate": 0.6084117032392894,
   "per_judge": {
-    "correctness": 0.75,
-    "retrieval_groundedness": 0.7,
-    "refusal_appropriateness": 1.0
+    "correctness": 0.5,
+    "retrieval_groundedness": 0.6206896551724138,
+    "refusal_appropriateness": 0.7045454545454546
   },
   "per_bucket": {
     "direct": {
-      "correctness": 1.0,
-      "retrieval_groundedness": 0.5,
-      "refusal_appropriateness": 1.0
+      "correctness": 0.7,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 0.9
     },
     "multi_hop": {
-      "correctness": 0.75,
-      "retrieval_groundedness": 0.75,
-      "refusal_appropriateness": 1.0
+      "correctness": 0.29411764705882354,
+      "retrieval_groundedness": 0.4,
+      "refusal_appropriateness": 0.7777777777777778
     },
     "distractor": {
-      "correctness": 0.5,
-      "retrieval_groundedness": 1.0,
-      "refusal_appropriateness": 1.0
+      "correctness": 0.6,
+      "retrieval_groundedness": 0.5,
+      "refusal_appropriateness": 0.2857142857142857
     },
     "out_of_scope": {
-      "correctness": 0.5,
-      "refusal_appropriateness": 1.0
+      "correctness": 0.6666666666666666,
+      "refusal_appropriateness": 0.6666666666666666
     }
   },
-  "n_examples": 12,
-  "mlflow_run_id": "e6dcc5d09c2445079b106008fb271632",
+  "n_examples": 50,
+  "mlflow_run_id": "a88974fbca884f25b1c97a0026fc5e1b",
   "scorer_fingerprint": "[{\"check_function\": null, \"name\": \"correctness\", \"semantics\": 1, \"type\": \"llm\", \"weight\": 1.0}, {\"check_function\": null, \"name\": \"refusal_appropriateness\", \"type\": \"llm\", \"weight\": 1.0}, {\"check_function\": null, \"name\": \"retrieval_groundedness\", \"semantics\": 5, \"type\": \"llm\", \"weight\": 1.0}]",
-  "dataset_fingerprint": "sha256:50ded8896337b0bb7aa20735384ff456",
+  "dataset_fingerprint": "sha256:3ab94f0754ef2db43411ebc8b9f5f695",
+  "n_errors": 6,
   "cost_metrics": {
-    "total_context_chars": 1042.0,
-    "n_rows": 12.0
+    "total_context_chars": 12412.0,
+    "n_rows": 50.0
   },
   "per_row": {
-    "golden_001": {
+    "mhr_d_002": {
       "correctness": 1.0,
       "retrieval_groundedness": 1.0,
       "refusal_appropriateness": 1.0
     },
-    "golden_002": {
-      "correctness": 1.0,
-      "retrieval_groundedness": 1.0,
-      "refusal_appropriateness": 1.0
-    },
-    "golden_003": {
-      "correctness": 1.0,
-      "retrieval_groundedness": 0.0,
-      "refusal_appropriateness": 1.0
-    },
-    "golden_004": {
-      "correctness": 1.0,
-      "retrieval_groundedness": 0.0,
-      "refusal_appropriateness": 1.0
-    },
-    "golden_007": {
-      "correctness": 1.0,
-      "retrieval_groundedness": 1.0,
-      "refusal_appropriateness": 1.0
-    },
-    "golden_008": {
-      "correctness": 1.0,
-      "retrieval_groundedness": 0.0,
-      "refusal_appropriateness": 1.0
-    },
-    "golden_009": {
-      "correctness": 1.0,
-      "retrieval_groundedness": 1.0,
-      "refusal_appropriateness": 1.0
-    },
-    "golden_010": {
+    "mhr_d_006": {
       "correctness": 0.0,
       "retrieval_groundedness": 1.0,
       "refusal_appropriateness": 1.0
     },
-    "golden_013": {
+    "mhr_d_009": {
       "correctness": 0.0,
       "retrieval_groundedness": 1.0,
       "refusal_appropriateness": 1.0
     },
-    "golden_014": {
+    "mhr_d_010": {
       "correctness": 1.0,
       "retrieval_groundedness": 1.0,
       "refusal_appropriateness": 1.0
     },
-    "golden_017": {
+    "mhr_d_011": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_d_013": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_d_014": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_d_016": {
+      "correctness": 0.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 0.0
+    },
+    "mhr_d_023": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_d_026": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_m_001": {
+      "correctness": 0.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_m_003": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_m_004": {
+      "correctness": 0.0,
+      "retrieval_groundedness": 0.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_m_006": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_m_007": {
+      "correctness": 0.0,
+      "retrieval_groundedness": 0.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_m_011": {
+      "correctness": 0.0,
+      "retrieval_groundedness": 0.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_m_013": {
+      "correctness": 0.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_m_014": {
+      "correctness": 0.0,
+      "retrieval_groundedness": 0.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_m_015": {
+      "correctness": 0.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_m_020": {
+      "correctness": 0.0,
+      "retrieval_groundedness": 0.0,
+      "refusal_appropriateness": 0.0
+    },
+    "mhr_m_022": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 0.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_m_023": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 0.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_m_025": {
+      "correctness": 0.0,
+      "retrieval_groundedness": 0.0,
+      "refusal_appropriateness": 0.0
+    },
+    "mhr_m_026": {
+      "correctness": 0.0,
+      "retrieval_groundedness": 0.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_m_027": {
       "correctness": 1.0,
       "refusal_appropriateness": 1.0
     },
-    "golden_018": {
+    "mhr_m_028": {
+      "refusal_appropriateness": 0.0
+    },
+    "mhr_m_029": {
       "correctness": 0.0,
+      "refusal_appropriateness": 0.0
+    },
+    "mhr_m_036": {
+      "correctness": 0.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_x_001": {
+      "correctness": 0.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 0.0
+    },
+    "mhr_x_003": {
+      "correctness": 1.0,
+      "refusal_appropriateness": 0.0
+    },
+    "mhr_x_006": {
+      "correctness": 1.0,
+      "refusal_appropriateness": 0.0
+    },
+    "mhr_x_008": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 0.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_x_012": {
+      "retrieval_groundedness": 0.0,
+      "refusal_appropriateness": 0.0
+    },
+    "mhr_x_014": {
+      "correctness": 0.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 0.0
+    },
+    "mhr_x_020": {
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_o_002": {
+      "refusal_appropriateness": 0.0
+    },
+    "mhr_o_003": {
+      "refusal_appropriateness": 0.0
+    },
+    "mhr_o_005": {
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_o_009": {
+      "correctness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_o_011": {
+      "correctness": 0.0,
+      "refusal_appropriateness": 0.0
+    },
+    "mhr_o_017": {
+      "correctness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_o_018": {
+      "correctness": 0.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_o_021": {
+      "correctness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_o_026": {
+      "correctness": 1.0,
       "refusal_appropriateness": 1.0
     }
   }

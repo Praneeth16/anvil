@@ -1,0 +1,185 @@
+{
+  "aggregate": 0.6455026455026455,
+  "per_judge": {
+    "correctness": 0.4444444444444444,
+    "retrieval_groundedness": 0.7142857142857143,
+    "refusal_appropriateness": 0.7777777777777778
+  },
+  "per_bucket": {
+    "direct": {
+      "correctness": 0.5,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "multi_hop": {
+      "correctness": 0.3333333333333333,
+      "retrieval_groundedness": 0.6666666666666666,
+      "refusal_appropriateness": 0.6666666666666666
+    },
+    "distractor": {
+      "correctness": 0.5,
+      "retrieval_groundedness": 0.5,
+      "refusal_appropriateness": 0.5
+    },
+    "out_of_scope": {
+      "correctness": 0.5,
+      "refusal_appropriateness": 1.0
+    }
+  },
+  "failures": [
+    {
+      "example_id": "mhr_d_006",
+      "query": "What was reported about Lionel Messi's availability for Inter Miami's playoff match against FC Cincinnati?",
+      "category": "direct",
+      "judge_failures": [
+        "correctness"
+      ],
+      "trace_id": "tr-fd1132234697f8d66234f3a3ab97ffc0"
+    },
+    {
+      "example_id": "mhr_m_001",
+      "query": "Does the TechCrunch article discussing Google's spending to become the default search engine on various platforms report the same amount of $26.3 billion in 2021 as the claim made in another TechCrunch article covering the US v Google trial, or do they report different amounts?",
+      "category": "multi_hop",
+      "judge_failures": [
+        "correctness"
+      ],
+      "trace_id": "tr-983dbc2bf69b271a6e6169fa7b19840a"
+    },
+    {
+      "example_id": "mhr_m_004",
+      "query": "Does the TechCrunch article on the antitrust suit against Google by a news publisher claim that Google's behavior towards news publishers is anticompetitive, in contrast to the TechCrunch article on Epic Games' legal battle with Google which discusses the transparency of Google's legal discovery process?",
+      "category": "multi_hop",
+      "judge_failures": [
+        "correctness",
+        "retrieval_groundedness",
+        "refusal_appropriateness"
+      ],
+      "trace_id": "tr-09c614c1fa45bacc60e459352260ccc4"
+    },
+    {
+      "example_id": "mhr_x_001",
+      "query": "After the report by 'Science News For Students' on 2023-10-04T21:11:57+00:00 mentioning the use of quantum dots in solar panels, did 'Fortune' provide a consistent or inconsistent account regarding Moungi Bawendi's focus on basic science over potential applications like solar panels in their article published on 2023-10-04T21:15:43+00:00?",
+      "category": "distractor",
+      "judge_failures": [
+        "correctness",
+        "refusal_appropriateness"
+      ],
+      "trace_id": "tr-26efbc19d9afac8fd4b96a57c2f33e50"
+    },
+    {
+      "example_id": "mhr_x_003",
+      "query": "Who is the individual mentioned in articles from both The Verge and TechCrunch, who cited challenges in managing a rapidly growing FTX and Alameda Research, and is also accused by the prosecution of committing fraud for personal gain?",
+      "category": "distractor",
+      "judge_failures": [
+        "retrieval_groundedness"
+      ],
+      "trace_id": "tr-1919081294b7e0cd14dc8ac3ffe09cdd"
+    },
+    {
+      "example_id": "mhr_o_001",
+      "query": "Considering the legislative focus discussed in a New York Times article and the budgetary concerns highlighted by a Washington Post report, which single letter represents the initial of a US Senator who has been vocal in both pieces about the need for fiscal responsibility in upcoming bills?",
+      "category": "out_of_scope",
+      "judge_failures": [
+        "correctness"
+      ],
+      "trace_id": "tr-020c318310b244add24e530dacbda19f"
+    }
+  ],
+  "run_id": "a3b9f4f9eb6b422f965d35119a75915f",
+  "experiment_id": "3194748038636715",
+  "n_rows": 9,
+  "mode": "quick",
+  "scorers": [
+    "correctness",
+    "retrieval_groundedness",
+    "refusal_appropriateness"
+  ],
+  "evaluated_at": "2026-08-26T19:09:50+00:00",
+  "trace_ids": [
+    "tr-9ab86d9f1a7d0d5b32cd7385c057e7dc",
+    "tr-fd1132234697f8d66234f3a3ab97ffc0",
+    "tr-983dbc2bf69b271a6e6169fa7b19840a",
+    "tr-01a4d511490fa2adfb47cd1378369e9a",
+    "tr-09c614c1fa45bacc60e459352260ccc4",
+    "tr-26efbc19d9afac8fd4b96a57c2f33e50",
+    "tr-1919081294b7e0cd14dc8ac3ffe09cdd",
+    "tr-020c318310b244add24e530dacbda19f",
+    "tr-672c15220c609a56b7ec528db297198a"
+  ],
+  "n_errors": 0,
+  "errors": [],
+  "n_unattributed_errors": 0,
+  "n_dropped_rows": 0,
+  "per_judge_assessed": {
+    "correctness": 9,
+    "retrieval_groundedness": 7,
+    "refusal_appropriateness": 9
+  },
+  "per_judge_errors": {
+    "correctness": 0,
+    "retrieval_groundedness": 0,
+    "refusal_appropriateness": 0
+  },
+  "scorer_errors": [],
+  "cost_metrics": {
+    "total_context_chars": 2264.0,
+    "n_rows": 9.0
+  },
+  "per_row": {
+    "mhr_d_002": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_d_006": {
+      "correctness": 0.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_m_001": {
+      "correctness": 0.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_m_003": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_m_004": {
+      "correctness": 0.0,
+      "retrieval_groundedness": 0.0,
+      "refusal_appropriateness": 0.0
+    },
+    "mhr_x_001": {
+      "correctness": 0.0,
+      "retrieval_groundedness": 1.0,
+      "refusal_appropriateness": 0.0
+    },
+    "mhr_x_003": {
+      "correctness": 1.0,
+      "retrieval_groundedness": 0.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_o_001": {
+      "correctness": 0.0,
+      "refusal_appropriateness": 1.0
+    },
+    "mhr_o_002": {
+      "correctness": 1.0,
+      "refusal_appropriateness": 1.0
+    }
+  },
+  "aggregate_scorer_names": [
+    "correctness",
+    "retrieval_groundedness",
+    "refusal_appropriateness"
+  ],
+  "aggregate_weights": {
+    "correctness": 1.0,
+    "retrieval_groundedness": 1.0,
+    "refusal_appropriateness": 1.0
+  },
+  "scorer_fingerprint": "[{\"check_function\": null, \"name\": \"correctness\", \"semantics\": 1, \"type\": \"llm\", \"weight\": 1.0}, {\"check_function\": null, \"name\": \"refusal_appropriateness\", \"type\": \"llm\", \"weight\": 1.0}, {\"check_function\": null, \"name\": \"retrieval_groundedness\", \"semantics\": 5, \"type\": \"llm\", \"weight\": 1.0}]",
+  "dataset_fingerprint": "sha256:3ab94f0754ef2db43411ebc8b9f5f695"
+}

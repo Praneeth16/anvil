@@ -29,3 +29,14 @@ tools:
     policy documents." say that the Pyloom docs do not cover the question.
 
     '
+  parameters:
+    type: object
+    properties:
+      query:
+        type: string
+        description: Natural-language search query over the Pyloom documentation.
+      k:
+        type: integer
+        description: Maximum number of documentation pages to return (default 3).
+    required:
+    - query

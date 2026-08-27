@@ -43,11 +43,11 @@ optimizer_endpoint: databricks-claude-opus-4-7
 judge_endpoint: databricks-claude-sonnet-4-6
 
 # The refusal judge's own description of the domain it is grading. Left unset
-# here, which means the shipped NeoVolt defaults in `anvil.eval.scorers` are
-# used and the judge prompt is byte-for-byte what it has always been.
+# here, which means the shipped MultiHopRAG defaults in `anvil.eval.scorers`
+# are used.
 #
 # Set both to grade a different domain without touching library code. See
-# `examples/` for a worked case, and note the consequence: these two strings
+# `examples/` for worked cases, and note the consequence: these two strings
 # change what the refusal judge measures, so they are folded into the scorer
 # fingerprint and setting them INVALIDATES `eval/runs/baseline.json` by design.
 # Regenerate the baseline with scripts/make_baseline.py after changing them.
@@ -55,12 +55,14 @@ judge_endpoint: databricks-claude-sonnet-4-6
 # They live in this file, not in `scaffold/`, because the optimizer is graded by
 # this judge and must not be able to rewrite its own grader.
 #
-# judge_domain_name: NeoVolt
+# judge_domain_name: MultiHopRAG
 # judge_domain_context: |-
-#   Domain: NeoVolt, a fictional electricity & gas utility. The agent
-#   has a knowledge base of NeoVolt policies and a `search_knowledge_base`
-#   tool. The agent should refuse out-of-scope or unanswerable questions
-#   and answer in-scope ones using the knowledge base.
+#   Domain: MultiHopRAG, a multi-hop question-answering benchmark over a
+#   news-article corpus. The agent has a knowledge base of news articles
+#   and a `search_knowledge_base` tool. Many questions require combining
+#   facts from several articles. The agent should refuse questions the
+#   articles do not answer and answer covered ones using the knowledge
+#   base.
 
 # MLflow experiment paths. Stable, declared here, NOT driven by
 # environment variables (which lint/format passes have historically
@@ -98,29 +100,39 @@ eval:
   held_out_test: true
   # Default mode for `evaluate_branch`. One of: quick, standard, full.
   #
-  # `standard` (12 rows), not `quick` (8), because two healthy 8-row runs of the
-  # SAME scaffold differed by ~0.15 of aggregate from judge noise alone (see
-  # docs/design/failure-vs-error.md) while `gate.epsilon` is 0.0 — so at 8 rows
-  # the gate reads noise of that size as signal. This must also match the mode
-  # `eval/runs/baseline.json` was generated at: the round path compares against
-  # the cached aggregate without checking the modes agree, so a mismatch would
-  # silently compare a 12-row mean against an 8-row one.
-  default_mode: standard
-  # Anti-overfit data split. When enabled, the golden set is partitioned
-  # into train (reserved for optimizer-visible use; currently not scored),
-  # dev (round-by-round eval), and test (held-out finalization only). Split is
-  # deterministic by hash of example_id, so membership remains stable.
-  # split:
-  #   enabled: false
-  #   train_ratio: 0.6
-  #   dev_ratio: 0.2
-  #   seed: 42
-  # Row count per mode (deterministic sub-set of the golden set).
+  # `full` — the whole 50-row dev partition — because that is where the paired
+  # gate's power comes from: a sign test over ~30 discordant pairs detects a
+  # q=0.65-0.70 mutation with power 0.5-0.7, where 12-15 rows could not (issue
+  # #15 measured 0.185). This costs 50 rows of eval per round instead of 12;
+  # that is the intended trade, and quick (9) remains for smoke checks. This
+  # must also match the mode `eval/runs/baseline.json` was generated at: the
+  # round path compares against the cached aggregate without checking the modes
+  # agree, so a mismatch would silently compare means over different row sets.
+  default_mode: full
+  # Anti-overfit data split (issues #15/#21 — enabled). The 120-row golden set
+  # is partitioned by hash of example_id into train (40 rows; reserved for
+  # optimizer-visible use, currently not scored), dev (50 rows; round-by-round
+  # eval), and test (30 rows; held-out finalization only — scripts/finalize.py
+  # is the sole caller allowed to run test mode). Membership is deterministic
+  # and the vendoring script pins the per-bucket table exactly; any change to
+  # ratios, seed, or example_ids requires re-running
+  # scripts/build_multihop_domain.py --check.
+  split:
+    enabled: true
+    train_ratio: 0.3333   # 40/120
+    dev_ratio: 0.4167     # 50/120; remainder 0.25 -> 30 test
+    seed: 42
+  # Row count per mode. With split enabled, non-test bucket counts are declared
+  # at FULL-SET scale and scaled by split.dev_ratio (rounded, min 1) onto the
+  # dev partition — `rows` documents the resulting dev count and is read only
+  # by test mode, whose selection is the whole test partition. Do not hand-tune
+  # without re-running the vendoring script's mode dry-run (banker's rounding:
+  # round(2.5) == 2).
   modes:
-    quick:    {rows: 8,  buckets: {direct: 2, multi_hop: 2, distractor: 2, out_of_scope: 2}}
-    standard: {rows: 12, buckets: {direct: 4, multi_hop: 4, distractor: 2, out_of_scope: 2}}
-    full:     {rows: 20, buckets: {direct: 6, multi_hop: 6, distractor: 4, out_of_scope: 4}}
-    test:     {rows: 20, buckets: {direct: 6, multi_hop: 6, distractor: 4, out_of_scope: 4}}
+    quick:    {rows: 9,  buckets: {direct: 5,  multi_hop: 7,  distractor: 5,  out_of_scope: 5}}
+    standard: {rows: 15, buckets: {direct: 7,  multi_hop: 14, distractor: 6,  out_of_scope: 6}}
+    full:     {rows: 50, buckets: {direct: 24, multi_hop: 48, distractor: 24, out_of_scope: 24}}
+    test:     {rows: 30, buckets: {direct: 6,  multi_hop: 12, distractor: 6,  out_of_scope: 6}}
   # Parallelism for predict_fn rows. Tune down if TPM saturates.
   n_workers: 4
   # Cooldown seconds between row tasks inside the thread pool when

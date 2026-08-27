@@ -9,9 +9,11 @@ from types import ModuleType
 
 import pytest
 
-from anvil.data import load_golden_set, select_subset
+from anvil.data import load_golden_set
+from anvil.eval import runner
 from anvil.eval.runner import EvalReport
 from anvil.loop.frontier import Frontier
+from anvil.runtime.loader import load_harness
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SHA = "b" * 40
@@ -59,15 +61,28 @@ def _write_config(root: Path, *, enabled: bool = True) -> None:
     )
 
 
-def test_test_mode_selects_all_golden_rows() -> None:
+def test_test_mode_selects_exactly_the_test_partition() -> None:
+    """Held-out finalization scores the test partition and nothing else.
+
+    Issue #21: the old `test` mode selected all 20 golden rows — including the
+    12 the optimizer was graded on every round. With the split enabled, `test`
+    mode returns the whole test partition (pinned at 30 rows), which shares no
+    example_id with the dev partition the rounds see.
+    """
     examples = load_golden_set(REPO_ROOT / "data" / "golden_set.jsonl")
-    selected = select_subset(
-        examples,
-        buckets={"direct": 6, "multi_hop": 6, "distractor": 4, "out_of_scope": 4},
-    )
-    assert len(examples) == 20
-    assert len(selected) == 20
-    assert {row["example_id"] for row in selected} == {row["example_id"] for row in examples}
+    cfg = load_harness(REPO_ROOT / "scaffold").config.eval
+    _, dev, test_partition = runner.partition_dataset(examples, cfg.split)
+
+    selected = runner._select_mode_examples(examples, cfg=cfg, selected_mode="test")
+    assert len(examples) == 120
+    assert len(test_partition) == 30
+    assert list(selected) == test_partition
+
+    dev_ids = {row["example_id"] for row in dev}
+    assert dev_ids.isdisjoint(row["example_id"] for row in selected)
+    with pytest.warns(UserWarning, match="scaled 'full' bucket counts"):
+        full = runner._select_mode_examples(examples, cfg=cfg, selected_mode="full")
+    assert {row["example_id"] for row in full} == dev_ids
 
 
 def test_finalize_cli_writes_expected_payload(

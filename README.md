@@ -1,8 +1,8 @@
 # ANVIL
 
-**A self-mutating agent harness on Databricks.** An optimizer LLM rewrites a
-support agent's prompt scaffold, round after round, and an evaluation gate
-decides which rewrites survive.
+**A self-mutating agent harness on Databricks.** An optimizer LLM rewrites an
+agent's prompt scaffold, round after round, and an evaluation gate decides
+which rewrites survive.
 
 [![CI](https://github.com/Praneeth16/anvil/actions/workflows/ci.yml/badge.svg)](https://github.com/Praneeth16/anvil/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
@@ -45,21 +45,24 @@ What makes that work in practice:
 
 ## What it has done
 
-Ten rounds on the built-in support domain, 7 kept and 3 no-op:
+Ten rounds on the NeoVolt support domain, 7 kept and 3 no-op — measured
+history, preserved with that domain at [`examples/neovolt/`](examples/neovolt/).
+Those rounds also exposed the harness's binding constraints: the 20-row golden
+set capped the paired gate's power at 0.185, and the optimizer was graded on
+the same 12 rows every round, so "held-out" finalization was 60% seen rows.
 
-| Round | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
-|---|---|---|---|---|---|---|---|---|---|---|
-| Aggregate | 0.750 | 0.778 | 0.833 | 0.819 | — | 0.875 | — | 0.875 | — | 0.819 |
-| Decision | keep | keep | keep | keep | noop | keep | noop | keep | noop | keep |
+The primary domain is now **MultiHopRAG**: a 120-row golden set over a
+350-article news knowledge base, vendored by
+[`scripts/build_multihop_domain.py`](scripts/build_multihop_domain.py) and
+split 40 train / 50 dev / 30 test. Rounds evaluate against the whole dev
+partition, which is what gives the gate real power; finalization alone touches
+the test partition. See `data/ATTRIBUTION.md` for dataset licensing.
 
-Three things to know before reading anything into those numbers. They ran under
-scorer semantics v1–v3, and v4 changed which buckets a scorer applies to, so they
-are incomparable to the current baseline of 0.828 on `standard` and a rerun would
-not reproduce them. Ten rounds is a fifth of the 50-round target, and the
-interesting question lives past that point: whether gains keep coming, or the
-optimizer runs out of ideas. And two runs of the *same* scaffold on the same rows
-differed by about 0.15 of aggregate from judge noise alone, which is larger than
-most of the per-round gains in the table. See [Limitations](#limitations).
+Two things to know before reading anything into the historical numbers. They
+ran under scorer semantics v1–v3, incomparable to any current baseline. And two
+runs of the *same* scaffold on the same rows differed by about 0.15 of
+aggregate from judge noise alone, which is larger than most per-round gains —
+the reason the gate requires a paired sign test. See [Limitations](#limitations).
 
 ## How a round works
 
@@ -132,11 +135,11 @@ Then, against a real workspace:
 # Reads files only, so no LLM call and no cost.
 uv run python scripts/round_show.py
 
-# Smallest real eval (8 rows, 3 judges)
+# Smallest real eval (9 dev rows, 3 judges)
 uv run python scripts/evaluate.py --mode quick
 
-# The mode the gate actually uses (12 rows, ~3-5 min)
-uv run python scripts/evaluate.py --mode standard
+# The mode the gate actually uses (50 dev rows, ~15-25 min)
+uv run python scripts/evaluate.py --mode full
 
 # Establish the bar, then optimize
 uv run python scripts/make_baseline.py
@@ -172,7 +175,8 @@ uv run python scripts/evaluate.py \
 [`examples/pyloom-docs/`](examples/pyloom-docs/) is a complete worked example: a
 documentation-support agent for a fictional Python library, with 14
 knowledge-base pages, a 20-row golden set, and a starting scaffold with real
-headroom left in it.
+headroom left in it. [`examples/neovolt/`](examples/neovolt/) preserves the
+original support domain with its ten rounds of measured history.
 
 Its golden set is built around traps, because a golden set without traps proves
 nothing. The knowledge base documents a deprecated v1 client alongside the
@@ -241,15 +245,12 @@ round actually changed.
 - **Judge noise is the binding constraint.** About 0.15 of aggregate between two
   identical runs at 8 rows, reproduced again while building
   `examples/pyloom-docs/`, where two runs of one unchanged scaffold scored 0.875
-  and 0.917 and differed on a single refusal row. The gate now requires a paired
+  and 0.917 and differed on a single refusal row. The gate requires a paired
   sign test over the per-row scores, which is what makes a real gain
-  distinguishable from that noise. At 12 rows the test is weak: expect rounds to
-  revert as underpowered, and raise `gate.replicates` to buy the power back at
+  distinguishable from that noise. Power scales with rows: the 50-row dev
+  partition detects a q=0.65–0.70 mutation with power ~0.5–0.7, the `quick`
+  and `standard` modes are far weaker, and `gate.replicates` buys more at
   proportional cost.
-- **The paired gate is inert until you regenerate the baseline.**
-  `eval/runs/baseline.json` as shipped carries no per-row scores, so every round
-  reports that it could not run the test and the frontier decision stands
-  unchecked. One command fixes it: `scripts/make_baseline.py`.
 - **The judge is unaligned.** `Judge.align` exists and has not been used. It
   would shrink the noise floor itself, which beats compensating for it, but it
   needs human labels on real traces and there is no honest way to synthesize
@@ -277,4 +278,5 @@ round actually changed.
 
 ## License
 
-[Apache License 2.0](LICENSE).
+[Apache License 2.0](LICENSE). The shipped evaluation domain derives from the
+MultiHopRAG dataset (ODC-BY 1.0) — see [`data/ATTRIBUTION.md`](data/ATTRIBUTION.md).

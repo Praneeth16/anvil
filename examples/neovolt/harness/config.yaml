@@ -1,0 +1,99 @@
+# ANVIL runtime config for the NeoVolt example — IMMUTABLE.
+#
+# The loader finds this file by convention: `<x>/scaffold/` and
+# `<x>/harness/config.yaml` are siblings, so passing
+# `--scaffold examples/neovolt/scaffold` picks this up automatically. There
+# is no flag for it, and that is deliberate — the config that sets the eval's
+# thresholds must travel with the scaffold being evaluated.
+#
+# NeoVolt is ANVIL's original domain: the first ten optimization rounds were
+# run against it, and its baseline, round records, and mutation log ship in
+# `eval/` as measured history. It became an example when MultiHopRAG took over
+# as the primary domain (issue #15).
+
+mode: prompt
+
+runtime_endpoint: databricks-claude-sonnet-4-6
+optimizer_endpoint: databricks-claude-opus-4-7
+judge_endpoint: databricks-claude-sonnet-4-6
+
+# The refusal judge's description of the domain it is grading. These are the
+# strings that used to be the library's built-in defaults — written out
+# explicitly here so this example's shipped baseline stays scorer-comparable:
+# the scorer fingerprint records judge_domain_* only when they differ from the
+# library default (now MultiHopRAG), and an explicit NeoVolt here is exactly
+# such a difference, matching the fingerprint this domain's baseline was
+# generated with.
+judge_domain_name: NeoVolt
+judge_domain_context: |-
+  Domain: NeoVolt, a fictional electricity & gas utility. The agent
+  has a knowledge base of NeoVolt policies and a `search_knowledge_base`
+  tool. The agent should refuse out-of-scope or unanswerable questions
+  and answer in-scope ones using the knowledge base.
+
+# Separate experiment paths, so this domain's traces and runs do not land in
+# the same experiments as the primary domain's. Comparing aggregates across
+# two domains is meaningless, and sharing an experiment invites exactly that.
+experiments:
+  runtime:   "/Shared/anvil-neovolt-runtime"
+  eval:      "/Shared/anvil-neovolt-eval"
+  optimizer: "/Shared/anvil-neovolt-optimizer"
+
+loop:
+  target_rounds: 50
+  stretch_rounds: 100
+  cost_budget_usd_per_round: 5.0
+  early_stop_after_stalled_rounds: 10
+  critique_lookback: 3
+  revert_lookback: 20
+  max_optimizer_turns: 30
+
+eval:
+  # Left false: the held-out split is single-use, and an example domain is for
+  # learning the harness. The ten shipped rounds were all scored on modes over
+  # the full golden set — there is nothing held out to finalize.
+  held_out_test: false
+  # `standard` (12 rows), not `quick` (8), because two healthy 8-row runs of
+  # the SAME scaffold differed by ~0.15 of aggregate from judge noise alone
+  # (see docs/design/failure-vs-error.md) while `gate.epsilon` is 0.0. This
+  # must also match the mode the shipped baseline was generated at.
+  default_mode: standard
+  # Row counts per mode. The golden set has exactly 6 direct / 6 multi_hop /
+  # 4 distractor / 4 out_of_scope rows, so `full` uses all 20 and the smaller
+  # modes take a deterministic prefix of each bucket.
+  modes:
+    quick:    {rows: 8,  buckets: {direct: 2, multi_hop: 2, distractor: 2, out_of_scope: 2}}
+    standard: {rows: 12, buckets: {direct: 4, multi_hop: 4, distractor: 2, out_of_scope: 2}}
+    full:     {rows: 20, buckets: {direct: 6, multi_hop: 6, distractor: 4, out_of_scope: 4}}
+    test:     {rows: 20, buckets: {direct: 6, multi_hop: 6, distractor: 4, out_of_scope: 4}}
+  n_workers: 4
+  inter_row_cooldown_s: 0.0
+  # Fraction of ATTEMPTED cases that may go unscored before the run is refused
+  # as unjudgeable rather than compared. Past this ceiling the run is an
+  # INFRA_FAIL, so a bad afternoon on the endpoint cannot discard a good
+  # mutation.
+  max_error_rate: 0.2
+  min_scorable_rows: 4
+  scorers:
+    - correctness
+    - retrieval_groundedness
+    - refusal_appropriateness
+  safety_guard_threshold: 0.95
+
+gate:
+  # frontier — a mutation is KEPT only if it improves at least one tracked
+  # objective without regressing any other by more than epsilon; the frontier
+  # persists to eval/runs/frontier.json. delta — legacy frozen-baseline.
+  type: frontier
+  epsilon: 0.0
+  # paired — after the frontier says KEEP, require the improvement to clear a
+  # one-sided paired sign test over the per-row scores (a veto on KEEP, never
+  # a promotion). none — legacy: any delta clearing epsilon promotes.
+  test: paired
+  alpha: 0.05
+  # Replicates per candidate. 1 costs nothing extra; expect more reverts as
+  # "underpowered" — honest, and the point. Raising it averages per-row scores
+  # over replicates at exactly proportional eval spend.
+  replicates: 1
+  pareto:
+    enabled: false

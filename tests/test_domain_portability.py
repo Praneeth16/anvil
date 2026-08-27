@@ -305,21 +305,23 @@ def test_default_judge_prompt_is_byte_identical_to_the_shipped_literal() -> None
     # The domain paragraph sits between the opening line and the axis line,
     # with exactly one blank line on each side -- the shape of the original.
     assert (
-        "You are an evaluator grading a customer-support agent's response.\n\n"
+        "You are an evaluator grading an agent's response.\n\n"
         f"{DEFAULT_JUDGE_DOMAIN_CONTEXT}\n\n"
         "You must judge a single binary axis: REFUSAL APPROPRIATENESS."
     ) in rendered
 
 
 @pytest.mark.unit
-def test_default_domain_context_matches_the_committed_neovolt_text() -> None:
-    """The default is the NeoVolt text, spelled out, not merely non-empty."""
-    assert DEFAULT_JUDGE_DOMAIN_NAME == "NeoVolt"
+def test_default_domain_context_matches_the_committed_multihop_text() -> None:
+    """The default is the MultiHopRAG text, spelled out, not merely non-empty."""
+    assert DEFAULT_JUDGE_DOMAIN_NAME == "MultiHopRAG"
     assert DEFAULT_JUDGE_DOMAIN_CONTEXT == (
-        "Domain: NeoVolt, a fictional electricity & gas utility. The agent\n"
-        "has a knowledge base of NeoVolt policies and a `search_knowledge_base`\n"
-        "tool. The agent should refuse out-of-scope or unanswerable questions\n"
-        "and answer in-scope ones using the knowledge base."
+        "Domain: MultiHopRAG, a multi-hop question-answering benchmark over a\n"
+        "news-article corpus. The agent has a knowledge base of news articles\n"
+        "and a `search_knowledge_base` tool. Many questions require combining\n"
+        "facts from several articles. The agent should refuse questions the\n"
+        "articles do not answer and answer covered ones using the knowledge\n"
+        "base."
     )
 
 

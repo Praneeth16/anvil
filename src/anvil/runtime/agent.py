@@ -160,7 +160,12 @@ def _openai_tool_defs(tools: list[ToolRef]) -> list[dict[str, Any]]:
                 "function": {
                     "name": t.name,
                     "description": t.description or "",
-                    "parameters": {
+                    # An empty schema leaves the model to guess argument names
+                    # from the description; measured on the MultiHopRAG domain,
+                    # half to three quarters of rows then arrive as `{}` calls
+                    # and die in the executor's validation.
+                    "parameters": t.parameters
+                    or {
                         "type": "object",
                         "properties": {},
                         "additionalProperties": True,

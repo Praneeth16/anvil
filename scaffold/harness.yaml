@@ -3,33 +3,40 @@ sampling:
   top_p: null
   max_tokens: 2048
   tool_choice: auto
-  max_tool_calls: 3
+  max_tool_calls: 4
 skills:
 - file: identity.md
-- file: greeting.md
-- file: classification.md
-- file: escalation.md
-- file: refund.md
+- file: citation.md
+- file: synthesis.md
+- file: refusal.md
 rules:
-- file: no_repeat_failed_mutations.md
-- file: answer_scope_discipline.md
-- file: answer_specificity.md
+- file: citation_discipline.md
+- file: scope_discipline.md
 tools:
 - name: search_knowledge_base
-  description: 'Search the NeoVolt policy knowledge base by natural-language
+  description: 'Search the news-article knowledge base by natural-language query.
 
-    query. Returns the top-k matching policy documents, each with
+    Returns the top-k matching articles, each with doc_id, title, source,
 
-    doc_id, title, and a snippet of the body. Use whenever the user
+    publication date, and a snippet of the body. Use it for any factual
 
-    asks about NeoVolt policies — billing, outages, tariffs,
+    question — and use it more than once, with rephrased queries, when a
 
-    payments, meters, account, safety, connections, regulatory
+    question needs facts from several articles. If the result is "No matching
 
-    rights, or emergency contacts. If the result is "No matching
+    policy documents." the knowledge base does not cover the question; say
 
-    policy documents." the question is out of scope for this
-
-    knowledge base and you should say so.
+    so instead of answering from general knowledge.
 
     '
+  parameters:
+    type: object
+    properties:
+      query:
+        type: string
+        description: Natural-language search query over the article knowledge base.
+      k:
+        type: integer
+        description: Maximum number of articles to return (default 3).
+    required:
+    - query

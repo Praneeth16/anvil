@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -50,10 +50,18 @@ class RuleRef(BaseModel):
 
 
 class ToolRef(BaseModel):
-    """Tool entry registered in the runtime agent's tool list."""
+    """Tool entry registered in the runtime agent's tool list.
+
+    ``parameters`` is the JSON Schema object sent to the model as the tool's
+    ``parameters`` block. Left unset it defaults to an empty object schema —
+    which means the model must guess the argument names from the description
+    alone, and a nontrivial share of calls arrive as ``{}`` and die in the
+    executor's validation. Declare it for every tool.
+    """
 
     name: str
     description: str | None = None
+    parameters: dict[str, Any] | None = None
 
 
 class LoopConfig(BaseModel):
@@ -334,7 +342,7 @@ class EvalConfig(BaseModel):
         ``{name: <str>}`` dict, which :class:`ScorerConfig` then parses
         with ``type=llm`` and ``weight=1.0``. A list of dicts (the new
         shape) and a list of already-built ``ScorerConfig`` objects pass
-        through unchanged. The shipped NeoVolt scaffold lists scorers as
+        through unchanged. The shipped scaffold lists scorers as
         strings, so this keeps it scoring identically without a config
         migration."""
         if not isinstance(v, list):
@@ -404,7 +412,7 @@ class RuntimeYAML(BaseModel):
     optimizer_endpoint: str  # FMAPI model for the optimizer
     judge_endpoint: str  # FMAPI model for the judge
     # The refusal judge's description of the domain it grades. ``None`` means
-    # "use the shipped NeoVolt defaults" (``anvil.eval.scorers``), which keeps
+    # "use the shipped defaults" (``anvil.eval.scorers``), which keeps
     # every prompt and every cached baseline byte-identical. Set both to grade a
     # different domain without editing library code -- see examples/.
     #
@@ -422,12 +430,11 @@ class RuntimeYAML(BaseModel):
         """Reject setting one judge-domain key without the other.
 
         They are interpolated into different parts of the same prompt, and each
-        falls back to the shipped NeoVolt default independently. So setting only
+        falls back to the shipped default independently. So setting only
         ``judge_domain_context`` -- the substantial one, and the one anyone
-        reaches for first -- produces a judge told it is grading a Python library
-        that still offers "I can only help with NeoVolt-related questions" as its
-        example of a refusal. Nothing downstream can detect that; the refusal
-        score simply becomes wrong.
+        reaches for first -- produces a judge told it is grading one domain
+        while its refusal examples name another. Nothing downstream can detect
+        that; the refusal score simply becomes wrong.
         """
         name, context = self.judge_domain_name, self.judge_domain_context
         if (name is None) != (context is None):

@@ -113,11 +113,14 @@ off-machine sockets for any test not marked `live`.
 
 Read this as evidence the machinery runs end to end and moved the agent, and
 **not** as a benchmark. Those rounds were measured under scorer semantics
-v1–v3. v4 changed which buckets a scorer applies to, so these numbers are not
-comparable to the current baseline (0.828 on `standard`, 12 rows) and a rerun
-would not reproduce them. The curve also stops well short of the 50-round
-target, where the interesting question — whether gains keep coming or the
-optimizer runs out of ideas — actually lives.
+v1–v3, on a 20-row golden set whose 12-row `standard` mode capped the paired
+gate's power at 0.185 and left no room for a holdout. The NeoVolt domain now
+lives at `examples/neovolt/` with its full history; the primary domain is
+MultiHopRAG — 120 rows split 40 train / 50 dev / 30 test, rounds evaluated on
+the whole dev partition, finalization alone on test (issues #15/#21). The
+curve also stops well short of the 50-round target, where the interesting
+question — whether gains keep coming or the optimizer runs out of ideas —
+actually lives.
 
 ---
 
@@ -138,19 +141,23 @@ traces, and there is no honest way to synthesize those: a judge aligned against
 labels produced by a judge measures nothing. The prerequisite is a person
 labelling a few dozen rows from a live run.
 
-### 2. Regenerate the baseline to activate the paired gate
+### 2. Chunk-level retrieval (#26)
 
-One command, but it costs a real eval and it is the difference between the gate
-running and the gate logging that it could not run:
+`search_knowledge_base` ranks whole documents but returns a prefix snippet.
+That fit NeoVolt's short policy pages; MultiHopRAG articles average ~10.3k
+chars with the answer mid-body, and the migration's live probe measured rows
+failing correctness while groundedness passed — the fact sat past the prefix.
+The migration ships a stopgap (500 → 3000 chars). The proper fix is chunk-level
+retrieval: BM25 over deterministic ~1-2k chunks, results labeled with their
+parent `doc_id` so the citation contract is unchanged. Land it before a
+campaign — snippet shape changes what a baseline measures.
 
-```bash
-python scripts/make_baseline.py
-```
+### 3. Regenerate the baseline to activate the paired gate — DONE
 
-`eval/runs/baseline.json` as shipped predates `per_row`, so every round currently
-reports `paired: no rows could be paired` and the frontier decision stands
-unchecked. Until this is done, the noise-aware gate is documented rather than
-operative.
+Done 2026-08-26 (baseline with `per_row`, scorer semantics v1/v5), and done
+again on the new primary domain: the MultiHopRAG migration regenerates the
+baseline on the 50-row dev partition as part of the same change. The paired
+gate is operative, not documented.
 
 ---
 
