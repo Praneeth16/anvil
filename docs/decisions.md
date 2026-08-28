@@ -394,3 +394,56 @@ it writes a new baseline.
 Persisting a vetoed or reverted candidate's draw as anyone's comparator.
 Overwriting `baseline.json` from the round loop. Failing open when the parent
 comparator is dataset-incompatible (the pre-flight raises instead).
+
+## D14 — The judges, measured: groundedness is strict, refusal is near-perfect
+
+**Decision.** Judge-vs-human agreement is measured before any alignment work,
+and the numbers are recorded: `scripts/measure_judge_agreement.py` scores a
+stratified RAGTruth slice (`eval/judge_validation/ragtruth/`, 444 rows, MIT,
+pinned, `--check` reproducible) with the same `build_scorers` construction
+the gate runs, and the report lives at
+`eval/runs/judge_agreement_ragtruth.json` with scorer and slice fingerprints.
+
+**Why.** D12's paired test assumes the judges are noisy but unbiased; a
+systematically wrong judge is invisible to it, and replication amplifies the
+bias into false significance (issue #16). The only way to see bias is to
+score human-labeled rows.
+
+**Measured 2026-08-28 (judge: databricks-claude-sonnet-4-6).**
+
+* `retrieval_groundedness`: **kappa 0.600** [0.506, 0.686] over 300 answer
+  rows — moderate, and directionally *strict*. It fails 23.3% of responses
+  humans marked supported (FN), worst on QA (30%), and passes 16.7% of
+  responses humans marked unsupported (FP), worst on summarization (24%).
+  Against the gate's assumption this is the consequential finding: the judge
+  has a systematic direction, not just variance. A mutation that lengthens or
+  hedges answers can move the judge without moving the human — the paired
+  test cancels row difficulty, not bias that interacts with the mutation.
+* `refusal_appropriateness`: **kappa 0.925** [0.886, 0.960] over 444 rows. It
+  catches 99.3% of incorrect refusals and flags 4.7% of appropriate answers.
+  Caveat that keeps this honest: RAGTruth contains no *correct*-refusal rows,
+  so the hard half of this judge's job — blessing a refusal that should
+  happen — is unmeasured. The MultiHopRAG golden set's out_of_scope bucket is
+  where that half matters.
+* `correctness`: **not measurable against RAGTruth.** The dataset carries no
+  reference answers, and this judge grades against `expected_facts`;
+  fabricating them would measure the fabrication. Closing this needs a
+  dataset with expert-verified reference answers (a labeling pass on our own
+  golden rows is the cheapest honest source — the same annotation package
+  covers it).
+
+**The ceiling caveat.** These kappas are judge-vs-RAGTruth-labels, not yet
+judge-as-fraction-of-local-ceiling. The two-annotator package is built
+(`eval/judge_validation/annotation_worksheet.csv`, `ANNOTATION_PROTOCOL.md`,
+`scripts/compute_alpha.py`) and waits on human annotators; an LLM annotator
+would be a fourth judge and make the ceiling circular.
+
+**Enforced by.** `tests/test_agreement.py` (known-answer kappa/alpha tables),
+`tests/test_ragtruth_slice.py` (schema guards, strata, refusal mapping,
+`--check`), `tests/test_judge_scoring_offline.py` (pairing, error ceiling),
+the vendoring script's hard-fail schema asserts.
+
+**Rules out.** Treating judge consistency (replication) as evidence of judge
+correctness. Quoting agreement numbers without the scorer fingerprint that
+produced them. Validating correctness against datasets with no reference
+answers. Using an LLM as a human-ceiling annotator.

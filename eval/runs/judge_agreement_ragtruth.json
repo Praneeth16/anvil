@@ -1,0 +1,192 @@
+{
+  "judges": {
+    "retrieval_groundedness": {
+      "n": 300,
+      "human_pos": 150,
+      "human_neg": 150,
+      "false_positives": 25,
+      "false_negatives": 35,
+      "fp_rate": 0.16666666666666666,
+      "fn_rate": 0.23333333333333334,
+      "observed_agreement": 0.8,
+      "kappa": 0.6000000000000001,
+      "kappa_ci95": [
+        0.5058980636545737,
+        0.6856888096299599
+      ],
+      "per_stratum": {
+        "Data2txt/supported": {
+          "n": 50,
+          "human_pos": 50,
+          "human_neg": 0,
+          "false_positives": 0,
+          "false_negatives": 9,
+          "fp_rate": 0.0,
+          "fn_rate": 0.18,
+          "observed_agreement": 0.82,
+          "kappa": 0.0
+        },
+        "Data2txt/unsupported": {
+          "n": 50,
+          "human_pos": 0,
+          "human_neg": 50,
+          "false_positives": 3,
+          "false_negatives": 0,
+          "fp_rate": 0.06,
+          "fn_rate": 0.0,
+          "observed_agreement": 0.94,
+          "kappa": 0.0
+        },
+        "QA/supported": {
+          "n": 50,
+          "human_pos": 50,
+          "human_neg": 0,
+          "false_positives": 0,
+          "false_negatives": 15,
+          "fp_rate": 0.0,
+          "fn_rate": 0.3,
+          "observed_agreement": 0.7,
+          "kappa": 0.0
+        },
+        "QA/unsupported": {
+          "n": 50,
+          "human_pos": 0,
+          "human_neg": 50,
+          "false_positives": 10,
+          "false_negatives": 0,
+          "fp_rate": 0.2,
+          "fn_rate": 0.0,
+          "observed_agreement": 0.8,
+          "kappa": 0.0
+        },
+        "Summary/supported": {
+          "n": 50,
+          "human_pos": 50,
+          "human_neg": 0,
+          "false_positives": 0,
+          "false_negatives": 11,
+          "fp_rate": 0.0,
+          "fn_rate": 0.22,
+          "observed_agreement": 0.78,
+          "kappa": 0.0
+        },
+        "Summary/unsupported": {
+          "n": 50,
+          "human_pos": 0,
+          "human_neg": 50,
+          "false_positives": 12,
+          "false_negatives": 0,
+          "fp_rate": 0.24,
+          "fn_rate": 0.0,
+          "observed_agreement": 0.76,
+          "kappa": 0.0
+        }
+      }
+    },
+    "refusal_appropriateness": {
+      "n": 444,
+      "human_pos": 300,
+      "human_neg": 144,
+      "false_positives": 1,
+      "false_negatives": 14,
+      "fp_rate": 0.006944444444444444,
+      "fn_rate": 0.04666666666666667,
+      "observed_agreement": 0.9662162162162162,
+      "kappa": 0.9246844890758583,
+      "kappa_ci95": [
+        0.8860725601320898,
+        0.9603606820819569
+      ],
+      "per_stratum": {
+        "Data2txt/supported": {
+          "n": 50,
+          "human_pos": 50,
+          "human_neg": 0,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "fp_rate": 0.0,
+          "fn_rate": 0.0,
+          "observed_agreement": 1.0,
+          "kappa": 1.0
+        },
+        "Data2txt/unsupported": {
+          "n": 50,
+          "human_pos": 50,
+          "human_neg": 0,
+          "false_positives": 0,
+          "false_negatives": 6,
+          "fp_rate": 0.0,
+          "fn_rate": 0.12,
+          "observed_agreement": 0.88,
+          "kappa": 0.0
+        },
+        "QA/supported": {
+          "n": 50,
+          "human_pos": 50,
+          "human_neg": 0,
+          "false_positives": 0,
+          "false_negatives": 6,
+          "fp_rate": 0.0,
+          "fn_rate": 0.12,
+          "observed_agreement": 0.88,
+          "kappa": 0.0
+        },
+        "QA/unsupported": {
+          "n": 50,
+          "human_pos": 50,
+          "human_neg": 0,
+          "false_positives": 0,
+          "false_negatives": 2,
+          "fp_rate": 0.0,
+          "fn_rate": 0.04,
+          "observed_agreement": 0.96,
+          "kappa": 0.0
+        },
+        "Summary/supported": {
+          "n": 50,
+          "human_pos": 50,
+          "human_neg": 0,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "fp_rate": 0.0,
+          "fn_rate": 0.0,
+          "observed_agreement": 1.0,
+          "kappa": 1.0
+        },
+        "Summary/unsupported": {
+          "n": 50,
+          "human_pos": 50,
+          "human_neg": 0,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "fp_rate": 0.0,
+          "fn_rate": 0.0,
+          "observed_agreement": 1.0,
+          "kappa": 1.0
+        },
+        "refusal/incorrect": {
+          "n": 144,
+          "human_pos": 0,
+          "human_neg": 144,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "fp_rate": 0.006944444444444444,
+          "fn_rate": 0.0,
+          "observed_agreement": 0.9930555555555556,
+          "kappa": 0.0
+        }
+      }
+    },
+    "correctness": {
+      "status": "not measurable against RAGTruth",
+      "reason": "RAGTruth carries no reference answers or expected facts, and the correctness judge grades against exactly those. Validating it needs a dataset with expert-verified reference answers; see docs/decisions.md."
+    }
+  },
+  "n_errors": 0,
+  "errors": [],
+  "measured_at": "2026-08-28T03:41:45.276108+00:00",
+  "judge_model": "databricks-claude-sonnet-4-6",
+  "slice_path": "/Users/praneeth.paikray/Documents/Code/anvil/eval/judge_validation/ragtruth/rows.jsonl",
+  "slice_sha256": "4bfd707f3dc91e355c752b8a24140814",
+  "scorer_fingerprint": "[{\"check_function\": null, \"name\": \"correctness\", \"semantics\": 1, \"type\": \"llm\", \"weight\": 1.0}, {\"check_function\": null, \"judge_domain_context\": \"an open-domain retrieval-augmented assistant evaluated on the RAGTruth slice: news summarization, question answering over provided passages, and data-to-text tasks. Any question the provided passages can answer is in scope; refusing an answerable question is inappropriate.\", \"judge_domain_name\": \"open-domain RAG (RAGTruth slice)\", \"name\": \"refusal_appropriateness\", \"type\": \"llm\", \"weight\": 1.0}, {\"check_function\": null, \"name\": \"retrieval_groundedness\", \"semantics\": 5, \"type\": \"llm\", \"weight\": 1.0}]"
+}
