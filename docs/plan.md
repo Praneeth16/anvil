@@ -179,6 +179,22 @@ rejected on cost — the trade and its drift caveat are recorded as D13 in
 `docs/decisions.md`. #8's A/A harness remains the empirical check on
 cross-session judge drift.
 
+### 5. Gate calibration harness (#8) — DONE
+
+Known-truth scenario families (A/A, three known-bad, one known-good) run
+end-to-end through `run_round` with an injected eval
+(`anvil.loop.calibration` + `tests/test_gate_calibration.py`, offline and in
+the default suite). A/A reverts via the paired veto and the assertion is
+proven sensitive (with `gate.test: none` the same round keeps); loud
+regressions are caught by the frontier before the veto runs, and the harness
+records which layer fired. The stub judge is quantized on purpose — exact
+ties are what make "underpowered" reachable, and the harness counts it
+separately from "not significant". `scripts/measure_gate_calibration.py`
+runs the same scenarios live against the real judge (opt-in; ~10 evals at
+`--mode quick`), and its A/A false-positive rate is the drift measurement
+D13 deferred. D15 makes a calibration run a prerequisite for future gate
+changes.
+
 ---
 
 ## Closed

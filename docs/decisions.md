@@ -447,3 +447,44 @@ the vendoring script's hard-fail schema asserts.
 correctness. Quoting agreement numbers without the scorer fingerprint that
 produced them. Validating correctness against datasets with no reference
 answers. Using an LLM as a human-ceiling annotator.
+
+## D15 — The gate is calibrated, not just unit-tested
+
+**Decision.** Before any future change to the gate (thresholds, tests,
+frontier rules), the change must show its effect on the calibration harness
+(`anvil.loop.calibration`, `tests/test_gate_calibration.py`,
+`scripts/measure_gate_calibration.py`): known-truth scenario families — A/A,
+known-bad, known-good — run end-to-end through `run_round`, and the
+confusion matrix must not regress.
+
+**Why.** The gate's unit tests prove the sign test's arithmetic and the
+veto's plumbing; they cannot prove the assembled gate promotes good
+mutations and rejects bad ones, which is the only property that matters
+(issue #8, the advisory blocker for every other gate change). The harness
+measures it: A/A (same scaffold twice) must revert — any KEEP is a measured
+false positive, and the A/A assertion is proven sensitive: with
+`gate.test: none` the same round KEEPs. Three crippled scaffolds must
+revert, with the rejecting layer recorded (the frontier catches loud
+regressions before the veto runs). A restored rule must keep.
+
+**The stub judge is quantized on purpose.** Scores snap to 0.0 / 0.5 / 1.0
+with seeded per-draw flips, because real judge verdicts are discrete and
+exact ties are what make the sign test's *underpowered* outcome reachable —
+continuous noise would make every row discordant and that branch
+untestable. The A/A candidate's seed is pinned at a draw with flips in both
+directions (5 up / 2 down / 5 tied at row level): the candidate is luckier,
+not better, and the veto can see it. A one-directional draw would be a real
+false positive of the gate, not a test of it — and such seeds exist, which
+is exactly why the harness had to be built.
+
+**What it measures that D13 deferred.** The A/A family is the empirical
+check on parent-anchored pairing's drift assumption: run live
+(`scripts/measure_gate_calibration.py --mode full`), and the A/A false
+positive rate IS the cross-session drift the paired test fails to reject.
+The offline suite runs in CI with a deterministic stub judge; the live
+script is opt-in and reports TPR/FPR against the real judge.
+
+**Rules out.** Changing gate parameters on argument alone, without a
+calibration run. Interpreting "underpowered" and "not significant" as one
+outcome (the harness counts them separately — the first says buy power,
+the second says the mutation was nothing).
