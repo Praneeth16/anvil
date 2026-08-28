@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -44,7 +45,6 @@ from anvil.loop.calibration import (  # noqa: E402
     make_session,
     result_from_report,
     scenarios,
-    write_baseline_scaffold,
 )
 from anvil.runtime.loader import default_runtime_config_path, load_endpoints  # noqa: E402
 
@@ -59,20 +59,57 @@ def _git(repo: Path, *args: str) -> str:
 
 
 def _make_repo(repo: Path, config_text: str) -> None:
+    """A scratch repo carrying the REAL scaffold.
+
+    The live run composes the real prompt, which requires a registered
+    identity skill (and every registered file to exist) — the offline
+    suite's stub scaffold world cannot drive it. Scenarios therefore mutate
+    the real scaffold: the applier keeps ``harness.yaml`` registrations in
+    sync on their mutations, and the one scenario whose BASELINE is crippled
+    is prepared by hand below.
+    """
     _git(repo, "init", "-q")
     _git(repo, "config", "user.email", "calibration@anvil")
     _git(repo, "config", "user.name", "anvil-calibration")
     _git(repo, "config", "commit.gpgsign", "false")
-    (repo / "scaffold" / "memory").mkdir(parents=True)
-    (repo / "scaffold" / "skills").mkdir()
-    (repo / "scaffold" / "rules").mkdir()
-    (repo / "scaffold" / "harness.yaml").write_text("skills: []\ntools: []\n")
+    shutil.copytree(REPO_ROOT / "scaffold", repo / "scaffold")
     (repo / "harness").mkdir()
     (repo / "harness" / "config.yaml").write_text(config_text)
     (repo / "eval" / "runs").mkdir(parents=True)
     _git(repo, "add", ".")
     _git(repo, "commit", "-q", "-m", "init")
     _git(repo, "checkout", "-q", "-b", "anvil/exp")
+
+
+def _prepare_baseline(repo: Path, scenario) -> None:
+    """Materialize the scenario's baseline scaffold onto the real one."""
+    if scenario.name == "good_restore_citation":
+        # The crippled world this scenario restores from: citation skill
+        # gone, from the registry as well as the tree.
+        (repo / "scaffold" / "skills" / "citation.md").unlink()
+        harness = repo / "scaffold" / "harness.yaml"
+        harness.write_text(harness.read_text().replace("- file: citation.md\n", ""))
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-q", "-m", "baseline scaffold")
+    # Other scenarios use the real scaffold as-is; the init commit already
+    # covers it, and committing an unchanged tree exits non-zero.
+
+
+def _live_scenarios(selected: list, real_citation: str) -> list:
+    """Scenario definitions adjusted for the live world.
+
+    The offline A/A rewrites the citation skill with stub content; live, it
+    must rewrite it with the skill's REAL content — byte-identical is the
+    whole point, and the stub text is not what is on disk.
+    """
+    import dataclasses
+
+    return [
+        dataclasses.replace(s, action_args={**s.action_args, "content": real_citation})
+        if s.name == "aa"
+        else s
+        for s in selected
+    ]
 
 
 def _arg_parser() -> argparse.ArgumentParser:
@@ -102,16 +139,17 @@ def main(argv: list[str] | None = None) -> int:
         if missing:
             raise SystemExit(f"unknown scenarios: {sorted(missing)}")
 
+    real_citation = (REPO_ROOT / "scaffold" / "skills" / "citation.md").read_text(
+        encoding="utf-8"
+    )
     results = []
-    for scenario in all_scenarios:
+    for scenario in _live_scenarios(all_scenarios, real_citation):
         print(f"[{scenario.name}] {scenario.description} (truth: {scenario.truth})")
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
             _make_repo(repo, config_text)
-            write_baseline_scaffold(repo, scenario.baseline_skills)
-            _git(repo, "add", ".")
-            _git(repo, "commit", "-q", "-m", "baseline scaffold")
+            _prepare_baseline(repo, scenario)
 
             baseline_report = evaluate_branch(
                 scaffold_root=repo / "scaffold",
