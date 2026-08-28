@@ -1,0 +1,65 @@
+{
+  "n_scenarios": 5,
+  "tp": 0,
+  "fn": 1,
+  "fp": 0,
+  "tn": 3,
+  "tpr": 0.0,
+  "fpr": 0.0,
+  "by_layer": {
+    "frontier": 3,
+    "paired_veto": 2,
+    "none": 0
+  },
+  "underpowered": 0,
+  "not_significant": 2,
+  "results": [
+    {
+      "name": "aa",
+      "truth": "revert",
+      "decision": "revert",
+      "correct": true,
+      "rejecting_layer": "frontier",
+      "paired_outcome": "not_run",
+      "notes": ""
+    },
+    {
+      "name": "bad_no_citation",
+      "truth": "revert",
+      "decision": "infra_fail",
+      "correct": true,
+      "rejecting_layer": "frontier",
+      "paired_outcome": "not_run",
+      "notes": "eval failed: TimeoutError: Timed out after 0:08:20"
+    },
+    {
+      "name": "bad_no_refusal",
+      "truth": "revert",
+      "decision": "revert",
+      "correct": true,
+      "rejecting_layer": "frontier",
+      "paired_outcome": "not_run",
+      "notes": ""
+    },
+    {
+      "name": "bad_confident",
+      "truth": "revert",
+      "decision": "revert",
+      "correct": true,
+      "rejecting_layer": "paired_veto",
+      "paired_outcome": "not_significant",
+      "notes": "paired: 10 improved / 8 regressed / 32 tied over 50 paired rows, p=0.4073 > alpha=0.05: consistent with judge noise"
+    },
+    {
+      "name": "good_restore_citation",
+      "truth": "keep",
+      "decision": "revert",
+      "correct": false,
+      "rejecting_layer": "paired_veto",
+      "paired_outcome": "not_significant",
+      "notes": "paired: 4 improved / 1 regressed / 45 tied over 50 paired rows, p=0.1875 > alpha=0.05: consistent with judge noise"
+    }
+  ],
+  "measured_at": "2026-08-28T08:37:12.955455+00:00",
+  "mode": "full"
+}
