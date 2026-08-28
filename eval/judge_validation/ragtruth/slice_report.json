@@ -1,0 +1,15 @@
+{
+  "source": "ParticleMedia/RAGTruth@c103204b9ce28d6bbad859304bf30de72b8ed8fe",
+  "seed": 42,
+  "n_rows": 444,
+  "strata": {
+    "QA/supported": 50,
+    "QA/unsupported": 50,
+    "Summary/supported": 50,
+    "Summary/unsupported": 50,
+    "Data2txt/supported": 50,
+    "Data2txt/unsupported": 50,
+    "refusal/incorrect": 144
+  },
+  "rows_sha256": "4bfd707f3dc91e355c752b8a24140814"
+}
