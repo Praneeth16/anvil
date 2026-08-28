@@ -126,20 +126,27 @@ actually lives.
 
 ## Open work, in priority order
 
-### 1. Judge alignment
+### 1. Judge alignment — MEASURED (machine part); human ceiling pending
 
-The unaligned LLM judge is the root cause of the noise the paired gate now works
-around, not merely correlated with it. MLflow exposes
-`Judge.align(traces, optimizer=None)` and `judges.AlignmentOptimizer`
-(`docs/verified-api-surface.md`). Aligning the judge against human labels would
-shrink the noise floor itself, which is strictly better than compensating for it
-— a smaller floor means the paired test detects smaller real effects at
-`replicates: 1`.
+Judge-vs-human agreement is now measurable: `scripts/build_ragtruth_slice.py`
+vendors a stratified 444-row RAGTruth slice (MIT, pinned, `--check`
+reproducible) and `scripts/measure_judge_agreement.py` scores it with the
+same `build_scorers` construction the gate runs, reporting Cohen's kappa with
+FP/FN broken out per judge per stratum (`eval/runs/
+judge_agreement_ragtruth.json`, D14). Two findings stand: correctness cannot
+be validated against RAGTruth at all (no reference answers — a dataset with
+expert-verified answers is the gap), and RAGTruth carries no correct-refusal
+rows, so the refusal judge is measured on appropriate answers vs incorrect
+refusals only.
 
-**Blocked on labels, not on code.** Alignment needs human verdicts on real
-traces, and there is no honest way to synthesize those: a judge aligned against
-labels produced by a judge measures nothing. The prerequisite is a person
-labelling a few dozen rows from a live run.
+**What remains is the human ceiling** (issue #16's criteria 3–4). The package
+is ready: `scripts/build_annotation_worksheet.py` emits ~200 blind stratified
+items plus `eval/judge_validation/ANNOTATION_PROTOCOL.md` (i2b2-style, two
+independent annotators, adjudication), and `scripts/compute_alpha.py` reports
+Krippendorff's alpha from the filled sheets. It needs two human annotators;
+an LLM annotator is a fourth judge and makes the ceiling circular. Only then
+can judge kappa be read as a fraction of the ceiling — and only then does
+`Judge.align` (the actual alignment step) have labels worth aligning to.
 
 ### 2. Chunk-level retrieval (#26) — DONE
 
